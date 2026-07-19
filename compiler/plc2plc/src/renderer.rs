@@ -1241,11 +1241,23 @@ impl Visitor<Diagnostic> for LibraryRenderer {
 
     // 3.2.3
     fn visit_fb_call(&mut self, node: &dsl::textual::FbCall) -> Result<Self::Value, Diagnostic> {
-        self.visit_id(&node.var_name)?;
+        match &node.qualifier {
+            Some(qualifier) => {
+                // Matches visit_structured_variable's exact pattern: a raw
+                // write on both sides of the period (and for var_name
+                // too, here), since visit_id's write_ws would insert an
+                // unwanted space around the period.
+                self.write_ws(qualifier.original().as_str());
+                self.write(".");
+                self.write(node.var_name.original().as_str());
+            }
+            None => self.visit_id(&node.var_name)?,
+        }
 
         self.write_ws("(");
         visit_comma_separated!(self, node.params.iter(), ParamAssignmentKind);
         self.write_ws(")");
+        self.write(";");
 
         Ok(())
     }

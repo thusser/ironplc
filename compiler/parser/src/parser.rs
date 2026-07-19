@@ -1694,9 +1694,17 @@ parser! {
 
     // B.3.2.2 Subprogram control statements
     rule subprogram_control_statement() -> StmtKind = fb:fb_invocation() { fb } / tok(TokenType::Return) { StmtKind::Return }
-    rule fb_invocation() -> StmtKind = name:fb_name() _ tok(TokenType::LeftParen) _ params:param_assignment() ** (_ tok(TokenType::Comma) _) _ end:tok(TokenType::RightParen) {
-      let span = SourceSpan::join(&name.span, &end.span);
+    rule fb_invocation() -> StmtKind = qualifier:(q:fb_name() tok(TokenType::Period) { q })? name:fb_name() _ tok(TokenType::LeftParen) _ params:param_assignment() ** (_ tok(TokenType::Comma) _) _ end:tok(TokenType::RightParen) {
+      // A qualified call (instance.Method(...)) is a CODESYS/TwinCAT
+      // vendor extension -- parsed unconditionally, but flagged as
+      // recognized-but-not-yet-supported (P9004) by
+      // rule_unsupported_extension, since IronPLC does not yet implement
+      // method/interface dispatch. See allow_oop_extensions and
+      // specs/plans/2026-07-19-twincat-qualified-method-call-parsing.md.
+      let start_span = qualifier.as_ref().map(|q| &q.span).unwrap_or(&name.span);
+      let span = SourceSpan::join(start_span, &end.span);
       StmtKind::FbCall(FbCall {
+        qualifier,
         var_name: name,
         params,
         position: span,
