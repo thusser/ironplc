@@ -176,9 +176,18 @@ Options
 
 ``--allow-math-constants``
    Register implicit math constants (currently just ``PI``) as built-in
-   ``LREAL`` globals. Only resolves in statement context today (e.g.
-   ``x := PI/180.0;``); using it as a ``VAR`` initializer is not yet
-   supported. Enabled by ``--dialect=rusty`` and ``--dialect=codesys``.
+   ``LREAL`` globals. Resolves in statement context (e.g.
+   ``x := PI/180.0;``) unconditionally; using it as a ``VAR`` initializer
+   additionally requires ``--allow-constant-initializer-expressions``.
+   Enabled by ``--dialect=rusty`` and ``--dialect=codesys``.
+
+``--allow-constant-initializer-expressions``
+   Allow a ``VAR`` initializer to be a constant expression (e.g.
+   ``d2r : LREAL := PI/180.0;``) rather than only a bare literal. Folded to
+   a literal at compile time; produces
+   :doc:`P4037 </reference/compiler/problems/P4037>` if the expression does
+   not fully reduce to a constant. Enabled by ``--dialect=rusty`` and
+   ``--dialect=codesys``.
 
 Examples
 ========

@@ -286,6 +286,11 @@ define_compiler_options! {
     "--allow-math-constants",
     [Rusty, Codesys],
     allow_math_constants,
+
+    "Allow constant expressions (not just bare literals) in VAR initializers, e.g. PI/180.0",
+    "--allow-constant-initializer-expressions",
+    [Rusty, Codesys],
+    allow_constant_initializer_expressions,
 }
 
 /// Format a human-readable summary of all dialects and which features each
@@ -345,6 +350,7 @@ mod tests {
         assert!(!options.allow_pragmas);
         assert!(!options.allow_oop_extensions);
         assert!(!options.allow_math_constants);
+        assert!(!options.allow_constant_initializer_expressions);
     }
 
     #[test]
@@ -371,6 +377,7 @@ mod tests {
         assert!(!options.allow_pragmas);
         assert!(!options.allow_oop_extensions);
         assert!(!options.allow_math_constants);
+        assert!(!options.allow_constant_initializer_expressions);
     }
 
     #[test]
@@ -396,6 +403,7 @@ mod tests {
         assert!(options.allow_pragmas);
         assert!(options.allow_oop_extensions);
         assert!(options.allow_math_constants);
+        assert!(options.allow_constant_initializer_expressions);
     }
 
     #[test]
@@ -423,6 +431,7 @@ mod tests {
         assert!(options.allow_pragmas);
         assert!(options.allow_oop_extensions);
         assert!(options.allow_math_constants);
+        assert!(options.allow_constant_initializer_expressions);
     }
 
     /// REQ-PAB-051: The `rusty` dialect preset enables partial-access syntax.
@@ -449,7 +458,7 @@ mod tests {
 
     #[test]
     fn feature_descriptors_when_called_then_contains_all_vendor_flags() {
-        assert_eq!(CompilerOptions::FEATURE_DESCRIPTORS.len(), 18);
+        assert_eq!(CompilerOptions::FEATURE_DESCRIPTORS.len(), 19);
         assert_eq!(
             CompilerOptions::FEATURE_DESCRIPTORS[0].cli_flag,
             "--allow-c-style-comments"
@@ -463,7 +472,7 @@ mod tests {
             .filter(|f| f.dialects.contains(&Dialect::Rusty))
             .map(|f| f.cli_flag)
             .collect();
-        assert_eq!(rusty_features.len(), 18);
+        assert_eq!(rusty_features.len(), 19);
     }
 
     #[test]
@@ -473,7 +482,7 @@ mod tests {
             .filter(|f| f.dialects.contains(&Dialect::Codesys))
             .map(|f| f.cli_flag)
             .collect();
-        assert_eq!(codesys_features.len(), 17);
+        assert_eq!(codesys_features.len(), 18);
         assert!(!codesys_features.contains(&"--allow-system-uptime-global"));
     }
 

@@ -75,6 +75,8 @@ fn extract_compiler_options(initialize_params: &InitializeParams) -> CompilerOpt
         options.allow_pragmas |= flag("allowPragmas");
         options.allow_oop_extensions |= flag("allowOopExtensions");
         options.allow_math_constants |= flag("allowMathConstants");
+        options.allow_constant_initializer_expressions |=
+            flag("allowConstantInitializerExpressions");
         options
     } else {
         CompilerOptions::default()
@@ -1006,6 +1008,30 @@ mod test {
 
         let options = super::extract_compiler_options(&params);
         assert!(options.allow_math_constants);
+    }
+
+    #[test]
+    fn extract_compiler_options_when_allow_constant_initializer_expressions_then_enables_flag() {
+        #[allow(deprecated)]
+        let params = InitializeParams {
+            process_id: None,
+            root_path: None,
+            root_uri: None,
+            initialization_options: Some(
+                serde_json::json!({"allowConstantInitializerExpressions": true}),
+            ),
+            capabilities: ClientCapabilities::default(),
+            trace: None,
+            workspace_folders: None,
+            client_info: None,
+            locale: None,
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        };
+
+        let options = super::extract_compiler_options(&params);
+        assert!(options.allow_constant_initializer_expressions);
     }
 
     #[test]
