@@ -289,6 +289,11 @@ define_compiler_options! {
     "--allow-pragmas",
     [Rusty, Codesys],
     allow_pragmas,
+
+    "Allow AT-located variables (e.g. AT%I*) mixed with plain variables in the same VAR/VAR_INPUT/VAR_OUTPUT block",
+    "--allow-mixed-located-var-declarations",
+    [Rusty, Codesys],
+    allow_mixed_located_var_declarations,
 }
 
 /// Format a human-readable summary of all dialects and which features each
@@ -393,6 +398,7 @@ mod tests {
                 "allow_cross_family_widening",
                 "allow_partial_access_syntax",
                 "allow_pragmas",
+                "allow_mixed_located_var_declarations",
             ],
         );
     }
@@ -422,6 +428,7 @@ mod tests {
                 "allow_cross_family_widening",
                 "allow_partial_access_syntax",
                 "allow_pragmas",
+                "allow_mixed_located_var_declarations",
             ],
         );
     }
