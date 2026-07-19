@@ -186,11 +186,23 @@ features — they never disable features that a dialect already includes.
 ``--allow-math-constants``
    Register implicit math constants (currently just ``PI``) as built-in
    ``LREAL`` globals, matching CODESYS/TwinCAT behavior where these names
-   are available without declaration. Only resolves in *statement* context
-   today (e.g. ``x := PI/180.0;``); using ``PI`` as a ``VAR`` initializer
-   (``d2r : LREAL := PI/180.0;``) is not yet supported, since ``VAR``
-   initializers only accept a literal constant, not an expression. Enabled
-   by ``--dialect=rusty`` and ``--dialect=codesys``.
+   are available without declaration. Resolves in statement context (e.g.
+   ``x := PI/180.0;``) unconditionally; using ``PI`` as a ``VAR``
+   initializer (``d2r : LREAL := PI/180.0;``) additionally requires
+   ``--allow-constant-initializer-expressions``, since ``VAR`` initializers
+   otherwise only accept a literal constant, not an expression. Enabled by
+   ``--dialect=rusty`` and ``--dialect=codesys``.
+
+``--allow-constant-initializer-expressions``
+   Allow a ``VAR`` initializer to be a constant *expression* — arithmetic
+   between literals and/or references to declared ``CONSTANT`` variables
+   (e.g. ``d2r : LREAL := PI/180.0;``) — rather than only a bare literal.
+   The IEC 61131-3 standard's initializer grammar permits only literals in
+   this position; this vendor extension folds the expression to a literal
+   at compile time. If the expression does not fully reduce to a constant
+   (e.g. it references a non-``CONSTANT`` variable), this produces problem
+   :doc:`P4037 </reference/compiler/problems/P4037>`. Enabled by
+   ``--dialect=rusty`` and ``--dialect=codesys``.
 
 Pass the flag when running :program:`ironplcc`:
 

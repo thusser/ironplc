@@ -514,4 +514,28 @@ END_INTERFACE
             .expect("rendered output must parse under the same dialect");
         assert_eq!(library_original, library_rendered);
     }
+
+    #[test]
+    fn write_to_string_when_constant_expression_initializer_then_round_trips() {
+        let source = "
+PROGRAM main
+VAR
+    d2r : LREAL := PI/180.5;
+END_VAR
+END_PROGRAM
+";
+        let options = CompilerOptions {
+            allow_constant_initializer_expressions: true,
+            ..CompilerOptions::default()
+        };
+        let library_original = parse_program(source, &FileId::default(), &options).unwrap();
+        let rendered = write_to_string(&library_original).unwrap();
+
+        assert!(rendered.contains("PI"));
+        assert!(rendered.contains("180.5"));
+
+        let library_rendered = parse_program(&rendered, &FileId::default(), &options)
+            .expect("rendered output must parse under the same dialect");
+        assert_eq!(library_original, library_rendered);
+    }
 }

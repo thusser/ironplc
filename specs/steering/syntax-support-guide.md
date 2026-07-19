@@ -165,7 +165,8 @@ Current flags in `CompilerOptions` (`parser/src/options.rs`):
 | `allow_partial_access_syntax` | `--allow-partial-access-syntax` | IEC 61131-3:2013 partial-access bit syntax (`.%Xn`) |
 | `allow_pragmas` | `--allow-pragmas` | Curly-brace pragmas (`{attribute 'qualified_only'}`) parsed and discarded like a comment |
 | `allow_oop_extensions` | `--allow-oop-extensions` | CODESYS/TwinCAT OOP: `EXTENDS`/`IMPLEMENTS` on `FUNCTION_BLOCK`, `INTERFACE` declarations |
-| `allow_math_constants` | `--allow-math-constants` | Implicit math constants (`PI`) as built-in `LREAL` globals; statement context only, not yet usable as a `VAR` initializer |
+| `allow_math_constants` | `--allow-math-constants` | Implicit math constants (`PI`) as built-in `LREAL` globals; `VAR` initializer usage additionally needs `allow_constant_initializer_expressions` |
+| `allow_constant_initializer_expressions` | `--allow-constant-initializer-expressions` | Constant expressions (not just bare literals) in `VAR` initializers, e.g. `PI/180.0` |
 
 ### Dialects
 
