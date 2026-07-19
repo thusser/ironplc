@@ -1,5 +1,10 @@
 # Plan: Parse Qualified Method-Call Statements (Recognized, Not Yet Supported)
 
+**Status: implemented and landed on this branch.** `fbComm.Publish('a', 'b');`
+now parses under every dialect and is flagged `P9004`, matching the design
+below. One pre-existing, unrelated renderer bug was found and fixed along
+the way — see "Implementation Notes" at the end of this file.
+
 ## Goal
 
 Allow `fbComm.Publish('a', 'b');` — a qualified call statement invoking
@@ -179,11 +184,66 @@ is the gate).
 ## Tasks
 
 - [x] Write plan (this document)
-- [ ] `FbCall.qualifier` field + `VendorExtension` impl + `fb_call_mapped()` update
-- [ ] Grammar: qualifier prefix in `fb_invocation()`
-- [ ] `rule_unsupported_extension.rs`: `visit_fb_call` override
-- [ ] Tests from Testing Strategy
-- [ ] Update docs (syntax-support-guide.md mention)
-- [ ] Run full CI pipeline (`cd compiler && just`)
-- [ ] Push branch to fork (no PR against `ironplc/ironplc` without explicit
+- [x] `FbCall.qualifier` field + `VendorExtension` impl + `fb_call_mapped()` update
+- [x] Grammar: qualifier prefix in `fb_invocation()`
+- [x] `rule_unsupported_extension.rs`: `visit_fb_call` override
+- [x] `rule_function_block_invocation.rs`: skip qualified calls (see
+      Implementation Notes — not in the original plan, found via testing)
+- [x] Tests from Testing Strategy
+- [x] Update docs (`enabling-dialects-and-features.rst` note appended to
+      the existing `--allow-oop-extensions` entry, since this construct
+      needs no new flag of its own)
+- [x] Run full CI pipeline (`cd compiler && just`)
+- [x] Push branch to fork (no PR against `ironplc/ironplc` without explicit
       go-ahead, per standing instruction)
+
+## Implementation Notes
+
+- **A second, unrelated semantic rule needed a fix too, found only by
+  running the smoke test, not by reading the grammar.** `P9004` fired
+  correctly, but a *second*, misleading diagnostic also appeared:
+  `P4012 Function block invocation is not a variable in scope
+  (invocation=Publish)` — from `rule_function_block_invocation.rs`, which
+  looks up `fb_call.var_name` ("Publish") in a map of declared FB-typed
+  variables and, finding nothing (since "Publish" was never a declared
+  variable — "fbComm" was), reports it as an undeclared invocation. That
+  rule has no way to understand a qualified call at all, so it needed an
+  early-return guard (`if fb_call.qualifier.is_some() { return Ok(()); }`)
+  to defer entirely to `rule_unsupported_extension`'s `P9004`, rather than
+  also emitting its own (in this case incorrect) diagnostic. This wasn't
+  anticipated in the plan — it only surfaced by actually running the
+  compiler against a real reproduction rather than just tracing the
+  grammar/AST changes on paper.
+- **Verified the P9004-blocks-codegen assumption holds**, and confirmed a
+  real, still-open, *unrelated* gap along the way: declaring a variable of
+  an `INTERFACE` type (`fbComm : I_Comm;`, the exact shape from the
+  reporting codebase) already produces its own separate diagnostic
+  (`P2008 Cannot determine kind of type identifier`) with or without this
+  feature — a pre-existing limitation of the `INTERFACE`-as-variable-type
+  support from the earlier `EXTENDS`/`IMPLEMENTS`/`INTERFACE` work, not
+  something this change introduces or needs to fix.
+- **Found and fixed a genuine, unrelated pre-existing renderer bug while
+  writing the plc2plc round-trip test**: `visit_fb_call` in `renderer.rs`
+  never wrote a trailing `;` at all — for *any* FB call, qualified or not.
+  Every other statement-rendering function in the file writes its own
+  trailing separator (confirmed by grepping for `write_ws(";")`/`write(";")`
+  across every other `visit_*` statement function); `visit_fb_call` was
+  simply missing it, presumably because no prior test round-tripped a
+  standalone FB-call statement through plc2plc. Fixed as part of this
+  change since it directly blocked the new round-trip test, rather than
+  filing it separately.
+- **Rendering the qualifier needed raw `write()`, not `visit_id()`'s
+  `write_ws()`** — matching the exact pattern `visit_structured_variable`
+  already uses for its own period-separated access
+  (`self.write(node.field.original().as_str())` rather than
+  `self.visit_id(&node.field)`), since `write_ws` unconditionally inserts
+  a leading space unless the buffer already ends in one, which produced
+  `fbComm. Publish` (a space after the period) the first time through.
+- **No new dialect flag** — unlike every other feature this session, this
+  construct needs no new keyword to gate at the lexer level (the way
+  `EXTENDS` is), so there's nothing to gate the parse itself on. `P9004`
+  firing whenever a qualified call is parsed *is* the gate, consistent
+  with `rule_unsupported_extension`'s existing design (it doesn't check
+  `allow_oop_extensions` either — `INTERFACE`/`EXTENDS`/`IMPLEMENTS` are
+  gated by *whether the keyword parses at all* via token demotion, not by
+  the semantic rule re-checking the flag).

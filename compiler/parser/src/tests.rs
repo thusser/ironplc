@@ -2710,4 +2710,105 @@ END_FUNCTION_BLOCK";
             InitialValueAssignmentKind::SimpleExpr(_)
         ));
     }
+
+    // ---------------------------------------------------------------------
+    // Qualified method-call statements (recognized, not yet supported).
+    // See specs/plans/2026-07-19-twincat-qualified-method-call-parsing.md.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_when_qualified_call_then_parses_with_qualifier() {
+        let source = "
+FUNCTION_BLOCK FB_Outer
+VAR
+    fbComm : FB_Inner;
+END_VAR
+    fbComm.Publish('a', 'b');
+END_FUNCTION_BLOCK";
+        let library = parse_text(source);
+
+        let fb = cast!(
+            &library.elements[0],
+            LibraryElementKind::FunctionBlockDeclaration
+        );
+        let s = cast!(&fb.body, FunctionBlockBodyKind::Statements);
+        let call = cast!(&s.body[0], StmtKind::FbCall);
+        assert_eq!(
+            call.qualifier.as_ref().map(|q| q.to_string()),
+            Some("fbComm".to_string())
+        );
+        assert_eq!(call.var_name.to_string(), "Publish");
+        assert_eq!(call.params.len(), 2);
+    }
+
+    #[test]
+    fn parse_when_unqualified_call_then_no_qualifier() {
+        // Regression: an ordinary direct FB invocation must be unaffected.
+        let source = "
+FUNCTION_BLOCK FB_Outer
+VAR
+    fbComm : FB_Inner;
+END_VAR
+    fbComm(a := 'x');
+END_FUNCTION_BLOCK";
+        let library = parse_text(source);
+
+        let fb = cast!(
+            &library.elements[0],
+            LibraryElementKind::FunctionBlockDeclaration
+        );
+        let s = cast!(&fb.body, FunctionBlockBodyKind::Statements);
+        let call = cast!(&s.body[0], StmtKind::FbCall);
+        assert!(call.qualifier.is_none());
+        assert_eq!(call.var_name.to_string(), "fbComm");
+    }
+
+    #[test]
+    fn parse_when_qualified_field_assignment_then_still_parses_as_assignment() {
+        // Regression: a genuine structured-field assignment (unrelated to
+        // this feature) with the same dotted-path prefix must not be
+        // swallowed by the new fb_invocation() grammar path.
+        let source = "
+TYPE ST_Data : STRUCT
+    Value : INT;
+END_STRUCT;
+END_TYPE
+PROGRAM main
+VAR
+    d : ST_Data;
+END_VAR
+    d.Value := 5;
+END_PROGRAM";
+        let library = parse_text(source);
+
+        let program = cast!(&library.elements[1], LibraryElementKind::ProgramDeclaration);
+        let s = cast!(&program.body, FunctionBlockBodyKind::Statements);
+        assert!(matches!(&s.body[0], StmtKind::Assignment(_)));
+    }
+
+    #[test]
+    fn parse_when_qualified_call_positional_args_then_parses() {
+        // Matches the dominant real-world usage pattern (all-positional
+        // arguments, no named parameters).
+        let source = "
+FUNCTION_BLOCK FB_Outer
+VAR
+    fbComm : FB_Inner;
+END_VAR
+    fbComm.Publish('telescope', 'dome', 'SENSOR.VALUE', '42');
+END_FUNCTION_BLOCK";
+        let library = parse_text(source);
+
+        let fb = cast!(
+            &library.elements[0],
+            LibraryElementKind::FunctionBlockDeclaration
+        );
+        let s = cast!(&fb.body, FunctionBlockBodyKind::Statements);
+        let call = cast!(&s.body[0], StmtKind::FbCall);
+        assert_eq!(
+            call.qualifier.as_ref().map(|q| q.to_string()),
+            Some("fbComm".to_string())
+        );
+        assert_eq!(call.params.len(), 4);
+    }
 }

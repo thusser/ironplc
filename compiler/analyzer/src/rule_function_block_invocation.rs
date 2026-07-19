@@ -260,6 +260,14 @@ impl Visitor<Diagnostic> for RuleFunctionBlockUse<'_> {
     }
 
     fn visit_fb_call(&mut self, fb_call: &FbCall) -> Result<Self::Value, Diagnostic> {
+        // A qualified call (instance.Method(...)) is a vendor extension
+        // IronPLC does not yet semantically analyze -- rule_unsupported_extension
+        // already flags it (P9004). var_name here is the method name, not
+        // a declared variable, so this rule's checks don't apply.
+        if fb_call.qualifier.is_some() {
+            return Ok(());
+        }
+
         // Check if function block is defined because you cannot
         // call a function block that doesn't exist
         let function_block_name = self.var_to_fb.get(&fb_call.var_name);
@@ -587,6 +595,31 @@ FB_INSTANCE : Callee;
 END_VAR
 FB_INSTANCE(IN1 := TRUE);
 END_PROGRAM";
+
+        let library = parse_and_resolve_types(program);
+        let context = SemanticContextBuilder::new().build().unwrap();
+        let result = apply(&library, &context, &CompilerOptions::default());
+
+        assert!(result.is_ok())
+    }
+
+    #[test]
+    fn apply_when_qualified_call_then_ok() {
+        // A qualified call (instance.Method(...)) is a vendor extension
+        // this rule does not understand -- var_name is the method name,
+        // not a declared variable, so it must be skipped here rather than
+        // misreported as "not a variable in scope". rule_unsupported_extension
+        // is what flags it (P9004).
+        let program = "
+FUNCTION_BLOCK Callee
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Caller
+VAR
+FB_INSTANCE : Callee;
+END_VAR
+FB_INSTANCE.SomeMethod();
+END_FUNCTION_BLOCK";
 
         let library = parse_and_resolve_types(program);
         let context = SemanticContextBuilder::new().build().unwrap();
