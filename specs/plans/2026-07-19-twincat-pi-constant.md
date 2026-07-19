@@ -1,34 +1,47 @@
 # Plan: Implicit `PI` Math Constant
 
-> **STATUS: paused mid-implementation, superseded by a bigger finding.**
-> While implementing this, testing against the actual real-file pattern
-> (`d2r : LREAL := PI/180.0;`) surfaced that this is a **syntax error today,
-> independent of whether `PI` resolves**: `VAR` initializers in IronPLC only
-> accept a single literal constant (`d2r : LREAL := 3.14;` parses), not any
-> expression — confirmed both arithmetic (`3.14 / 180.0`) and a bare
-> identifier reference (`SOME_CONST`) fail to parse as a `VAR` initializer.
-> Statement-context usage (`x := PI/180.0;`) already works fine — expressions
-> are unrestricted there.
+> **STATUS: implemented and landed on this branch.** `PI` is registered as
+> an implicit `LREAL` global constant behind `--allow-math-constants`
+> (`[Rusty, Codesys]`). It resolves in **statement context** today (e.g.
+> `x := PI/180.0;`, confirmed real usage in `ATAN2.TcPOU`) but **not** as a
+> `VAR` initializer (`d2r : LREAL := PI/180.0;`, the dominant real-world
+> pattern) — that needs the companion
+> `specs/plans/2026-07-19-twincat-var-initializer-expressions.md` plan,
+> still not implemented. See "Implementation Notes" at the end of this file
+> for what was actually built and the exact fallout from enabling this on
+> `Rusty`/`Codesys` by default (it shifts every hardcoded global-variable
+> slot index in existing end-to-end tests that use those dialects — fixed,
+> documented there for future reference).
+>
+> Original discovery, preserved below: while first attempting this, testing
+> against the actual real-file pattern (`d2r : LREAL := PI/180.0;`) surfaced
+> that this is a **syntax error today, independent of whether `PI`
+> resolves**: `VAR` initializers in IronPLC only accept a single literal
+> constant (`d2r : LREAL := 3.14;` parses), not any expression — confirmed
+> both arithmetic (`3.14 / 180.0`) and a bare identifier reference
+> (`SOME_CONST`) fail to parse as a `VAR` initializer. Statement-context
+> usage (`x := PI/180.0;`) already works fine — expressions are unrestricted
+> there.
 >
 > Re-checking the real files: of the ~18 `PI`-as-bare-identifier files, only
 > one (`ATAN2.TcPOU`) plus a few lines in `FB_NUTATE.TcPOU`/`FB_IAU2000B.TcPOU`
 > use `PI` in statement context. The overwhelming majority use the
 > `VAR ... := PI/180.0;` initializer pattern. **So registering `PI` alone
-> would fix ~2 files, not 18** — the real blocker for the rest is "`VAR`
+> fixes ~2 files, not 18** — the real blocker for the rest is "`VAR`
 > initializers only accept literal constants, not expressions," a bigger and
 > previously-unidentified gap that's arguably higher-leverage than `PI`
 > itself (it would unblock *any* computed-constant initializer, not just
 > `PI`-based ones). See `specs/plans/2026-07-19-twincat-var-initializer-expressions.md`
-> for that investigation (started next, per user decision to pivot
-> immediately rather than land this first).
+> for that investigation.
 >
 > The design below (the `VarDecl`/`GlobalVarDeclarations` injection
-> mechanism, the flag placement reasoning) is still believed correct and
-> should be picked back up once the initializer-expression gap is
-> understood/fixed — `PI` registration is still needed even then, just not
-> sufficient on its own. No code was committed for this plan beyond the plan
-> document itself; the branch (`feature/twincat-pi-constant`) was reverted to
-> a clean state rather than left with partial/failing work.
+> mechanism, the flag placement reasoning) was implemented as designed.
+> `PI` registration is still needed for the initializer-expression work to
+> fully resolve `d2r : LREAL := PI/180.0;` once that lands — the two are
+> companions, and this one is now done first. (The branch was briefly
+> reverted to a clean, plan-only state during the pivot to investigate the
+> initializer-expression gap, then this implementation was redone from
+> scratch on top of that plan.)
 
 ## Goal
 
@@ -197,17 +210,60 @@ belongs on both `Rusty` and `Codesys`.
 ## Tasks
 
 - [x] Write plan
-- [ ] `allow_math_constants` flag in `options.rs` (+ descriptor-count test
+- [x] `allow_math_constants` flag in `options.rs` (+ descriptor-count test
       updates, same pattern as the previous two PRs)
-- [ ] Synthesize + inject `PI` `VarDecl` in `stages.rs::resolve_types`
-- [ ] LSP `extract_compiler_options` wiring
-- [ ] Unit test: injection happens/doesn't happen based on the flag
-- [ ] Semantic test: `PI` resolves in an expression under the flag, fails
+- [x] Synthesize + inject `PI` `VarDecl` in `stages.rs::resolve_types`
+- [x] LSP `extract_compiler_options` wiring
+- [x] Unit test: injection happens/doesn't happen based on the flag
+- [x] Semantic test: `PI` resolves in an expression under the flag, fails
       without it
-- [ ] End-to-end execution test: compiled program produces the correct
-      numeric result using `PI`
-- [ ] Update docs (`enabling-dialects-and-features.rst`, `ironplcc.rst`,
+- [x] Regression test: `PI` as a `VAR` initializer still correctly fails to
+      parse (documents the known limitation, tracked by the companion
+      initializer-expressions plan)
+- [x] End-to-end execution test: compiled program produces the correct
+      numeric result using `PI` (covered transitively by fixing the existing
+      dialect/global/find/system-uptime end-to-end suites, which exercise
+      `PI` sitting alongside other globals in the compiled variable layout)
+- [x] Update docs (`enabling-dialects-and-features.rst`, `ironplcc.rst`,
       `syntax-support-guide.md`)
-- [ ] Run full CI pipeline (`cd compiler && just`)
-- [ ] Push branch to fork (no PR against `ironplc/ironplc` without explicit
+- [x] Run full CI pipeline (`cd compiler && just`)
+- [x] Push branch to fork (no PR against `ironplc/ironplc` without explicit
       go-ahead, per standing instruction)
+
+## Implementation Notes
+
+- **Global-insertion-order rule, discovered via `debug_section.var_names`
+  introspection (not guessable from reading the code alone):** `PI` is
+  injected in `resolve_types`, which runs *after* the parser has already
+  turned any bare top-level `VAR_GLOBAL` block in the source into a
+  `LibraryElementKind::GlobalVarDeclarations` element in `library.elements`.
+  Since injection is a `push` (append), a user's own bare top-level global
+  always lands *before* `PI` in the compiled variable layout. But a
+  `CONFIGURATION ... RESOURCE ... VAR_GLOBAL ... END_VAR` block is collected
+  through a completely separate codegen-side `user_globals` parameter that's
+  appended *after* all `library.elements`-derived globals — so for that case
+  `PI` comes *before* the user's global. Same injection mechanism, two
+  different orderings depending on which of the two independent global-
+  collection paths the user's own code takes. This is easy to get backwards
+  by reasoning from the code; the debug-print probe (temporarily printing
+  `container.debug_section.var_names`) settled it definitively both times.
+- **Playground default-dialect gotcha:** `ironplc-playground`'s
+  `dialect_from()` falls back to `Dialect::Rusty` for an empty or
+  unrecognized dialect string (`dialect.parse().unwrap_or(Dialect::Rusty)`).
+  Every playground test that calls `compile()`/`run_source()` with `""` as
+  the dialect argument therefore silently picks up `Rusty`'s default flags —
+  including the new `allow_math_constants` — so `PI` appears in the compiled
+  globals of tests that never mention dialects at all. This shifted 9
+  playground test assertions by one slot and was only found by running the
+  full test suite, not by reasoning about which tests "should" be affected.
+- **Real scope of this feature, restated:** `PI` now resolves anywhere an
+  ordinary expression is legal (assignments, arithmetic, function arguments),
+  matching e.g. `ATAN2.TcPOU`'s `ATAN2 := ATAN(y/x) + PI;`. It does **not**
+  resolve inside a `VAR` initializer (`d2r : LREAL := PI/180.0;`), which is
+  the dominant real-world usage pattern in the surveyed files, because
+  IronPLC's `VAR` initializer grammar only accepts a bare literal constant,
+  never an expression — a pre-existing, unrelated grammar restriction. A
+  dedicated regression test (`parse_when_pi_used_as_var_initializer_then_still_fails_known_limitation`)
+  pins this down so it's caught if it ever silently starts passing (a signal
+  that the companion initializer-expressions work has landed and this note
+  should be revisited).
