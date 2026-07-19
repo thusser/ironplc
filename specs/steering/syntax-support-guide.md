@@ -167,6 +167,7 @@ Current flags in `CompilerOptions` (`parser/src/options.rs`):
 | `allow_oop_extensions` | `--allow-oop-extensions` | CODESYS/TwinCAT OOP: `EXTENDS`/`IMPLEMENTS` on `FUNCTION_BLOCK`, `INTERFACE` declarations |
 | `allow_math_constants` | `--allow-math-constants` | Implicit math constants (`PI`) as built-in `LREAL` globals; `VAR` initializer usage additionally needs `allow_constant_initializer_expressions` |
 | `allow_constant_initializer_expressions` | `--allow-constant-initializer-expressions` | Constant expressions (not just bare literals) in `VAR` initializers, e.g. `PI/180.0` |
+| `allow_mixed_located_var_declarations` | `--allow-mixed-located-var-declarations` | `AT`-located variable (e.g. `AT %I*`) mixed with plain variables in one `VAR`/`VAR_INPUT`/`VAR_OUTPUT` block |
 
 ### Dialects
 
