@@ -1,5 +1,35 @@
 # Plan: Implicit `PI` Math Constant
 
+> **STATUS: paused mid-implementation, superseded by a bigger finding.**
+> While implementing this, testing against the actual real-file pattern
+> (`d2r : LREAL := PI/180.0;`) surfaced that this is a **syntax error today,
+> independent of whether `PI` resolves**: `VAR` initializers in IronPLC only
+> accept a single literal constant (`d2r : LREAL := 3.14;` parses), not any
+> expression — confirmed both arithmetic (`3.14 / 180.0`) and a bare
+> identifier reference (`SOME_CONST`) fail to parse as a `VAR` initializer.
+> Statement-context usage (`x := PI/180.0;`) already works fine — expressions
+> are unrestricted there.
+>
+> Re-checking the real files: of the ~18 `PI`-as-bare-identifier files, only
+> one (`ATAN2.TcPOU`) plus a few lines in `FB_NUTATE.TcPOU`/`FB_IAU2000B.TcPOU`
+> use `PI` in statement context. The overwhelming majority use the
+> `VAR ... := PI/180.0;` initializer pattern. **So registering `PI` alone
+> would fix ~2 files, not 18** — the real blocker for the rest is "`VAR`
+> initializers only accept literal constants, not expressions," a bigger and
+> previously-unidentified gap that's arguably higher-leverage than `PI`
+> itself (it would unblock *any* computed-constant initializer, not just
+> `PI`-based ones). See `specs/plans/2026-07-19-twincat-var-initializer-expressions.md`
+> for that investigation (started next, per user decision to pivot
+> immediately rather than land this first).
+>
+> The design below (the `VarDecl`/`GlobalVarDeclarations` injection
+> mechanism, the flag placement reasoning) is still believed correct and
+> should be picked back up once the initializer-expression gap is
+> understood/fixed — `PI` registration is still needed even then, just not
+> sufficient on its own. No code was committed for this plan beyond the plan
+> document itself; the branch (`feature/twincat-pi-constant`) was reverted to
+> a clean state rather than left with partial/failing work.
+
 ## Goal
 
 Register `PI` as an implicit, built-in `LREAL` global constant so that real
