@@ -302,6 +302,18 @@ impl SignedInteger {
             is_neg: true,
         })
     }
+
+    /// The signed numeric value, saturating at `i64::MIN`/`i64::MAX` if
+    /// the underlying magnitude doesn't fit (values of this magnitude
+    /// aren't realistic for an enum's explicit ordinal value).
+    pub fn to_i64(&self) -> i64 {
+        let magnitude = i64::try_from(self.value.value).unwrap_or(i64::MAX);
+        if self.is_neg {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
 }
 
 /// An integer value that may be either a literal or a reference to a named constant.
@@ -1349,6 +1361,12 @@ pub struct EnumerationDeclaration {
 pub struct EnumeratedSpecificationInit {
     pub spec: EnumeratedSpecificationKind,
     pub default: Option<EnumeratedValue>,
+    /// Present for the CODESYS/TwinCAT base-type suffix (`(A, B) BYTE;`)
+    /// -- overrides the automatic count/value-based sizing in
+    /// `enumeration.rs`'s `try_from_values`. `None` uses the existing
+    /// automatic sizing.
+    #[recurse(ignore)]
+    pub underlying_type: Option<ElementaryTypeName>,
 }
 
 impl EnumeratedSpecificationInit {
@@ -1358,6 +1376,7 @@ impl EnumeratedSpecificationInit {
                 values: values.into_iter().map(EnumeratedValue::new).collect(),
             }),
             default: Some(EnumeratedValue::new(default)),
+            underlying_type: None,
         }
     }
 }
@@ -1375,6 +1394,7 @@ impl EnumeratedSpecificationKind {
             .map(|v| EnumeratedValue {
                 type_name: None,
                 value: Id::from(v),
+                explicit_value: None,
             })
             .collect();
         SpecificationKind::Inline(EnumeratedSpecificationValues { values })
@@ -1434,6 +1454,14 @@ impl HasEnumeratedValues for EnumeratedSpecificationValues {
 pub struct EnumeratedValue {
     pub type_name: Option<TypeName>,
     pub value: Id,
+    /// Present when this member's value was assigned explicitly
+    /// (`member := 5`) in an enum *declaration's* value list -- a
+    /// CODESYS/TwinCAT extension (also standard as of IEC 61131-3:2013).
+    /// `None` in every other context `EnumeratedValue` is used in
+    /// (references, default values, case labels) -- only the
+    /// declaration-list grammar path sets this.
+    #[recurse(ignore)]
+    pub explicit_value: Option<SignedInteger>,
 }
 
 impl EnumeratedValue {
@@ -1441,6 +1469,7 @@ impl EnumeratedValue {
         EnumeratedValue {
             type_name: None,
             value: Id::from(value),
+            explicit_value: None,
         }
     }
 }
@@ -1896,6 +1925,7 @@ impl VarDecl {
                     initial_value: Some(EnumeratedValue {
                         type_name: None,
                         value: Id::from(initial_value),
+                        explicit_value: None,
                     }),
                 },
             ),
