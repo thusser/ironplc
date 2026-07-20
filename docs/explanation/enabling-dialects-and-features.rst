@@ -204,6 +204,19 @@ features — they never disable features that a dialect already includes.
    :doc:`P4037 </reference/compiler/problems/P4037>`. Enabled by
    ``--dialect=rusty`` and ``--dialect=codesys``.
 
+``--allow-mixed-located-var-declarations``
+   Allow an ``AT``-located variable (complete address like ``AT %IX0.0``,
+   or incomplete/wildcard address like ``AT %I*``) inside an otherwise
+   plain ``VAR``/``VAR_INPUT``/``VAR_OUTPUT`` block, instead of requiring
+   located variables to live in their own dedicated block. The IEC 61131-3
+   standard requires located and plain variables to be declared in
+   separate blocks; real CODESYS/TwinCAT code commonly mixes them. Without
+   this flag, mixing produces problem
+   :doc:`P4038 </reference/compiler/problems/P4038>`. A block containing
+   *only* located variables is unaffected by this flag — it is standard
+   syntax and always allowed. Enabled by ``--dialect=rusty`` and
+   ``--dialect=codesys``.
+
 Pass the flag when running :program:`ironplcc`:
 
 .. code-block:: shell
