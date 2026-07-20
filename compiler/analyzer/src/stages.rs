@@ -29,8 +29,9 @@ use crate::{
     semantic_context::SemanticContext,
     symbol_environment::{ScopeKind, SymbolEnvironment, SymbolKind},
     type_environment::{TypeEnvironment, TypeEnvironmentBuilder},
-    type_table, xform_fold_constant_expressions, xform_int_to_bool_initializer,
-    xform_named_to_positional_args, xform_resolve_constant_expressions, xform_resolve_expr_types,
+    type_table, xform_fold_constant_expressions, xform_fold_initializer_expressions,
+    xform_int_to_bool_initializer, xform_named_to_positional_args,
+    xform_resolve_constant_expressions, xform_resolve_expr_types,
     xform_resolve_late_bound_expr_kind, xform_resolve_late_bound_type_initializer,
     xform_resolve_symbol_and_function_environment, xform_resolve_type_aliases,
     xform_resolve_type_decl_environment, xform_toposort_declarations,
@@ -96,11 +97,11 @@ pub fn resolve_types(
     // runtime-read system value, so one injected VarDecl is enough (no
     // separate codegen-side synthesis needed).
     //
-    // Note: PI only resolves in *statement* context today (e.g.
-    // `x := PI/180.0;`). Using it as a VAR initializer (the dominant real
-    // usage: `d2r : LREAL := PI/180.0;`) still fails to parse — VAR
-    // initializers only accept a bare literal, not an expression. See
-    // specs/plans/2026-07-19-twincat-var-initializer-expressions.md.
+    // PI resolves in statement context (e.g. `x := PI/180.0;`) unconditionally.
+    // Using it as a VAR initializer (the dominant real usage:
+    // `d2r : LREAL := PI/180.0;`) additionally requires
+    // --allow-constant-initializer-expressions, folded by
+    // xform_fold_initializer_expressions below.
     if options.allow_math_constants {
         library
             .elements
@@ -182,6 +183,19 @@ pub fn resolve_types(
                 diagnostics.extend(errs);
                 library = fallback;
             }
+        }
+    }
+
+    // Fold constant-expression VAR initializers (e.g. `d2r : LREAL := PI/180.0;`)
+    // back into ordinary literal initializers, or diagnose. Must run before
+    // any other pass touches `InitialValueAssignmentKind::SimpleExpr` — see
+    // specs/plans/2026-07-19-twincat-var-initializer-expressions.md.
+    let fallback = library.clone();
+    match xform_fold_initializer_expressions::apply(library, options) {
+        Ok(result) => library = result,
+        Err(errs) => {
+            diagnostics.extend(errs);
+            library = fallback;
         }
     }
 
@@ -500,26 +514,65 @@ END_FUNCTION_BLOCK";
         assert!(context.has_diagnostics());
     }
 
+    // ---------------------------------------------------------------------
+    // PI as a VAR initializer, combined with constant initializer
+    // expressions.
+    // See specs/plans/2026-07-19-twincat-var-initializer-expressions.md.
+    // ---------------------------------------------------------------------
+
+    fn opts_with_math_constants_and_initializer_expressions() -> CompilerOptions {
+        CompilerOptions {
+            allow_math_constants: true,
+            allow_constant_initializer_expressions: true,
+            ..CompilerOptions::default()
+        }
+    }
+
     #[test]
-    fn parse_when_pi_used_as_var_initializer_then_still_fails_known_limitation() {
-        // Documents the current capability boundary: PI resolving as a
-        // symbol doesn't help here because VAR initializers only accept a
-        // bare literal, not an expression — a separate, larger gap tracked
-        // by specs/plans/2026-07-19-twincat-var-initializer-expressions.md.
-        // If this test starts failing (i.e. it now parses), that plan's
-        // fold pass has landed and this test (and the plan's status) should
-        // be updated together.
+    fn analyze_when_pi_used_as_var_initializer_and_both_flags_enabled_then_resolves() {
+        // The dominant real-world usage pattern (e.g. FB_TelescopeControl.TcPOU):
+        // registering PI alone is not enough — it also needs constant
+        // initializer expressions to fold `PI/180.0` at compile time.
         let program = "
 FUNCTION_BLOCK FB_Example
 VAR
     d2r : LREAL := PI/180.0;
 END_VAR
 END_FUNCTION_BLOCK";
-        let result = parse_program(program, &FileId::default(), &opts_with_math_constants());
+        let lib = parse_program(
+            program,
+            &FileId::default(),
+            &opts_with_math_constants_and_initializer_expressions(),
+        )
+        .unwrap();
+        let (_library, context) = analyze(
+            &[&lib],
+            &opts_with_math_constants_and_initializer_expressions(),
+        )
+        .unwrap();
+
         assert!(
-            result.is_err(),
-            "expected VAR-initializer PI usage to still fail to parse; if this now \
-             succeeds, the initializer-expressions plan has landed and this test is stale"
+            !context.has_diagnostics(),
+            "unexpected diagnostics: {:?}",
+            context.diagnostics()
         );
+    }
+
+    #[test]
+    fn analyze_when_pi_used_as_var_initializer_and_initializer_expressions_disabled_then_diagnostics(
+    ) {
+        // PI alone resolves the symbol, but without
+        // allow_constant_initializer_expressions the VAR initializer
+        // position still rejects the expression form.
+        let program = "
+FUNCTION_BLOCK FB_Example
+VAR
+    d2r : LREAL := PI/180.0;
+END_VAR
+END_FUNCTION_BLOCK";
+        let lib = parse_program(program, &FileId::default(), &opts_with_math_constants()).unwrap();
+        let (_library, context) = analyze(&[&lib], &opts_with_math_constants()).unwrap();
+
+        assert!(context.has_diagnostics());
     }
 }
