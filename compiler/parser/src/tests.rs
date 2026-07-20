@@ -3031,7 +3031,8 @@ END_FUNCTION_BLOCK";
 
     #[test]
     fn parse_when_enum_all_members_explicit_value_then_parses() {
-        // Matches real brotlib usage: TYPE E_ModeLanguage :(Deutsch:=1,English:=2);
+        // Matches real usage found in a private test corpus:
+        // TYPE E_ModeLanguage :(Deutsch:=1,English:=2);
         let source = "
 TYPE E_ModeLanguage : (Deutsch := 1, English := 2);
 END_TYPE";
