@@ -9,32 +9,34 @@ supported files when no project file is found) call `fs::read_dir(dir)`
 once and never recurse into subdirectories.
 
 Real TwinCAT project layouts are inherently nested (Visual-Studio-style
-solution/project structure). In the `brotlib` corpus, `.plcproj` lives
-2-3 levels below the directory a user would naturally point the tool at:
+solution/project structure). In a private test corpus of real TwinCAT
+projects, `.plcproj` lives 2-3 levels below the directory a user would
+naturally point the tool at:
 
 ```
-MONETN/                                  <- naturally the "project directory"
-  MONETN/
-    MONETNRuntime/
-      MONETNRuntime.plcproj              <- actual project file, 2 levels down
+TestProject/                             <- naturally the "project directory"
+  TestProject/
+    TestProjectRuntime/
+      TestProjectRuntime.plcproj         <- actual project file, 2 levels down
       POUs/...
 ```
 
-`ironplcc check MONETN` never finds the `.plcproj`, falls through to the
-fallback enumerator (which also only checks the top level), finds
+`ironplcc check TestProject` never finds the `.plcproj`, falls through to
+the fallback enumerator (which also only checks the top level), finds
 nothing there either, and reports `P9002 Set of valid source files has
 no content`. Pointing at the exact subdirectory works immediately —
 confirming discovery itself is the blocker, not anything downstream.
 
 ## Verification this is real (not just theoretical)
 
-Confirmed directly against `/home/husser/code/brotlib/MONETN`:
+Confirmed directly against a private local checkout of a real TwinCAT
+project laid out exactly as above:
 
 ```
-$ ironplcc check --dialect codesys MONETN
+$ ironplcc check --dialect codesys TestProject
 error[P9002]: Set of valid source files has no content
 
-$ ironplcc check --dialect codesys MONETN/MONETN/MONETNRuntime
+$ ironplcc check --dialect codesys TestProject/TestProject/TestProjectRuntime
 error[P6007]: File type is not supported ... VisualizationManager.TcVMO
 error[P0002]: Syntax error ... POUs/MAIN.TcPOU:66:33
 ```
@@ -44,8 +46,8 @@ The second command immediately finds and processes real content
 discovery, not something downstream).
 
 Also confirmed (relevant to the design below): the real corpus has a
-directory with **two** `.plcproj` files (`MONETNRuntime.plcproj` and
-`MONETRuntime.plcproj` — a stale duplicate from an apparent rename),
+directory with **two** `.plcproj` files (`TestProjectRuntime.plcproj` and
+`TestRuntime.plcproj` — a stale duplicate from an apparent rename),
 and both `.git/` and `.idea/` directories are present under the
 project root — recursion must not wastefully (or riskily, in `.git`'s
 case) descend into these.
@@ -87,7 +89,7 @@ already picked an arbitrary match with no disambiguation), just made
 deterministic across the whole tree instead of non-deterministic within
 one directory's `read_dir` order. Verified this tie-break happens to pick
 the "obviously correct" one in the real duplicate case
-(`MONETNRuntime.plcproj` sorts before `MONETRuntime.plcproj`, and also
+(`TestProjectRuntime.plcproj` sorts before `TestRuntime.plcproj`, and also
 happens to be the one whose name matches its containing folder).
 
 **Non-goal**: smarter disambiguation (e.g., preferring a `.plcproj` whose
@@ -144,7 +146,7 @@ this change scoped to the actual reported problem.
 ## Testing Strategy
 
 - `detect_twincat`: `.plcproj` nested 2-3 levels deep is found (matches
-  the real `brotlib` layout); hidden directories (`.git`-named dir
+  the real test-corpus layout); hidden directories (`.git`-named dir
   containing a decoy `.plcproj`) are not descended into; multiple
   `.plcproj` candidates at different depths resolve deterministically
   (sorted); `<Compile Include="...">` paths in a nested `.plcproj`
@@ -175,18 +177,18 @@ this change scoped to the actual reported problem.
 ## Implementation Notes
 
 - **Verified end-to-end against the real corpus, before and after**:
-  `ironplcc check MONETN` (top-level directory) went from
+  `ironplcc check TestProject` (top-level directory) went from
   `P9002 Set of valid source files has no content` to actually parsing
   real POUs (surfacing unrelated, pre-existing errors — unsupported
   `.TcVMO`/`.TcTTO` visualization file types, an unsupported
   `REFERENCE TO` variable, an unrelated parser edge case — confirming the
   fix is isolated to discovery, nothing downstream needed to change).
 - **The real duplicate-`.plcproj` case resolved correctly by coincidence
-  of the lexicographic tie-break**: `MONETNRuntime.plcproj` sorts before
-  `MONETRuntime.plcproj`, and is also the one whose name matches its
-  containing folder (the "correct" one). Not a designed heuristic — just
-  confirms the simple tie-break didn't make things worse for the one real
-  case found with multiple candidates.
+  of the lexicographic tie-break**: `TestProjectRuntime.plcproj` sorts
+  before `TestRuntime.plcproj`, and is also the one whose name matches
+  its containing folder (the "correct" one). Not a designed heuristic —
+  just confirms the simple tie-break didn't make things worse for the one
+  real case found with multiple candidates.
 - **The `root_dir`/base-path fix was easy to miss but load-bearing**:
   `parse_plcproj`'s second argument is used to resolve every
   `<Compile Include="...">` path, and those paths are always relative to
