@@ -531,7 +531,8 @@ mod tests {
 
     #[test]
     fn discover_when_plcproj_nested_several_levels_then_finds_it() {
-        // Matches the real brotlib layout: MONETN/MONETN/MONETNRuntime/MONETNRuntime.plcproj
+        // Matches a real layout found in a private test corpus:
+        // TestProject/TestProject/TestProjectRuntime/TestProjectRuntime.plcproj
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("Solution").join("Runtime");
         fs::create_dir_all(&nested).unwrap();
@@ -634,7 +635,7 @@ mod tests {
 
     #[test]
     fn discover_when_multiple_plcproj_candidates_then_picks_deterministically() {
-        // Matches a real duplicate found in the brotlib corpus (an
+        // Matches a real duplicate found in a private test corpus (an
         // apparent stale rename artifact): two .plcproj files in the
         // same directory. Must not error or pick non-deterministically.
         let dir = TempDir::new().unwrap();
