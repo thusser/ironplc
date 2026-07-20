@@ -682,6 +682,46 @@ END_FUNCTION_BLOCK
     }
 
     #[test]
+    fn write_to_string_when_located_array_mixed_with_plain_var_then_round_trips() {
+        use dsl::common::{InitialValueAssignmentKind, LibraryElementKind, VariableIdentifier};
+
+        let source = "
+FUNCTION_BLOCK FB_Example
+VAR
+    bEnabled : BOOL;
+    outputs AT%Q* : ARRAY[0..9] OF BOOL;
+END_VAR
+END_FUNCTION_BLOCK
+";
+        let options = CompilerOptions {
+            allow_mixed_located_var_declarations: true,
+            ..CompilerOptions::default()
+        };
+        let library_original = parse_program(source, &FileId::default(), &options).unwrap();
+        let rendered = write_to_string(&library_original).unwrap();
+
+        assert!(rendered.contains("AT %Q*"));
+        assert!(rendered.contains("ARRAY"));
+
+        let library_rendered = parse_program(&rendered, &FileId::default(), &options)
+            .expect("rendered output must parse under the same dialect");
+
+        let fb = match &library_rendered.elements[0] {
+            LibraryElementKind::FunctionBlockDeclaration(fb) => fb,
+            other => panic!("expected FunctionBlockDeclaration, got {other:?}"),
+        };
+        let outputs = fb
+            .variables
+            .iter()
+            .find(|v| matches!(&v.identifier, VariableIdentifier::Direct(d) if d.name.as_ref().map(|n| n.to_string()) == Some("outputs".to_string())))
+            .expect("outputs should still be a Direct (located) variable");
+        assert!(matches!(
+            &outputs.initializer,
+            InitialValueAssignmentKind::Array(_)
+        ));
+    }
+
+    #[test]
     fn write_to_string_when_qualified_fb_call_then_round_trips() {
         let source = "
 FUNCTION_BLOCK FB_Outer

@@ -102,9 +102,24 @@ work.
 ## Tasks
 
 - [x] Write plan (this document)
-- [ ] Grammar fix in `located_var1_init_decl()`
-- [ ] Tests from Testing Strategy
-- [ ] Verify end-to-end via CLI
-- [ ] Run full CI pipeline (`cd compiler && just`)
+- [x] Grammar fix in `located_var1_init_decl()`
+- [x] Tests from Testing Strategy
+- [x] Verify end-to-end via CLI
+- [x] Run full CI pipeline (`cd compiler && just`)
 - [ ] Push branch to fork
 - [ ] Merge into `twincat-dev`, update `twincat-status.md`, push
+
+## Implementation Notes
+
+- No changes needed beyond the single grammar-rule fix: `UntypedVarDecl`'s
+  location handling and the mixed-block semantic gating
+  (`rule_mixed_located_var_declarations.rs`) were both already
+  shape-agnostic (they key off the `location` field, not the
+  `initializer` variant), and `visit_initial_value_assignment_kind` in
+  the plc2plc renderer already dispatches `Array` generically — neither
+  needed touching.
+- Verified end-to-end via the CLI both ways: the mixed located-array
+  repro parses clean under `--dialect=codesys`, and correctly produces
+  `P4038` under the default dialect (confirming the mixed-block
+  semantic gate applies to the array case exactly like every other
+  located-variable shape).

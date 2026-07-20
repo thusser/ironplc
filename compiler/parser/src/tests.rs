@@ -2214,6 +2214,83 @@ END_PROGRAM",
         assert_eq!(prog.variables[1].qualifier, DeclarationQualifier::Retain);
     }
 
+    // -----------------------------------------------------------------
+    // AT-located ARRAY variable in a mixed VAR block.
+    // See specs/plans/2026-07-20-twincat-located-array-mixed-block.md.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_when_located_array_mixed_with_plain_var_then_ok() {
+        let lib = parse_text(
+            "FUNCTION_BLOCK FB_Example
+VAR
+    bEnabled : BOOL;
+    outputs AT %Q* : ARRAY[0..9] OF BOOL;
+END_VAR
+END_FUNCTION_BLOCK",
+        );
+        let fb = cast!(
+            &lib.elements[0],
+            LibraryElementKind::FunctionBlockDeclaration
+        );
+        assert_eq!(fb.variables.len(), 2);
+        assert!(matches!(
+            &fb.variables[0].identifier,
+            VariableIdentifier::Symbol(_)
+        ));
+        assert!(matches!(
+            &fb.variables[1].identifier,
+            VariableIdentifier::Direct(_)
+        ));
+        assert!(matches!(
+            &fb.variables[1].initializer,
+            InitialValueAssignmentKind::Array(_)
+        ));
+    }
+
+    #[test]
+    fn parse_when_located_array_complete_address_mixed_with_plain_var_then_ok() {
+        let lib = parse_text(
+            "FUNCTION_BLOCK FB_Example
+VAR
+    bEnabled : BOOL;
+    outputs AT %QX0.0 : ARRAY[0..9] OF BOOL;
+END_VAR
+END_FUNCTION_BLOCK",
+        );
+        let fb = cast!(
+            &lib.elements[0],
+            LibraryElementKind::FunctionBlockDeclaration
+        );
+        assert_eq!(fb.variables.len(), 2);
+        assert!(matches!(
+            &fb.variables[1].initializer,
+            InitialValueAssignmentKind::Array(_)
+        ));
+    }
+
+    #[test]
+    fn parse_when_located_array_alone_in_dedicated_block_then_ok() {
+        // Regression: the dedicated-block path already worked before this
+        // fix and must be unaffected by it.
+        let lib = parse_text(
+            "FUNCTION_BLOCK FB_Example
+VAR
+    outputs AT %Q* : ARRAY[0..9] OF BOOL;
+END_VAR
+END_FUNCTION_BLOCK",
+        );
+        let fb = cast!(
+            &lib.elements[0],
+            LibraryElementKind::FunctionBlockDeclaration
+        );
+        assert_eq!(fb.variables.len(), 1);
+        assert!(matches!(
+            &fb.variables[0].initializer,
+            InitialValueAssignmentKind::Array(_)
+        ));
+    }
+
     #[test]
     fn parse_when_program_motor_control_style_then_ok() {
         let lib = parse_text(
