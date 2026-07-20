@@ -87,9 +87,21 @@ New problem code `P4040` (`AbstractFunctionBlockInstantiated`).
 ## Tasks
 
 - [x] Write plan (this document)
-- [ ] New `P4040` problem code + doc
-- [ ] New semantic rule + registration
-- [ ] Tests from Testing Strategy
-- [ ] Run full CI pipeline (`cd compiler && just`)
+- [x] New `P4040` problem code + doc
+- [x] New semantic rule + registration
+- [x] Tests from Testing Strategy
+- [x] Run full CI pipeline (`cd compiler && just`)
 - [ ] Push branch to fork
 - [ ] Merge into `twincat-dev`, update `twincat-status.md`, push
+
+## Implementation Notes
+
+- Verified end-to-end via the CLI: the exact TcXaeShell repro now
+  produces `P4040` under `--dialect=codesys` (alongside the pre-existing
+  `P9004` for the `ABSTRACT` clause itself -- both fire independently,
+  which is correct: one flags the vendor extension as recognized-but-
+  unsupported in general, the other specifically flags the instantiation
+  attempt).
+- Confirmed a concrete subclass of an abstract base can still be
+  instantiated normally -- the check only looks at the *declared*
+  type's own `is_abstract`, not anything about its ancestry.
