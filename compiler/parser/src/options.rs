@@ -297,10 +297,15 @@ define_compiler_options! {
     [Rusty, Codesys],
     allow_mixed_located_var_declarations,
 
-    "Register Beckhoff Tc2_Math library functions (LTRUNC, LMOD) as built-in stdlib functions",
+    "Register Beckhoff Tc2_Math library functions (LTRUNC, LMOD, MODABS) as built-in stdlib functions",
     "--allow-extended-math-functions",
     [Rusty, Codesys],
     allow_extended_math_functions,
+
+    "Allow the AND_THEN short-circuit boolean operator (Beckhoff/CODESYS extension)",
+    "--allow-short-circuit-operators",
+    [Rusty, Codesys],
+    allow_short_circuit_operators,
 }
 
 /// Format a human-readable summary of all dialects and which features each
@@ -363,6 +368,7 @@ mod tests {
         assert!(!options.allow_constant_initializer_expressions);
         assert!(!options.allow_mixed_located_var_declarations);
         assert!(!options.allow_extended_math_functions);
+        assert!(!options.allow_short_circuit_operators);
     }
 
     #[test]
@@ -392,6 +398,7 @@ mod tests {
         assert!(!options.allow_constant_initializer_expressions);
         assert!(!options.allow_mixed_located_var_declarations);
         assert!(!options.allow_extended_math_functions);
+        assert!(!options.allow_short_circuit_operators);
     }
 
     #[test]
@@ -420,6 +427,7 @@ mod tests {
         assert!(options.allow_constant_initializer_expressions);
         assert!(options.allow_mixed_located_var_declarations);
         assert!(options.allow_extended_math_functions);
+        assert!(options.allow_short_circuit_operators);
     }
 
     #[test]
@@ -450,6 +458,7 @@ mod tests {
         assert!(options.allow_constant_initializer_expressions);
         assert!(options.allow_mixed_located_var_declarations);
         assert!(options.allow_extended_math_functions);
+        assert!(options.allow_short_circuit_operators);
     }
 
     /// REQ-PAB-051: The `rusty` dialect preset enables partial-access syntax.
@@ -476,7 +485,7 @@ mod tests {
 
     #[test]
     fn feature_descriptors_when_called_then_contains_all_vendor_flags() {
-        assert_eq!(CompilerOptions::FEATURE_DESCRIPTORS.len(), 21);
+        assert_eq!(CompilerOptions::FEATURE_DESCRIPTORS.len(), 22);
         assert_eq!(
             CompilerOptions::FEATURE_DESCRIPTORS[0].cli_flag,
             "--allow-c-style-comments"
@@ -490,7 +499,7 @@ mod tests {
             .filter(|f| f.dialects.contains(&Dialect::Rusty))
             .map(|f| f.cli_flag)
             .collect();
-        assert_eq!(rusty_features.len(), 21);
+        assert_eq!(rusty_features.len(), 22);
     }
 
     #[test]
@@ -500,7 +509,7 @@ mod tests {
             .filter(|f| f.dialects.contains(&Dialect::Codesys))
             .map(|f| f.cli_flag)
             .collect();
-        assert_eq!(codesys_features.len(), 20);
+        assert_eq!(codesys_features.len(), 21);
         assert!(!codesys_features.contains(&"--allow-system-uptime-global"));
     }
 
