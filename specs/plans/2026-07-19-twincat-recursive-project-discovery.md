@@ -162,12 +162,37 @@ this change scoped to the actual reported problem.
 
 ## Tasks
 
-- [ ] Write plan (this document)
-- [ ] `walk_files()` shared recursive helper
-- [ ] Wire into `detect_twincat()` (+ `root_dir`/`parse_plcproj` base-path fix)
-- [ ] Wire into `detect_fallback()`
-- [ ] Tests from Testing Strategy
-- [ ] Run full CI pipeline (`cd compiler && just`)
+- [x] Write plan (this document)
+- [x] `walk_files()` shared recursive helper
+- [x] Wire into `detect_twincat()` (+ `root_dir`/`parse_plcproj` base-path fix)
+- [x] Wire into `detect_fallback()`
+- [x] Tests from Testing Strategy (including the symlink-cycle-safety test)
+- [x] Run full CI pipeline (`cd compiler && just`)
 - [ ] Push branch to fork (no PR against `ironplc/ironplc` without explicit
       go-ahead, per standing instruction)
 - [ ] Merge into `twincat-dev`, update `twincat-status.md`, push
+
+## Implementation Notes
+
+- **Verified end-to-end against the real corpus, before and after**:
+  `ironplcc check MONETN` (top-level directory) went from
+  `P9002 Set of valid source files has no content` to actually parsing
+  real POUs (surfacing unrelated, pre-existing errors — unsupported
+  `.TcVMO`/`.TcTTO` visualization file types, an unsupported
+  `REFERENCE TO` variable, an unrelated parser edge case — confirming the
+  fix is isolated to discovery, nothing downstream needed to change).
+- **The real duplicate-`.plcproj` case resolved correctly by coincidence
+  of the lexicographic tie-break**: `MONETNRuntime.plcproj` sorts before
+  `MONETRuntime.plcproj`, and is also the one whose name matches its
+  containing folder (the "correct" one). Not a designed heuristic — just
+  confirms the simple tie-break didn't make things worse for the one real
+  case found with multiple candidates.
+- **The `root_dir`/base-path fix was easy to miss but load-bearing**:
+  `parse_plcproj`'s second argument is used to resolve every
+  `<Compile Include="...">` path, and those paths are always relative to
+  the `.plcproj` file's own directory — not the directory originally
+  passed to `discover()`. This was harmless before (when `.plcproj` was
+  required to live directly in that directory, the two were the same
+  path) but silently wrong once nesting is allowed. Caught by writing a
+  test with a `.plcproj` referencing a file in its own subdirectory
+  before assuming the straightforward wiring was correct.
