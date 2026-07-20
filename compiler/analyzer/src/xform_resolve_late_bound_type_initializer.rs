@@ -390,6 +390,7 @@ END_FUNCTION_BLOCK
                                 "val1", "val2", "val3",
                             ]),
                             default: None,
+                            underlying_type: None,
                         },
                     },
                 )),
