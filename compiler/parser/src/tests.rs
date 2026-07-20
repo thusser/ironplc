@@ -6,8 +6,8 @@ mod test {
         EnumeratedSpecificationInit, EnumerationDeclaration, FunctionBlockBodyKind,
         FunctionBlockDeclaration, FunctionDeclaration, FunctionReturnType,
         InitialValueAssignmentKind, Library, LibraryElementKind, ProgramDeclaration, RealLiteral,
-        ReferenceTarget, SimpleInitializer, SpecificationKind, TypeName, TypeReference, VarDecl,
-        VariableIdentifier, VariableType,
+        ReferenceKeyword, ReferenceTarget, SimpleInitializer, SpecificationKind, TypeName,
+        TypeReference, VarDecl, VariableIdentifier, VariableType,
     };
     use dsl::configuration::{
         ConfigurationDeclaration, DataSourceKind, ProgramConfiguration, ResourceDeclaration,
@@ -1520,9 +1520,7 @@ END_PROGRAM",
 
     #[test]
     fn parse_when_reference_to_var_decl_then_same_shape_as_ref_to() {
-        // CODESYS/TwinCAT alternate spelling of REF_TO -- matches real
-        // usage found in a private test corpus (fbCovers : REFERENCE TO
-        // FB_CoverControl;).
+        // CODESYS/TwinCAT alternate spelling of REF_TO.
         let lib = parse_text_edition3(
             "PROGRAM main
 VAR
@@ -1536,13 +1534,12 @@ END_PROGRAM",
             InitialValueAssignmentKind::Reference
         );
         assert_eq!(ref_init.target.type_name().unwrap().to_string(), "INT");
+        assert_eq!(ref_init.keyword, ReferenceKeyword::Reference);
     }
 
     #[test]
     fn parse_when_pointer_to_var_decl_then_same_shape_as_ref_to() {
-        // CODESYS/TwinCAT alternate spelling of REF_TO -- matches real
-        // usage found in a private test corpus (pCover : POINTER TO
-        // FB_CoverControl;).
+        // CODESYS/TwinCAT alternate spelling of REF_TO.
         let lib = parse_text_edition3(
             "PROGRAM main
 VAR
@@ -1556,6 +1553,24 @@ END_PROGRAM",
             InitialValueAssignmentKind::Reference
         );
         assert_eq!(ref_init.target.type_name().unwrap().to_string(), "INT");
+        assert_eq!(ref_init.keyword, ReferenceKeyword::Pointer);
+    }
+
+    #[test]
+    fn parse_when_ref_to_var_decl_then_keyword_is_ref_to() {
+        let lib = parse_text_edition3(
+            "PROGRAM main
+VAR
+    x : REF_TO INT;
+END_VAR
+END_PROGRAM",
+        );
+        let prog = cast!(&lib.elements[0], LibraryElementKind::ProgramDeclaration);
+        let ref_init = cast!(
+            &prog.variables[0].initializer,
+            InitialValueAssignmentKind::Reference
+        );
+        assert_eq!(ref_init.keyword, ReferenceKeyword::RefTo);
     }
 
     #[test]
