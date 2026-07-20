@@ -183,6 +183,14 @@ features — they never disable features that a dialect already includes.
    :doc:`P9004 </reference/compiler/problems/P9004>` rather than a parse
    error. Enabled by ``--dialect=rusty`` and ``--dialect=codesys``.
 
+   A qualified call statement (``instance.Method(...)``, calling a method
+   through a member instance) is parsed unconditionally under any dialect
+   — no flag needed — since it requires no new keyword, but produces the
+   same :doc:`P9004 </reference/compiler/problems/P9004>` diagnostic for
+   the same reason: method/interface dispatch is not yet implemented. An
+   ordinary direct invocation (``instance(...)``) is standard IEC 61131-3
+   and is never flagged.
+
 ``--allow-math-constants``
    Register implicit math constants (currently just ``PI``) as built-in
    ``LREAL`` globals, matching CODESYS/TwinCAT behavior where these names

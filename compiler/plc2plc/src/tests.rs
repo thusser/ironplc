@@ -595,4 +595,26 @@ END_FUNCTION_BLOCK
             .expect("fbComm should still be a plain Symbol variable");
         assert!(matches!(&fb_comm.identifier, VariableIdentifier::Symbol(_)));
     }
+
+    #[test]
+    fn write_to_string_when_qualified_fb_call_then_round_trips() {
+        let source = "
+FUNCTION_BLOCK FB_Outer
+VAR
+    fbComm : FB_Inner;
+END_VAR
+    fbComm.Publish('a', 'b');
+END_FUNCTION_BLOCK
+";
+        let library_original =
+            parse_program(source, &FileId::default(), &CompilerOptions::default()).unwrap();
+        let rendered = write_to_string(&library_original).unwrap();
+
+        assert!(rendered.contains("fbComm.Publish"));
+
+        let library_rendered =
+            parse_program(&rendered, &FileId::default(), &CompilerOptions::default())
+                .expect("rendered output must parse");
+        assert_eq!(library_original, library_rendered);
+    }
 }

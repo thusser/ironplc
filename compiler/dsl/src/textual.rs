@@ -8,6 +8,7 @@ use crate::common::{
 use crate::core::{Id, Located, SourceSpan};
 use std::fmt;
 
+use crate::extension::{ExtensionOrigin, VendorExtension};
 use crate::fold::Fold;
 use crate::visitor::Visitor;
 use dsl_macro_derive::Recurse;
@@ -306,6 +307,17 @@ impl Located for DerefVariable {
 /// See section 3.2.3.
 #[derive(Debug, PartialEq, Clone, Recurse)]
 pub struct FbCall {
+    /// Present for a qualified call (`instance.Method(...)`) -- the name
+    /// of the receiver instance. `None` for an ordinary direct FB
+    /// invocation (`instance(...)`), which is standard IEC 61131-3.
+    ///
+    /// A qualified call is a CODESYS/TwinCAT vendor extension (calling a
+    /// method through a member/interface-typed instance) -- see the
+    /// `VendorExtension` impl below. IronPLC does not yet implement
+    /// method/interface dispatch, so it is parsed and recognized but
+    /// flagged as not yet supported (P9004), not executed.
+    #[recurse(ignore)]
+    pub qualifier: Option<Id>,
     /// Name of the variable that is associated with the function block
     /// call.
     pub var_name: Id,
@@ -315,6 +327,24 @@ pub struct FbCall {
 
 impl Located for FbCall {
     fn span(&self) -> SourceSpan {
+        self.position.clone()
+    }
+}
+
+/// A qualified call (`instance.Method(...)`) is a CODESYS/TwinCAT vendor
+/// extension; an ordinary direct FB invocation (`instance(...)`) is
+/// standard IEC 61131-3. The `rule_unsupported_extension` semantic rule
+/// only calls this when `qualifier` is actually present.
+impl VendorExtension for FbCall {
+    fn extension_name(&self) -> &'static str {
+        "Qualified method-call statement"
+    }
+
+    fn extension_origins(&self) -> &'static [ExtensionOrigin] {
+        &[ExtensionOrigin::BeckhoffCodesys]
+    }
+
+    fn extension_span(&self) -> SourceSpan {
         self.position.clone()
     }
 }
@@ -771,6 +801,7 @@ impl StmtKind {
             .collect::<Vec<ParamAssignmentKind>>();
 
         StmtKind::FbCall(FbCall {
+            qualifier: None,
             var_name: Id::from(fb_instance_name),
             params: assignments,
             position: SourceSpan::default(),

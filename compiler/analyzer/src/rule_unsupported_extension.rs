@@ -19,6 +19,7 @@ use ironplc_dsl::{
     common::*,
     diagnostic::{Diagnostic, Label},
     extension::VendorExtension,
+    textual::FbCall,
     visitor::Visitor,
 };
 use ironplc_problems::Problem;
@@ -73,6 +74,17 @@ impl Visitor<Diagnostic> for RuleUnsupportedExtension {
         // Most function blocks are standard IEC 61131-3 — only flag when
         // the EXTENDS/IMPLEMENTS clause is actually present.
         if node.extends.is_some() || !node.implements.is_empty() {
+            self.flag(node);
+        }
+        node.recurse_visit(self)
+    }
+
+    fn visit_fb_call(&mut self, node: &FbCall) -> Result<Self::Value, Diagnostic> {
+        // Most FB calls are a plain, standard IEC 61131-3 direct
+        // invocation (instance(...)) — only flag a qualified call
+        // (instance.Method(...)), which requires method/interface
+        // dispatch IronPLC does not yet implement.
+        if node.qualifier.is_some() {
             self.flag(node);
         }
         node.recurse_visit(self)
@@ -195,5 +207,47 @@ END_FUNCTION_BLOCK";
         // One for the INTERFACE declaration, one for the FB's
         // EXTENDS/IMPLEMENTS clause.
         assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn apply_when_qualified_fb_call_then_p9004() {
+        let program = "
+FUNCTION_BLOCK FB_Inner
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK FB_Outer
+VAR
+    fbComm : FB_Inner;
+END_VAR
+    fbComm.Publish();
+END_FUNCTION_BLOCK";
+
+        let (input, _context) =
+            parse_and_resolve_types_with_options(program, &CompilerOptions::default());
+        let context = SemanticContextBuilder::new().build().unwrap();
+        let result = apply(&input, &context, &CompilerOptions::default());
+
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(Problem::UnsupportedExtension.code(), errors[0].code);
+    }
+
+    #[test]
+    fn apply_when_unqualified_fb_call_then_ok() {
+        let program = "
+FUNCTION_BLOCK FB_Inner
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK FB_Outer
+VAR
+    fbComm : FB_Inner;
+END_VAR
+    fbComm();
+END_FUNCTION_BLOCK";
+
+        let (input, _context) =
+            parse_and_resolve_types_with_options(program, &CompilerOptions::default());
+        let context = SemanticContextBuilder::new().build().unwrap();
+        let result = apply(&input, &context, &CompilerOptions::default());
+
+        assert!(result.is_ok());
     }
 }
