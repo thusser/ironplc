@@ -40,7 +40,8 @@ first if the callee's `METHOD` body is included in the same test):
   form for a call following it.
 
 Checked what `fbComm`'s real type actually is in the reporting codebase
-(`/home/husser/code/brotlib`): **`fbComm : I_Comm;`** — an **interface
+(a private local checkout of a real TwinCAT project):
+**`fbComm : I_Comm;`** — an **interface
 type**, not a concrete function block. `Publish` is a method on that
 interface, dispatched polymorphically to whatever concrete FB is assigned
 to `fbComm` at runtime (confirmed a `THIS^.fbComm := comm;` assignment
