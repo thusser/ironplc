@@ -60,8 +60,8 @@ registration, no grammar or parser change.
 
 ## Verified against real project files
 
-Checked `/home/husser/code/brotlib` (same TwinCAT codebase used for prior
-plans):
+Checked a private local checkout of a real TwinCAT codebase (the same
+one used for prior plans):
 
 - `PI` is used as a bare identifier in expressions across ~18 files, e.g.:
   `d2r : LREAL := PI/180.0;` (`FB_TelescopeControl.TcPOU`,
