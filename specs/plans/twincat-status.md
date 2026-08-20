@@ -6,6 +6,35 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-08-20: `twincat-dev` synced to `main` (v0.239.0)
+
+Routine sync, no PR changes. Local `main` had fallen 26 commits behind;
+fast-forwarded `57819df8 -> d8af5b80` (v0.239.0). Upstream had advanced
+by exactly one commit since the last entry (`d8af5b80`, a CI version
+bump touching only `Cargo.toml`/`Cargo.lock`/`package.json`/`docs/VERSION`
+-- no source changes missed).
+
+`twincat-dev` rebased onto the new tip per the standing playbook (old
+tip archived, branch rebuilt on fresh `main`): the two twincat commits
+(`a677c849` codegen, `d059fcbc` status doc) reapplied cleanly, zero
+conflicts. Verified the codegen patch is byte-identical after rebase
+(`git diff 82e17eb5 1ea861d0` == `git diff d8af5b80 a677c849`); only
+version-bump files differ in the tree, as expected. Old tip preserved
+as **`twincat-dev-archive-20260820`** (`23aac7c7`).
+
+**Correction to an earlier session's audit**: the archive refs the
+2026-08-16/17 entries mention *do* exist -- they're **tags**, not
+branches (`refs/tags/twincat-dev-archive-20260816` -> `803c3865`,
+`refs/tags/twincat-dev-archive-20260817` -> `f3526146`). The doc was
+accurate; the earlier check had only looked at `git branch`, not
+`git tag`.
+
+Re-verified PR state against upstream while here: #1361 `CLOSED`,
+#1386/#1378 `MERGED`, #1362 still `OPEN` + `MERGEABLE` with no review
+decision yet. Fork `main` (thusser/ironplc) remains 133 commits behind
+upstream -- expected, since the fork only hosts `twincat-dev` and opens
+PRs upstream.
+
 ## 2026-08-17: #1361 closed too -- superseded by garretfick's own #1386
 
 garretfick closed [#1361](https://github.com/ironplc/ironplc/pull/1361)
