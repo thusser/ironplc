@@ -67,24 +67,48 @@ members yet. Spot-checked representative failures; all genuine (e.g.
 Per-solution pass: IAG50cm 22/50, BROTLib 20/57, AstroBROT 3/22, MONETN
 1/10, HalfBROT 1/10, MONETS 1/4, MONETRoof 0/5, MONETcommon 0/8.
 
-**Gap re-triage** (the six "Remaining gaps" items): **item 2** (`^.`
-inside a structured/call-style initializer) confirmed still present --
-`FB_CoverClosingState.TcPOU`: `tonDelta : TON := (PT:= pCover^.Delta);`.
-**Item 3** (`THIS^.Method()`) confirmed still present --
-`FB_MonetCoverControl.TcPOU:116`: `THIS^._SendTelemetry();`. **Item 4**
-(external Beckhoff types) confirmed still present -- `AXIS_REF`/`MC_Home`
-in IAG50cm and MONETN. **Item 6** (namespace-qualified identifiers): no
-real hits outside string literals (the `AUXILIARY.SENSOR[1].NAME`-style
-matches are quoted strings, not identifiers) -- still not in the private
-corpus. **Item 1** (case-sensitivity) still unverified -- needs a
-targeted declared-vs-called pair test, not a corpus scan. Item 5
-unchanged (blocked on #1362's codegen landing).
+**Gap re-triage** (the six "Remaining gaps" items) -- **corrected
+2026-08-20 after source-level verification** (the initial version of
+this entry said items 1 and 2 were still present; that was wrong):
 
-Bottom line: nothing here changes the "wait on the maintainer" status,
-but it confirms the doc's standing analysis -- remaining failures are
-dominated by cross-file resolution (P2008/P4012) plus the known `THIS^`
-and `^.`-initializer gaps, and the two cheapest confirmed-live gaps
-(items 2 and 3) are the ones deferred behind #1362.
+- **Item 1** (function-call case-sensitivity) -- **already fixed, long
+  before this work started**: `FunctionEnvironment` stores lowercase
+  keys with a dedicated test
+  (`function_environment_get_when_case_insensitive_then_finds_function`,
+  added in #436, 2026-02-06). The "not yet confirmed" caveat in the
+  Remaining gaps section is stale and can be removed.
+- **Item 2** (`^.` inside a structured/call-style initializer) --
+  **already fixed** via `allow_struct_initializer_expressions`, which is
+  enabled in the `twincat` dialect (`options.rs`; flag introduced in
+  #1276). Verified with an isolated repro of the exact corpus pattern
+  (`tonDelta : TON := (PT:= pCover^.Delta);` in an EXTENDS FB): checks
+  clean, exit 0. The corpus file's failure on this line is a
+  **per-file-check artifact**, not a gap: `pCover` is declared in the
+  *base* class `FB_CoverState` (separate file), so single-file checking
+  can't resolve it -- that's the known cross-file P2008 family, not
+  initializer grammar.
+- **Item 3** (`THIS^.Method()`) -- **genuinely still open, confirmed
+  live in the corpus** (`FB_MonetCoverControl.TcPOU:116`:
+  `THIS^._SendTelemetry();`). Isolated repro: `THIS^.field := x` parses
+  but fails semantic (P4007, THIS undefined); `THIS^._CallMe()` fails
+  to *parse* -- after `THIS^._Method` the grammar accepts
+  `.`/`:=`/`REF`/`[`/`^`/newline but **not `(`**. This is a parse-level
+  grammar + symbol-resolution gap, independent of the METHOD-call
+  codegen in #1362 -- the one genuinely unblocked, corpus-confirmed
+  item left. Candidate for its own small PR (parse-level only, no
+  codegen, per the maintainer's no-stacking guidance).
+- **Item 4** (external Beckhoff types) confirmed still present --
+  `AXIS_REF`/`MC_Home` in IAG50cm and MONETN.
+- **Item 6** (namespace-qualified identifiers): no real hits outside
+  string literals (the `AUXILIARY.SENSOR[1].NAME`-style matches are
+  quoted strings, not identifiers) -- still not in the private corpus.
+- Item 5 unchanged (blocked on #1362's codegen landing).
+
+Bottom line: nothing here changes the "wait on the maintainer" status
+for #1362, but the gap list shrinks -- items 1 and 2 are closed, and
+the remaining corpus-confirmed gaps are cross-file resolution
+(P2008/P4012), external Beckhoff types (item 4), and the parse-level
+`THIS^.Method()` (item 3).
 
 ## 2026-08-17: #1361 closed too -- superseded by garretfick's own #1386
 
@@ -392,9 +416,9 @@ history needs to be dug up later (it is **not** pushed anywhere).
   measured checkpoint (2026-08-02, against a fork build with all PRs of
   the time applied): 49/173 (~28%), with the OOP `EXTENDS`/`IMPLEMENTS`
   gate (`P9004`, 46 files) as the single largest remaining bucket at that
-  point -- since resolved by #1301's OOP foundation landing. Pass rate has
-  not been re-measured since; worth doing before picking the next item
-  below.
+  point -- since resolved by #1301's OOP foundation landing. Re-measured
+  on 2026-08-20: 48/166 (~29%) per-file against fresh `main` v0.239.0 --
+  see the 2026-08-20 corpus re-check entry above.
 
 ## Architecture change: compiler-builtin registration rejected, replaced by compatibility libraries
 
@@ -453,7 +477,7 @@ function as a compiler built-in, check whether it should instead be a
 grammar/syntax additions (new keywords, new expression shapes) are
 unaffected by this change.
 
-## Remaining gaps (from the 2026-07-20 re-scan, not yet re-verified against current `main`)
+## Remaining gaps (from the 2026-07-20 re-scan; items 1 and 2 re-verified 2026-08-20)
 
 These were identified during the original private-corpus + 5-external-repo
 survey and had not been re-triaged as of the last rebuild. Re-verify each
@@ -465,18 +489,34 @@ rankings and construct names are not reliable cost estimates on their own.
    declared `SOME_FUNCTION`, called `some_function`) -- function-call
    resolution (`FunctionEnvironment`) not yet confirmed case-insensitive,
    unlike `TypeName`/`Id` lookups which already are.
+   **CLOSED 2026-08-20**: `FunctionEnvironment` stores lowercase keys
+   with a dedicated case-insensitive test since #436 (2026-02-06); the
+   "not yet confirmed" caveat was stale.
 2. **`^.` (deref + member access) inside a structured/call-style `VAR`
    initializer** -- e.g. `tonDelta : TON := (PT := pDevice^.Delta);`.
    Plain `:=` initializers already handle `^.` fine via `expression()`;
    this is specifically the structured/call-style initializer position.
+   **CLOSED 2026-08-20**: supported via
+   `allow_struct_initializer_expressions` (#1276), enabled in the
+   `twincat` dialect; verified with an isolated repro of the exact
+   corpus pattern (checks clean). Corpus failures on this line were a
+   per-file-check artifact (base-class var in another file -> P2008
+   cross-file family, see item 4), not initializer grammar.
 3. **`THIS^.Method()`** -- calling a method via an explicit `THIS^`
    pointer-dereference. Unclear whether it needs its own grammar support
    or composes with the existing qualified-call-parsing work.
+   **STILL OPEN 2026-08-20**: confirmed live in the corpus
+   (`FB_MonetCoverControl.TcPOU:116`: `THIS^._SendTelemetry();`);
+   isolated repro fails to parse -- grammar accepts `.`/`:=`/`REF`/`[`/
+   `^` after `THIS^._Method` but not `(`. Parse-level only, independent
+   of #1362's codegen.
 4. **`P2008` remaining pieces**: genuinely external Beckhoff-library types
    with no source in the corpus (`MC_Home`, `AXIS_REF`, etc. --
    Motion/System libraries, not fixable without stub/declaration-only
    registration -- a much larger effort) and one same-project resolution
    gap that only reproduces in a private corpus not available here.
+   **Re-confirmed present 2026-08-20** (`AXIS_REF`/`MC_Home` in IAG50cm
+   and MONETN).
 5. **Full OOP dispatch** (`METHOD`/`PROPERTY` bodies, access modifiers,
    inheritance *dispatch*, `THIS^`/`SUPER^`) -- #1301 landed the
    `EXTENDS`/`IMPLEMENTS`/`INTERFACE` foundation and field-inheritance
@@ -488,6 +528,8 @@ rankings and construct names are not reliable cost estimates on their own.
    the single biggest gap found across 5 external public TwinCAT repos
    checked (82/491 files, ~17%). Worth revisiting for any future
    multi-namespace/library-style project.
+   **Re-checked 2026-08-20**: still no real hits in the private corpus
+   (matches were quoted strings, not identifiers).
 
 ## Key design decisions (apply to future work in this area too)
 
