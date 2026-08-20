@@ -35,6 +35,57 @@ decision yet. Fork `main` (thusser/ironplc) remains 133 commits behind
 upstream -- expected, since the fork only hosts `twincat-dev` and opens
 PRs upstream.
 
+## 2026-08-20: per-file corpus re-check -- 48/166 pass (~29%)
+
+Re-ran the standing per-file corpus check (`ironplcc check --dialect
+twincat`, one file at a time) against all 8 real solutions under
+`/home/husser/code/brotlib`, built from fresh `main` v0.239.0 + our
+codegen commit (`feature/twincat-oop-method-codegen`).
+
+**48/166 files pass clean (~29%)**, down from 57/176 (~32%) at the
+2026-08-12 checkpoint. Caveat: the denominator changed (176 -> 166
+files; brotlib is not a git repo, so the file-set drift can't be
+diffed). First error code per failed file, vs 08-12:
+
+| Code | 08-12 | Now | Trend |
+|---|---|---|---|
+| P0002 syntax | 49 | 35 | down -- parser accepts more |
+| P2008 cross-file resolution | 27 | 41 | up |
+| P9999 not-implemented-in-codegen | 19 | 18 | flat |
+| P4038 non-constant initializer | 11 | 11 | flat |
+| P4017 undeclared function | 8 | 8 primary / 36 occurrences | flat as primary, up as secondary |
+
+Secondary codes also rose on the same files (not counted in the first
+code per file): P4012 FB-not-in-scope 34 occurrences, P4007 undefined
+var 29, P4008 const-without-init 18, P4017 36. This is exactly the mix
+shift the 08-13 entry predicted -- more `instance.Method(args)` now
+parses, but a chunk of it doesn't resolve against `EXTENDS`-inherited
+members yet. Spot-checked representative failures; all genuine (e.g.
+`FB_NUTATE.TcPOU` P0002 on `1/189474` in an array initializer,
+`FB_CO_ABERRATION.TcPOU` P2008 on `FB_SUNPOS`/`FB_IAU2000B` types).
+
+Per-solution pass: IAG50cm 22/50, BROTLib 20/57, AstroBROT 3/22, MONETN
+1/10, HalfBROT 1/10, MONETS 1/4, MONETRoof 0/5, MONETcommon 0/8.
+
+**Gap re-triage** (the six "Remaining gaps" items): **item 2** (`^.`
+inside a structured/call-style initializer) confirmed still present --
+`FB_CoverClosingState.TcPOU`: `tonDelta : TON := (PT:= pCover^.Delta);`.
+**Item 3** (`THIS^.Method()`) confirmed still present --
+`FB_MonetCoverControl.TcPOU:116`: `THIS^._SendTelemetry();`. **Item 4**
+(external Beckhoff types) confirmed still present -- `AXIS_REF`/`MC_Home`
+in IAG50cm and MONETN. **Item 6** (namespace-qualified identifiers): no
+real hits outside string literals (the `AUXILIARY.SENSOR[1].NAME`-style
+matches are quoted strings, not identifiers) -- still not in the private
+corpus. **Item 1** (case-sensitivity) still unverified -- needs a
+targeted declared-vs-called pair test, not a corpus scan. Item 5
+unchanged (blocked on #1362's codegen landing).
+
+Bottom line: nothing here changes the "wait on the maintainer" status,
+but it confirms the doc's standing analysis -- remaining failures are
+dominated by cross-file resolution (P2008/P4012) plus the known `THIS^`
+and `^.`-initializer gaps, and the two cheapest confirmed-live gaps
+(items 2 and 3) are the ones deferred behind #1362.
+
 ## 2026-08-17: #1361 closed too -- superseded by garretfick's own #1386
 
 garretfick closed [#1361](https://github.com/ironplc/ironplc/pull/1361)
