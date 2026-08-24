@@ -212,7 +212,8 @@ impl TerminatedReason {
     }
 }
 
-/// Executes a cached container for `trace_set` variables under `limits`.
+/// Executes a cached container for `trace_set` variables for `duration_ms` of
+/// simulated time, under `limits`.
 ///
 /// This is the core of the `run` tool. Control flow:
 /// 1. Deserialize bytes → `Container`.
@@ -221,9 +222,15 @@ impl TerminatedReason {
 ///    advanced its `scan_count`, append to trace.
 /// 4. On trap: capture diagnostic, drain final values from `VmFaulted`.
 /// 5. On clean stop: drain final values from `VmStopped`.
+///
+/// `duration_ms` is what the agent asked for (REQ-TOL-mcp-040); reaching it is
+/// a clean finish. `limits.max_duration_ms` is the sandbox ceiling
+/// (REQ-ARC-mcp-030); being cut short by it is not, and reports
+/// [`TerminatedReason::Duration`].
 pub fn execute(
     cached: &CachedContainer,
     trace_set: &[ResolvedVar],
+    duration_ms: u64,
     limits: EffectiveLimits,
 ) -> Result<RunOutcome, String> {
     let mut bytes = cached.iplc_bytes.as_slice();
@@ -255,10 +262,21 @@ pub fn execute(
     let mut prev_scan_counts: Vec<u64> = vec![0; task_names.len()];
     let mut truncated = false;
 
+    // The run stops at whichever comes first: the simulated duration the agent
+    // asked for, or the sandbox ceiling. Which one it was decides the reason —
+    // reaching the request is a clean finish, being clamped by the ceiling is
+    // an early termination (REQ-TOL-mcp-047).
+    let run_duration_ms = duration_ms.min(limits.max_duration_ms);
+    let duration_stop = if duration_ms > limits.max_duration_ms {
+        TerminatedReason::Duration
+    } else {
+        TerminatedReason::Completed
+    };
+
     let terminated_reason = loop {
         // Between-rounds limit gates (REQ-ARC-mcp-032/035).
-        if simulated_us / 1_000 >= limits.max_duration_ms {
-            break TerminatedReason::Duration;
+        if simulated_us / 1_000 >= run_duration_ms {
+            break duration_stop;
         }
         if wall_start.elapsed().as_millis() as u64 >= limits.max_wall_clock_ms {
             break TerminatedReason::WallClock;
@@ -273,12 +291,12 @@ pub fn execute(
 
         // Advance simulated time to the next cycle that's due.
         let next_due = running.next_due_us().unwrap_or(simulated_us);
-        let current_us = simulated_us.max(next_due);
+        let uptime_us = simulated_us.max(next_due);
 
-        // Re-check the duration gate against `current_us` so a cyclic task
+        // Re-check the duration gate against `uptime_us` so a cyclic task
         // due after the deadline doesn't execute.
-        if current_us / 1_000 >= limits.max_duration_ms {
-            break TerminatedReason::Duration;
+        if uptime_us / 1_000 >= run_duration_ms {
+            break duration_stop;
         }
 
         // Snapshot scan counts before the round so we can tell which tasks
@@ -294,11 +312,11 @@ pub fn execute(
         //
         // Simpler: just read from `running.scan_count()` (total) and
         // attribute the delta to the task the scheduler ran. The scheduler
-        // runs at most one task per round at the chosen `current_us`, so
+        // runs at most one task per round at the chosen `uptime_us`, so
         // this attribution is accurate.
         let before_total = running.scan_count();
 
-        if let Err(ctx) = running.run_round(current_us) {
+        if let Err(ctx) = running.run_round(uptime_us) {
             let trap_msg = ctx.trap.to_string();
             let faulted = running.fault(ctx);
             let final_values =
@@ -350,7 +368,7 @@ pub fn execute(
                 .collect();
 
             trace.push(TraceSample {
-                time_ms: current_us / 1_000,
+                time_ms: uptime_us / 1_000,
                 task: task_name,
                 variables,
             });
@@ -360,8 +378,8 @@ pub fn execute(
         // due cyclic tasks, break with Completed to avoid an infinite
         // freewheeling loop.
         match running.next_due_us() {
-            Some(next) if next > current_us => simulated_us = next,
-            Some(_) => simulated_us = current_us.saturating_add(1),
+            Some(next) if next > uptime_us => simulated_us = next,
+            Some(_) => simulated_us = uptime_us.saturating_add(1),
             None => break TerminatedReason::Completed,
         }
     };
