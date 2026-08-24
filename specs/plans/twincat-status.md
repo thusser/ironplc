@@ -558,11 +558,19 @@ rankings and construct names are not reliable cost estimates on their own.
 3. **`THIS^.Method()`** -- calling a method via an explicit `THIS^`
    pointer-dereference. Unclear whether it needs its own grammar support
    or composes with the existing qualified-call-parsing work.
-   **STILL OPEN 2026-08-20**: confirmed live in the corpus
-   (`FB_MonetCoverControl.TcPOU:116`: `THIS^._SendTelemetry();`);
-   isolated repro fails to parse -- grammar accepts `.`/`:=`/`REF`/`[`/
-   `^` after `THIS^._Method` but not `(`. Parse-level only, independent
-   of #1362's codegen.
+   **PARSING CLOSED 2026-08-24** by upstream #1403 (garretfick's own
+   "THIS^ and SUPER^ parsing", ADR-0041 Phase 1), picked up here via
+   today's `main` sync. Verified directly: `THIS^._SendTelemetry();`
+   inside a FUNCTION_BLOCK now parses clean (no `P0002`), stopping only
+   at semantic resolution (`P9999` "not yet resolved by IronPLC", from
+   `rule_method_call_declared.rs`). What remains isn't parse-level
+   anymore, isn't independent, and isn't ours to pick up: garretfick
+   opened **#1406** 2026-08-22 ("Reject SUPER^ where there's no base
+   type, and THIS^ outside a function block") as the deliberate
+   next small PR after #1403, and his 2026-08-24 comment on #1199 says
+   he's actively working parsing correctness right now. Don't start
+   this -- it's mid-flight under him, and duplicating it would repeat
+   the exact "too much similar code" complaint he already raised.
 4. **`P2008` remaining pieces**: genuinely external Beckhoff-library types
    with no source in the corpus (`MC_Home`, `AXIS_REF`, etc. --
    Motion/System libraries, not fixable without stub/declaration-only
