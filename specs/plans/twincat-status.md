@@ -6,6 +6,59 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-08-24: void-METHOD RETURN stack leak fixed; synced to `main` again
+
+garretfick flagged a real bug on PR #1362 (posted 2026-08-21, via Claude
+Code on his end): `RETURN;` inside a void `METHOD` compiled to a
+value-pushing `RET` instead of `RET_VOID`, because
+`compile_method.rs` set `CurrentFunctionReturn::Scalar` unconditionally
+regardless of whether the method had a return type. The call site only
+pops the return slot `if has_return_value`, so the leaked value
+(`fb_ref`) accumulates on the VM's never-reset operand stack across scan
+rounds and eventually traps `StackOverflow` far from the real cause.
+Fixed with a one-liner (`has_return_value.then_some(...)`); added a
+regression test that calls a void method with an early `RETURN;` in a
+loop within one scan round, and confirmed it reproduces the trap on the
+unfixed code. Pushed to both `twincat-dev` and PR #1362's branch; full
+CI clean.
+
+Also on issue #1199, garretfick said he's deliberately not reviewing
+any codegen PRs (including #1362) until parsing defects he's found are
+fixed first -- "better to refuse codegen than generate the wrong code."
+So #1362 is parked on his end for now; don't keep re-poking it.
+
+Separately pulled `main` into `twincat-dev` (15 commits, incl.
+THIS^/SUPER^ parsing under the same ADR-0041, and a new
+compile-time operand-stack-balance verifier in
+`container/src/verify.rs`, #1394). One real merge conflict in
+`compile_stmt.rs`: main had stubbed `MethodCall` codegen as
+`Diagnostic::todo_with_span` (declarations-only slice); kept our real
+`compile_method_call` implementation. Two follow-up fixes needed after
+resolving it:
+- `MethodCall.instance: Id` was renamed to `receiver: MethodReceiver`
+  upstream (to support THIS^/SUPER^; the analyzer already rejects
+  `SelfRef` receivers pre-codegen, tracked in #1406), and
+  `Diagnostic::todo_with_span` dropped its `file!()`/`line!()` args for
+  `#[track_caller]`. Updated all affected call sites.
+- The new verifier's exhaustive `effect_of` match in
+  `container/src/verify.rs` didn't know our `METHOD_CALL` opcode, so it
+  fell into the same `UnknownOpcode` error a call to an undefined
+  function would produce -- a confusing "not an assigned opcode" report
+  even though the opcode *is* registered (`is_assigned` returned true
+  when checked directly). Added a `METHOD_CALL` arm mirroring `CALL`,
+  but since a method (unlike a `FUNCTION`) can be void, the push count
+  can't use `CALL`'s fixed `RET_DEPTH` -- it's derived from whether the
+  callee's bytecode ends in `RET` vs `RET_VOID`.
+
+Note for whoever next rebases PR #1362 onto a fresh `main`: it will hit
+this exact same `effect_of`/`METHOD_CALL` gap again, since the fix so
+far only lives on `twincat-dev`'s own merge commit, not as something
+upstream is aware needs adding when method codegen eventually lands
+there.
+
+Not rebasing/force-pushing #1362 itself right now, per garretfick's
+"not reviewing codegen yet" note above -- would just be repeated churn.
+
 ## 2026-08-20: `twincat-dev` synced to `main` (v0.239.0)
 
 Routine sync, no PR changes. Local `main` had fallen 26 commits behind;
