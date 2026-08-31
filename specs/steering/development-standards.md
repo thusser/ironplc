@@ -31,6 +31,12 @@ Specifications that describe **what** to build: architecture, formats, interface
 
 Work breakdowns that describe **how** to implement: phased task lists, specific code changes, file modifications, and verification steps. A plan document answers "what steps do I follow to build this?" Plans reference the design they implement.
 
+**A plan is branch-local.** It is committed as the first commit on a feature branch so it can be reviewed as a file diff, and deleted from that branch before merge. Because the repository squash-merges, the add and the delete cancel within the squashed commit, so no plan content reaches `main`. The plan stays viewable on the pull request.
+
+Plans are the one document type in `specs/` that is not durable. Anything worth keeping — a decision, a constraint, a piece of rationale — must land somewhere durable in the same pull request: `specs/adrs/`, `specs/design/`, or a code doc comment where the reasoning is local to the code (see [Choosing the Right Location](#choosing-the-right-location)).
+
+**Never cite a plan from anywhere else.** Code comments, workflows, the `justfile`, design documents and ADRs must cite an ADR or a design document, never `specs/plans/`. A plan is deleted before its own pull request merges, so a reference to one is either already dead or about to be. `just plan-citations` enforces this and runs as part of `just`.
+
 ### `specs/steering/` — AI Steering Files
 
 Guidance for AI assistants working with the codebase (conventions, patterns, workflows). See [steering-file-guidelines.md](./steering-file-guidelines.md).
@@ -41,10 +47,21 @@ Guidance for AI assistants working with the codebase (conventions, patterns, wor
 |----------|----------|
 | Why did we choose approach X over Y? | `specs/adrs/` |
 | What should the container format look like? | `specs/design/` |
-| What are the steps to implement the container format? | `specs/plans/` |
+| Why is *this function* written this way? | a doc comment on it |
+| What are the steps to implement the container format? | `specs/plans/` (deleted before merge) |
 | How should AI assistants name tests? | `specs/steering/` |
 
-When a document contains both design and plan content, split it into two files with cross-references between them. The design file goes in `specs/design/` and the plan file goes in `specs/plans/`.
+**A decision may live in a code comment.** Rationale whose reader is the next
+person editing that function or file belongs next to the code, not in `specs/`
+— a deliberate divergence from the obvious implementation, why a branch exists,
+why a simpler shape was not used. Moving it to a design document makes it worse:
+further from the code it constrains, and easier to leave behind when the code
+moves.
+
+Reserve `specs/` for what a code comment cannot hold: a decision that constrains
+a subsystem, spans crates, or picks between alternatives someone will re-litigate.
+
+When a document contains both design and plan content, split it into two files. The design file goes in `specs/design/` and the plan file goes in `specs/plans/`. The reference is one-way: the plan cites the design it implements, and the design never cites the plan — the design outlives the plan.
 
 **Important**: Plan and design documents must **never** be placed in `docs/`. The `docs/` directory is exclusively for the public Sphinx documentation website. All internal technical documents (plans, designs, ADRs, steering files) belong in `specs/`.
 
@@ -76,16 +93,33 @@ Rules:
 
 Each requirement **must** have a corresponding conformance test annotated with `#[spec_test(REQ_<AREA>_<crate_slug>_NNN)]` in the owning crate. The build system enforces this bidirectionally: removing a requirement from the spec causes a compile error; adding a requirement without a test causes that crate's completeness meta-test to fail.
 
-See [Spec Conformance Testing](../design/spec-conformance-testing.md) for the full enforcement mechanism.
+The completeness half is weaker than it reads. A requirement counts as tested when its marker appears anywhere in the crate, so an empty or `#[ignore]`d body satisfies it without asserting anything. Write a real assertion; a marker on an empty test is worse than no marker, because it reports the requirement as covered.
+
+**Fix divergence opportunistically.** When a design document and the code disagree, reconcile that section as part of whatever work brought you there, rather than scheduling an audit of everything. `/project:reconcile-spec` does one section at a time.
+
+See [Spec Conformance Testing](../design/spec-conformance-testing.md) for the full enforcement mechanism, and [ADR-0043](../adrs/0043-spec-conformance-tests-over-a-workflow-framework.md) for why this mechanism rather than a spec-driven-development framework.
 
 ### Planning Requirement
 
-All non-trivial features and changes **must** begin with an implementation plan committed to `specs/plans/` before code changes start. The plan is the first deliverable — commit it to the feature branch before writing any implementation code.
+All non-trivial features and changes **must** begin with an implementation plan. The plan is a branch-local artifact: it is reviewed as a file diff, then deleted before merge.
+
+1. Write the plan to `specs/plans/YYYY-MM-DD-short-description.md` and commit it as the **first commit on the branch** — before any implementation code. This is what makes it reviewable as a file diff.
+2. Implement, following the plan.
+3. Any decision worth keeping lands as an ADR or a `specs/design/` update **in the same pull request**.
+4. **Anything the plan describes that the pull request does not deliver becomes a tracked issue** before the plan file is removed. A code comment saying "follow-up slice" is not tracking — the plan is about to be deleted, so an untracked deferral disappears with it.
+5. `git rm` the plan file before merge.
+
+**Work that spans more than one pull request must have an issue.** The issue is the durable record across the series: it holds the slice breakdown, stays open until every slice has landed, and is where a slice's undelivered work goes. Each pull request commits only its own slice's plan, and each plan references the issue.
+
+A single self-contained pull request does not need an issue. The plan is reviewed, the work lands, and the plan goes — nothing is left to track.
 
 A plan document should include:
 
 - **Goal** — a concise statement of what the change accomplishes
 - **Architecture** — brief summary of the technical approach
+- **Prefactoring** — the simplification to make *before* adding the new
+  behaviour, or an explicit statement that none is needed and why (see
+  [Prefactoring](#prefactoring))
 - **Design doc reference** — link to `specs/design/` doc if one exists
 - **File map** — which files will be created or modified
 - **Tasks** — ordered steps with checkboxes (`- [ ]`) for tracking progress
@@ -93,6 +127,82 @@ A plan document should include:
 Name plan files with a date prefix: `YYYY-MM-DD-short-description.md` (e.g., `2026-04-01-planning-requirement.md`).
 
 **When a plan may be skipped:** Changes that are clearly mechanical and self-contained — typo fixes, formatting, dependency bumps, single-line bug fixes, or documentation-only edits — do not require a plan.
+
+## Prefactoring
+
+**Prefactoring** is refactoring done *before* new behaviour is added: reshape the
+existing code so the new behaviour drops in, then add it. It is the opposite
+order from the more familiar "make it work, then clean it up" — and it is the
+order this project uses.
+
+Every change **must** start by looking for a prefactoring opportunity. Without
+that step, each change is bolted onto whatever shape the code already has —
+another `if`, another flag, another near-copy of an existing function. The cost
+compounds twice: the code gets harder to read, and every new branch multiplies
+the paths that tests have to cover, so the suite grows faster than the feature
+set.
+
+### Requirement
+
+- For any change that needs a plan, the plan **must** contain a **Prefactoring**
+  section naming the simplification the change will make first — or stating
+  explicitly that none is needed and why.
+- The prefactoring lands in its own commit (or commits) **before** the commits
+  that add the new behaviour.
+- Mechanical changes that skip the plan (see
+  [Planning Requirement](#planning-requirement)) also skip this.
+
+### Signals that a change needs prefactoring
+
+Look for these while reading the code you are about to modify. Any one of them
+means stop and reshape first:
+
+- The new behaviour needs a new `match` arm or `if` in **more than one place** —
+  the distinction wants to be a type or a data table, not repeated branching
+- You would copy an existing function and change a few lines of it
+- You would add a boolean parameter (or a second one) to select behaviour inside
+  a function
+- The new tests would duplicate an existing test's setup wholesale, or you would
+  need a combinatorial matrix of tests to cover how the new flag interacts with
+  the existing ones
+- The module would cross the [1000-line limit](#module-structure) once the change
+  lands
+- The code has to know *where in the pipeline it is* to decide what to do
+- The change is easy to describe in a sentence but hard to place in the code —
+  usually a sign the responsibility it belongs to does not exist yet
+
+### How to prefactor
+
+1. **Change the shape, not the behaviour.** The existing tests must pass
+   unchanged. If they have to be edited to accept the prefactoring — beyond
+   mechanical renames — the commit is not behaviour-preserving; split it.
+2. **Commit the prefactoring separately.** A reviewer can then read a diff that
+   provably changes nothing, followed by a small diff that adds the feature.
+   Either can be reverted alone.
+3. **Add the new behaviour.** If the feature diff is still branchy and large,
+   the prefactoring picked the wrong shape — go back to step 1 rather than
+   pushing through.
+
+### When *not* to prefactor
+
+Prefactoring is a tool for reducing the cost of the change in hand, not a
+licence to rewrite:
+
+- **No speculative generality.** Do not build an abstraction for a case nobody
+  has asked for. Extract a shared shape when the second or third caller arrives,
+  not the first.
+- **No unbounded rewrites.** If the reshaping is far larger than the feature,
+  write it up as its own plan and change, and land the feature the simple way
+  in the meantime — with a note saying so.
+- **Not for one-line fixes.** Typos, dependency bumps, and single-line bug fixes
+  stay single-line.
+
+### What good looks like
+
+A well-prefactored change shows up as a *smaller* feature diff and *fewer* new
+tests than the same feature added on top of the old shape — because there are
+fewer distinct paths to cover, not because anything went untested. The coverage
+gate (see [Just Commands](#just-commands)) still applies unchanged.
 
 ## Code Organization
 
@@ -183,7 +293,7 @@ Error handling is **critical** for developer experience. Follow these rules:
 1. **Unique codes**: Each problem gets its own unique P#### code - never reuse codes
 2. **Descriptive names**: Problem enum variants should clearly describe the issue
 3. **Shared definitions**: Problem codes are defined in `compiler/problems/resources/problem-codes.csv`
-4. **Documentation required**: Every problem code MUST have documentation in `docs/compiler/problems/P####.rst`
+4. **Documentation required**: Every problem code MUST have documentation in `docs/reference/compiler/problems/P####.rst`
 
 ### Problem Code Format
 ```csv
@@ -225,14 +335,14 @@ All IronPLC documentation follows the **Documentation Quadrants** approach, orga
 - **Audience**: People studying and learning
 - **Content**: Step-by-step lessons that work reliably
 - **Examples**: "Getting Started with IronPLC", "Your First PLC Program"
-- **Location**: `docs/tutorials/`
+- **Location**: `docs/quickstart/`
 
 #### 2. How-To Guides (Problem-Oriented)
 - **Purpose**: Show how to solve specific real-world problems
 - **Audience**: Practitioners at work who need to accomplish something
 - **Content**: Series of steps focused on achieving a goal
 - **Examples**: "How to Debug Compilation Errors", "How to Add a New Data Type"
-- **Location**: `docs/how-to/`
+- **Location**: `docs/how-to-guides/`
 
 #### 3. Technical Reference (Information-Oriented)
 - **Purpose**: Describe the machinery and how to operate it
@@ -301,7 +411,7 @@ All Sphinx documentation must use the correct RST roles for consistent rendering
 | Commands and executables | `:program:` | `:program:\`ironplcc --version\`` |
 | Code keywords | `:code:` | `:code:\`PROGRAM\`` |
 | User-typed text | `:samp:` | `:samp:\`IronPLC\`` |
-| Cross-document links | `:doc:` | `:doc:\`/compiler/problems/index\`` |
+| Cross-document links | `:doc:` | `:doc:\`/reference/compiler/problems/index\`` |
 
 **Menu paths** use ` --> ` as separator: `:menuselection:\`File --> Preferences --> Settings\``
 
@@ -331,7 +441,7 @@ Two Sphinx directives are available (defined in `docs/extensions/ironplc_playgro
 ```
 
 **When NOT to use playground directives:**
-- Problem code documentation (`docs/compiler/problems/`) — these show invalid code that would fail compilation
+- Problem code documentation (`docs/reference/compiler/problems/`) — these show invalid code that would fail compilation
 - Partial syntax fragments that are not runnable
 
 **Source of truth for the playground:**
@@ -358,7 +468,7 @@ Some IEC 61131-3 features require the user to enable a specific edition of the s
 The centralized explanation page at `docs/explanation/enabling-dialects-and-features.rst` covers how to enable editions in both the CLI and VS Code. Individual feature pages link there rather than duplicating instructions.
 
 ### Problem Documentation Format
-Each problem code must have a corresponding `.rst` file in `docs/compiler/problems/` with:
+Each problem code must have a corresponding `.rst` file in `docs/reference/compiler/problems/` with:
 
 ```rst
 =====
@@ -392,8 +502,8 @@ File extensions and format details are listed in **two** canonical locations. Al
 
 1. **Compiler source** - `compiler/sources/src/file_type.rs` (the source of truth for detection)
 2. **VS Code extension** - `integrations/vscode/package.json` (language contributions) and `integrations/vscode/src/extension.ts` (document selector)
-3. **Source format reference page** - the format-specific page in `docs/compiler/source-formats/` (e.g., `twincat.rst`)
-4. **VS Code overview** - `docs/vscode/overview.rst` (Supported Languages section)
+3. **Source format reference page** - the format-specific page in `docs/reference/compiler/source-formats/` (e.g., `twincat.rst`)
+4. **Editor overview** - `docs/reference/editor/overview.rst` (Supported Languages section)
 
 ### README Synchronization
 The project has multiple README files that must stay synchronized:
@@ -417,6 +527,11 @@ The project has multiple README files that must stay synchronized:
 - Use Rust doc comments (`///`) for public functions and types
 - Include examples in documentation when helpful
 - Document complex algorithms or IEC 61131-3 specific behavior
+- A comment carrying a decision states what was chosen and why, not only what
+  the code does — the next reader's question is whether they may change it
+- Nothing checks that a comment is still true. A comment asserting behaviour is
+  as capable of going stale as a design document, and is read more often; when
+  you change behaviour, re-read the comments around it
 
 ### Example Synchronization
 **Important**: Examples in documentation should also exist as tests in the Rust compiler to ensure documentation accuracy. Follow the existing naming conventions for test examples.

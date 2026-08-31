@@ -1035,7 +1035,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
 
     // OOP extension: INTERFACE ... END_INTERFACE. Only the
     // header renders — method/property signatures are not yet parsed (see
-    // specs/plans/2026-07-18-twincat-extends-implements-interface.md).
+    // specs/design/beckhoff-twincat-dialect.md §1.3).
     fn visit_interface_declaration(
         &mut self,
         node: &InterfaceDeclaration,
@@ -1446,19 +1446,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         self.write_ws("(");
         self.visit_expr(&node.left)?;
 
-        let op = match node.op {
-            dsl::textual::CompareOp::Or => "OR",
-            dsl::textual::CompareOp::Xor => "XOR",
-            dsl::textual::CompareOp::And => "AND",
-            dsl::textual::CompareOp::AndThen => "AND_THEN",
-            dsl::textual::CompareOp::Eq => "=",
-            dsl::textual::CompareOp::Ne => "<>",
-            dsl::textual::CompareOp::Lt => "<",
-            dsl::textual::CompareOp::Gt => ">",
-            dsl::textual::CompareOp::LtEq => "<=",
-            dsl::textual::CompareOp::GtEq => ">=",
-        };
-        self.write_ws(op);
+        self.write_ws(node.op.as_str());
 
         self.visit_expr(&node.right)?;
         self.write_ws(")");

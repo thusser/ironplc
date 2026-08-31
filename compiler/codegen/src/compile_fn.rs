@@ -80,6 +80,7 @@ pub(crate) fn compile_user_function(
     let saved_string_vars = std::mem::take(&mut ctx.string_vars);
     let saved_array_vars = std::mem::take(&mut ctx.array_vars);
     let saved_struct_vars = std::mem::take(&mut ctx.struct_vars);
+    let saved_struct_array_vars = std::mem::take(&mut ctx.struct_array_vars);
 
     // Re-insert global variable mappings so the function body can access them.
     for (id, index) in &saved_variables {
@@ -109,6 +110,14 @@ pub(crate) fn compile_user_function(
             .is_some_and(|i| i.raw() < num_globals)
         {
             ctx.struct_vars.insert(id.clone(), info.clone());
+        }
+    }
+    for (id, info) in &saved_struct_array_vars {
+        if saved_variables
+            .get(id)
+            .is_some_and(|i| i.raw() < num_globals)
+        {
+            ctx.struct_array_vars.insert(id.clone(), info.clone());
         }
     }
 
@@ -326,6 +335,9 @@ pub(crate) fn compile_user_function(
             None
         }
     };
+    // Captured here because `ctx.struct_vars` is restored to the caller's
+    // scope at the end of this function, losing the return variable's entry.
+    let return_struct_desc_index = ctx.struct_vars.get(&return_id).map(|info| info.desc_index);
     current_index = VarIndex::new(current_index.raw() + 1);
 
     let num_locals = current_index.raw() - var_offset.raw();
@@ -393,7 +405,7 @@ pub(crate) fn compile_user_function(
     }
     func_emitter.emit_ret();
 
-    let finalized = finalize_function(&mut func_emitter, ctx);
+    let finalized = finalize_function(&mut func_emitter, ctx)?;
 
     // Record function metadata for use at call sites.
     let func_name = func_decl.name.lower_case();
@@ -459,6 +471,7 @@ pub(crate) fn compile_user_function(
             param_op_types,
             param_string_info,
             return_string_info,
+            return_struct_desc_index,
             max_stack_depth: finalized.max_stack_depth,
         },
     );
@@ -469,6 +482,7 @@ pub(crate) fn compile_user_function(
     ctx.string_vars = saved_string_vars;
     ctx.array_vars = saved_array_vars;
     ctx.struct_vars = saved_struct_vars;
+    ctx.struct_array_vars = saved_struct_array_vars;
 
     Ok(CompiledFunction {
         function_id,
@@ -525,6 +539,7 @@ pub(crate) fn compile_user_function_block(
     let saved_string_vars = std::mem::take(&mut ctx.string_vars);
     let saved_array_vars = std::mem::take(&mut ctx.array_vars);
     let saved_struct_vars = std::mem::take(&mut ctx.struct_vars);
+    let saved_struct_array_vars = std::mem::take(&mut ctx.struct_array_vars);
     let saved_fb_instances = std::mem::take(&mut ctx.fb_instances);
 
     // Re-insert global variable mappings so the FB body can access them.
@@ -555,6 +570,14 @@ pub(crate) fn compile_user_function_block(
             .is_some_and(|i| i.raw() < num_globals)
         {
             ctx.struct_vars.insert(id.clone(), info.clone());
+        }
+    }
+    for (id, info) in &saved_struct_array_vars {
+        if saved_variables
+            .get(id)
+            .is_some_and(|i| i.raw() < num_globals)
+        {
+            ctx.struct_array_vars.insert(id.clone(), info.clone());
         }
     }
 
@@ -637,7 +660,7 @@ pub(crate) fn compile_user_function_block(
 
     ctx.current_function_id = saved_current_fn;
 
-    let finalized = finalize_function(&mut fb_emitter, ctx);
+    let finalized = finalize_function(&mut fb_emitter, ctx)?;
 
     // Note: `ctx`'s variable mappings are intentionally NOT restored
     // here (unlike `compile_user_function`). This type's METHODs (OOP
@@ -652,6 +675,7 @@ pub(crate) fn compile_user_function_block(
         string_vars: saved_string_vars,
         array_vars: saved_array_vars,
         struct_vars: saved_struct_vars,
+        struct_array_vars: saved_struct_array_vars,
         fb_instances: saved_fb_instances,
     };
 

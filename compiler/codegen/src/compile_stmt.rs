@@ -219,38 +219,11 @@ fn compile_statement(
                 return Ok(());
             }
 
-            // Check if the target is a struct variable (whole-struct assignment).
-            if let Some(target_name) = resolve_variable_name(&assignment.target) {
-                if let Some(dst_info) = ctx.struct_vars.get(target_name).cloned() {
-                    let dst_var = ctx.var_index(target_name)?;
-                    // Compile RHS (for struct-returning functions, leaves
-                    // the source struct's data_offset on the stack).
-                    compile_expr(emitter, ctx, &assignment.value, DEFAULT_OP_TYPE)?;
-
-                    // Copy protocol: temporarily point dst_var to source data,
-                    // load all fields, restore dst_var, store all fields.
-                    emit_store_var(emitter, dst_var, DEFAULT_OP_TYPE);
-
-                    let total = dst_info.total_slots.raw();
-                    for i in 0..total {
-                        let idx = ctx.add_i32_constant(i as i32);
-                        emitter.emit_load_const_i32(idx);
-                        emitter.emit_load_array(dst_var, dst_info.desc_index);
-                    }
-
-                    // Restore dst_var's own data_offset.
-                    let dst_offset = ctx.add_i32_constant(dst_info.data_offset as i32);
-                    emitter.emit_load_const_i32(dst_offset);
-                    emit_store_var(emitter, dst_var, DEFAULT_OP_TYPE);
-
-                    // Store fields in reverse order (LIFO stack consumption).
-                    for i in (0..total).rev() {
-                        let idx = ctx.add_i32_constant(i as i32);
-                        emitter.emit_load_const_i32(idx);
-                        emitter.emit_store_array(dst_var, dst_info.desc_index);
-                    }
-                    return Ok(());
-                }
+            // Whole-aggregate assignment (`x := y` where x is an array or a
+            // structure). Emits COPY_REGION, which moves the bytes rather
+            // than the data-region offset the scalar arm below would copy.
+            if crate::compile_aggregate::try_compile_whole_assignment(emitter, ctx, assignment)? {
+                return Ok(());
             }
 
             // Look up the target variable's type info.
@@ -565,20 +538,18 @@ fn compile_fb_call(
 /// data-region layout doesn't currently reserve storage for a base
 /// type's fields at all (`compile_user_function_block`'s field list
 /// comes from `fb_decl.variables` only, never flattened with inherited
-/// fields), so there is nothing correct to copy-in/copy-out from. See
-/// specs/plans/2026-08-12-oop-method-declarations-static-dispatch.md.
+/// fields), so there is nothing correct to copy-in/copy-out from.
 fn compile_method_call(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     call: &ironplc_dsl::textual::MethodCall,
 ) -> Result<(), Diagnostic> {
-    // `THIS^`/`SUPER^` receivers are rejected earlier, during semantic
-    // analysis (see `rule_method_call_declared.rs`, tracked in #1406), so
-    // by codegen the receiver is always a plain instance variable.
+    // `THIS^.M()` / `SUPER^.M()` receivers parse but are rejected earlier by
+    // `rule_method_call_declared`, so codegen only ever sees a named instance.
     let instance = match &call.receiver {
         ironplc_dsl::textual::MethodReceiver::Instance(id) => id,
-        ironplc_dsl::textual::MethodReceiver::SelfRef(_) => {
-            return Err(Diagnostic::todo_with_span(call.span()))
+        ironplc_dsl::textual::MethodReceiver::SelfRef(self_ref) => {
+            return Err(Diagnostic::todo_with_span(self_ref.span()))
         }
     };
 
@@ -820,7 +791,7 @@ fn compile_case(
 ///
 /// - `SignedInteger`: `selector == value`
 /// - `Subrange`: `(selector >= start) AND (selector <= end)`
-/// - `EnumeratedValue`: not yet supported (returns todo diagnostic)
+/// - `EnumeratedValue`: `selector == ordinal` (REQ-EN-codegen-040)
 /// - `BitStringLiteral`: `selector == value` (same shape as `SignedInteger`)
 fn compile_case_selector(
     emitter: &mut Emitter,
@@ -1259,7 +1230,7 @@ fn try_classify_for_head(
 /// The continuation predicate is `i <= to` (positive step) / `i >= to`
 /// (negative step). Inverting the predicate lets the body fall through
 /// from the conditional branch, eliminating one `JMP` dispatch per
-/// iteration. See `specs/plans/2026-04-30-elide-for-loop-exit-jmp.md`.
+/// iteration.
 fn compile_for(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
@@ -1284,7 +1255,8 @@ fn compile_for(
     };
 
     // Decide whether the per-loop TRUNC can be elided based on a local interval
-    // check over the constant bounds. See specs/plans/2026-04-30-elide-for-loop-trunc.md.
+    // check over the constant bounds. See `specs/design/vm-performance.md`
+    // §13 "Layer 1: Abstract Interpretation with Richer Domains".
     let elide_trunc = match type_info {
         Some(ti) => {
             for_loop_trunc_can_be_elided(&for_stmt.from, &for_stmt.to, for_stmt.step.as_ref(), ti)

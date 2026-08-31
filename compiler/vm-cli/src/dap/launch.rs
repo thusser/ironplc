@@ -6,8 +6,7 @@
 //! path the production `ironplcvm` binary uses in `cli.rs`), so there is no
 //! duplicated sizing logic here.
 //!
-//! The preconditions (see the plan,
-//! `specs/plans/2026-06-25-dap-server-scaffold.md` §"Launch preconditions"):
+//! The preconditions:
 //! 1. A debug section must be present, else [`LaunchError::NoDebugInfo`].
 //! 2. There must be exactly one program instance, else
 //!    [`LaunchError::MultiInstanceUnsupported`] (the v1 limitation described in
@@ -105,8 +104,8 @@ pub fn load_container(path: &Path) -> Result<Container, LaunchError> {
 
 /// Checks the two v1 launch preconditions against a loaded container.
 ///
-/// Debug info is checked first (per the plan), then the single-instance limit,
-/// so a container that is both missing debug info and multi-instance reports
+/// Debug info is checked first, then the single-instance limit, so a
+/// container that is both missing debug info and multi-instance reports
 /// [`LaunchError::NoDebugInfo`].
 pub fn check_preconditions(container: &Container) -> Result<(), LaunchError> {
     if container.debug_section.is_none() {

@@ -17,6 +17,7 @@ When adding new syntax, ensure every applicable item is complete:
 - [ ] **plc2plc renderer**: Update `plc2plc/src/renderer.rs` to render the new syntax
 - [ ] **plc2plc round-trip test**: Parse → render → **re-parse** (in a focused file under `plc2plc/src/tests/` — see [Test File Organization](#test-file-organization-avoid-merge-conflicts) and [plc2plc round-trip tests](#plc2plc-round-trip-tests-always-re-parse))
 - [ ] **End-to-end execution test**: Parse → compile → run → verify variable values
+- [ ] **Whitespace invariance**: Every `_` a new grammar rule introduces earns a row in `parser/src/tests/whitespace.rs`, so a rule that later loses its `_` fails there (see [Which leg asserts what](#which-leg-asserts-what-avoid-duplicate-tests))
 - [ ] **Non-standard gating**: If not standard IEC 61131-3, gate behind `--allow-x` flag
 - [ ] **LSP integration**: If a new `--allow-x` flag, add to LSP `extract_compiler_options`
 - [ ] **Documentation**: If a new `--allow-x` flag, update `docs/explanation/enabling-dialects-and-features.rst`, `docs/reference/compiler/ironplcc.rst`, and the flag table in this file
@@ -100,6 +101,7 @@ adds no signal — it is subsumed. Keep the legs distinct:
 | **codegen `compile_*`** | The emitted instruction sequence / container structure | Run results |
 | **codegen `end_to_end_*`** | Run results — the nominal behavior matrix reachable from ST | — |
 | **VM** (`vm/tests/it/`) | Traps, overflow/wrap edges, and states codegen cannot emit | A nominal case its codegen twin already runs |
+| **Whitespace** (`parser/src/tests/whitespace.rs`) | That the gaps the grammar permits stay permitted, and that adjacencies inside one lexical unit stay rejected | A row duplicating a rejection another file already owns — `REF=` belongs to `parser/src/tests/reference_to.rs` |
 
 Parser tests asserting only `is_ok()` are still right when there is **no**
 round-trip counterpart — a dialect-flag rejection, a pragma, or a corpus file
@@ -269,7 +271,7 @@ Dialects (`--dialect`) set the base configuration. Individual `--allow-*` flags 
 | Dialect | `--dialect` value | Edition 3 types | REF_TO | Extensions |
 |---------|-------------------|----------------|--------|-------------------|
 | IEC 61131-3 Ed 2 (default) | `iec61131-3-ed2` | OFF | OFF | all OFF |
-| IEC 61131-3 Ed 3 | `iec61131-3-ed3` | ON | ON | all OFF |
+| IEC 61131-3 Ed 3 | `iec61131-3-ed3` | ON | ON | all OFF except `allow_partial_access_syntax` and `allow_fb_inheritance` — those two gate Edition 3 *standard* syntax (partial access, object orientation), not vendor extensions |
 | RuSTy | `rusty` | OFF | ON | all ON |
 | CODESYS | `codesys` | OFF | ON | all ON except `allow_system_uptime_global` |
 | TwinCAT | `twincat` | OFF | OFF | CODESYS set minus the whole `REF_TO` family (`allow_ref_to`, `allow_ref_arithmetic`, `allow_ref_stack_variables`, `allow_ref_type_punning`), plus `allow_reference_to`, `allow_pointer_to`, and `allow_adr` — TwinCAT spells references `REFERENCE TO` (bound with `REF=`) and pointers `POINTER TO` (bound with `ADR()`) |

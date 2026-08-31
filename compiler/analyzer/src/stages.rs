@@ -14,8 +14,8 @@ use crate::{
     function_environment::FunctionEnvironmentBuilder,
     ironplc_dsl::common::Library,
     result::SemanticResult,
-    rule_abstract_not_instantiated, rule_bit_access_range, rule_case_bit_string_label,
-    rule_decl_struct_element_unique_names, rule_decl_subrange_limits,
+    rule_abstract_not_instantiated, rule_assignment_aggregate_type_compat, rule_bit_access_range,
+    rule_case_bit_string_label, rule_decl_struct_element_unique_names, rule_decl_subrange_limits,
     rule_enumeration_values_unique, rule_extends_field_duplicated,
     rule_function_block_call_unsupported, rule_function_block_invocation,
     rule_function_call_declared, rule_function_call_type_check, rule_method_call_declared,
@@ -145,10 +145,10 @@ pub fn resolve_types(
     // which codegen uses to skip unused functions.
     let (mut library, reachable) = xform_toposort_declarations::apply(library)?;
 
-    // Hard failure: declaration ordering and type-environment population is
-    // required for all subsequent transforms, and a failure here reflects a
-    // fundamentally broken declaration (not an unrelated one), so reverting
-    // the whole library on error is correct.
+    // Recoverable: a failure is collected as a diagnostic and analysis
+    // continues. A failure here reflects a fundamentally broken declaration
+    // (not an unrelated one), so reverting the whole library to its
+    // pre-transform state on error is correct.
     let fallback = library.clone();
     match xform_resolve_type_decl_environment::apply(library, &mut type_environment) {
         Ok(result) => library = result,
@@ -160,7 +160,6 @@ pub fn resolve_types(
 
     // Recoverable: an unresolvable declaration is diagnosed but does not
     // discard the rest of the library's successfully resolved declarations.
-    // See specs/plans/2026-08-02-partial-resolution-revert-on-unrelated-error.md.
     let recoverable_xforms: Vec<
         fn(Library, &mut TypeEnvironment) -> Result<(Library, Vec<Diagnostic>), Vec<Diagnostic>>,
     > = vec![
@@ -218,8 +217,7 @@ pub fn resolve_types(
 
     // Fold constant-expression VAR initializers (e.g. `scaled : LREAL := SCALE*4.0;`)
     // back into ordinary literal initializers, or diagnose. Must run before
-    // any other pass touches `InitialValueAssignmentKind::SimpleExpr` — see
-    // specs/plans/2026-07-19-twincat-var-initializer-expressions.md.
+    // any other pass touches `InitialValueAssignmentKind::SimpleExpr`.
     // Recoverable: a diagnosed initializer is still normalized, so the
     // transformed library must be kept even when diagnostics are present —
     // reverting would leak `SimpleExpr` nodes to later passes.
@@ -335,6 +333,7 @@ pub(crate) fn semantic(
 ) -> SemanticResult {
     let functions: Vec<fn(&Library, &SemanticContext, &CompilerOptions) -> SemanticResult> = vec![
         rule_abstract_not_instantiated::apply,
+        rule_assignment_aggregate_type_compat::apply,
         rule_decl_struct_element_unique_names::apply,
         rule_decl_subrange_limits::apply,
         rule_enumeration_values_unique::apply,
@@ -448,8 +447,7 @@ END_FUNCTION_BLOCK";
     // A diagnosed constant-expression initializer must report only its own
     // problem. The initializer-fold transform used to be reverted when it
     // diagnosed, leaking `SimpleExpr` nodes to later rules and raising a
-    // P9998 internal error after every legitimate P4037. See
-    // specs/plans/2026-08-06-twincat-initializer-dialect-and-fold-revert-fixes.md.
+    // P9998 internal error after every legitimate P4037.
     // ---------------------------------------------------------------------
 
     #[test]
@@ -481,7 +479,6 @@ END_FUNCTION";
     // ---------------------------------------------------------------------
     // Don't revert a whole library's type resolution because one unrelated
     // declaration failed to resolve.
-    // See specs/plans/2026-08-02-partial-resolution-revert-on-unrelated-error.md.
     // ---------------------------------------------------------------------
 
     #[test]
@@ -517,7 +514,6 @@ END_FUNCTION_BLOCK
 
     // ---------------------------------------------------------------------
     // Constant-expression VAR initializers.
-    // See specs/plans/2026-07-19-twincat-var-initializer-expressions.md.
     // ---------------------------------------------------------------------
 
     fn opts_with_constant_initializer_expressions() -> CompilerOptions {
@@ -576,7 +572,6 @@ END_FUNCTION_BLOCK";
 
     // ---------------------------------------------------------------------
     // FB-instance call-style initializer (distinct node).
-    // See specs/plans/2026-08-01-fb-call-style-initializer-distinct-node.md.
     // ---------------------------------------------------------------------
 
     #[test]

@@ -291,7 +291,7 @@ Currently, jumps use relative i16 offsets that require signed arithmetic at runt
 
 The common pattern `if x > 10` compiles to 4 instructions (LOAD_VAR, LOAD_CONST, GT, JMP_IF_NOT). A fused `CMP_GT_JMP_I32 var_idx, const_pool_idx, target` does the same in one dispatch. PLC programs are dominated by comparisons-then-branches (IF, CASE, WHILE). This could reduce instruction count for control flow by 75%.
 
-**Status (partial):** implemented in `specs/plans/2026-05-02-cmp-br-superinstruction.md` for I32 and I64 signed-integer compares against constant pool entries. A single op-class `OP_CLASS_CMP_BR` (`0x3D`) collapses all six comparison operators (`EQ`, `NE`, `LT_S`, `LE_S`, `GT_S`, `GE_S`) under a 1-byte `cmp_op` operand, with two type-tag variants (`CMP_BR_I32`, `CMP_BR_I64`). Codegen wires `CMP_BR` into the FOR head test, REPEAT `UNTIL` tail, and IF/ELSIF predicates; WHILE is restructured into do-while shape when the condition is fusable so the per-iteration unconditional `JMP` back-edge collapses into the same `CMP_BR`. Remaining work: F32/F64 (NaN-aware polarity), var-var comparisons, CASE-selector fusion, and complex-condition WHILE restructuring (would require a `JMP_IF` opcode).
+**Status (partial):** implemented for I32 and I64 signed-integer compares against constant pool entries. A single op-class `OP_CLASS_CMP_BR` (`0x3D`) collapses all six comparison operators (`EQ`, `NE`, `LT_S`, `LE_S`, `GT_S`, `GE_S`) under a 1-byte `cmp_op` operand, with two type-tag variants (`CMP_BR_I32`, `CMP_BR_I64`). Codegen wires `CMP_BR` into the FOR head test, REPEAT `UNTIL` tail, and IF/ELSIF predicates; WHILE is restructured into do-while shape when the condition is fusable so the per-iteration unconditional `JMP` back-edge collapses into the same `CMP_BR`. Remaining work: F32/F64 (NaN-aware polarity), var-var comparisons, CASE-selector fusion, and complex-condition WHILE restructuring (would require a `JMP_IF` opcode).
 
 **Files**: `container/src/opcode.rs`, `vm/src/vm.rs`, `codegen/src/emit.rs`
 
@@ -316,6 +316,14 @@ The basic verifier tracks stack depth (an integer) and validates static indices.
   - Division by zero cannot occur (divisor range excludes 0)
   - Integer overflow cannot occur for specific operations (value ranges fit)
   - MUX selector `K` is in-range (eliminating the `min/max` clamp)
+
+  **Status (partial):** two narrow, local forms of this have shipped in codegen rather than the verifier.
+
+  `for_loop_trunc_can_be_elided` (`codegen/src/compile_stmt.rs`) checks the interval spanned by a FOR loop's constant `from`/`to`/`step` bounds and elides the per-iteration `TRUNC` when every visible value of the control variable — including the post-final increment — stays inside the declared narrow type's range. It is deliberately conservative: any non-constant bound, or any boundary that could wrap, keeps the `TRUNC`. The scope is the loop's own init and increment only.
+
+  `pass_const_trunc` (`codegen/src/optimize/`) covers the constant-valued case everywhere else. Where a `TRUNC_*` follows a `LOAD_CONST_I32`, the truncation is resolved during code generation: the `TRUNC_*` is dropped when the constant already fits the narrow type, and otherwise the truncated value is interned and the load's pool operand rewritten. This reaches every narrow store whose value is a constant — scalar assignment, array element, structure field, initializers, structure field defaults — because it matches on the emitted instruction stream rather than on any one syntactic form. Measured on a representative program, 16 of 17 `TRUNC_*` instructions were preceded by a constant load, all of them already in range.
+
+  What still truncates at run time is a narrow store of a *computed* value (`total := total + i` where `total : INT`), which needs range tracking across arbitrary expressions rather than a single instruction pair.
 - **Type-state tracking**: Track which variables have been initialized, which string slots have valid headers. This eliminates the `cur_length <= max_length` defensive clamps.
 - **Control-flow abstract interpretation**: Walk all paths through the bytecode, merging abstract states at join points. This is what the JVM verifier and WASM validator do.
 

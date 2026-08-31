@@ -1,7 +1,7 @@
 //! Hand-rolled Debug Adapter Protocol message types for the v1 server.
 //!
-//! These model only the small v1 surface (see
-//! `specs/plans/2026-06-25-dap-server-scaffold.md`): the handshake, line
+//! These model only the small v1 surface (see `specs/design/debugger-support.md`
+//! §"v1 Scope Decisions"): the handshake, line
 //! breakpoints, one synthetic thread, stack/scope/variable inspection, and the
 //! four execution-control commands. Everything wider — logpoints, `evaluate`,
 //! custom `ironplc/*` requests, variable forcing — is deferred and not modelled
@@ -11,12 +11,9 @@
 //! effectively unmaintained, and used by nothing mainstream; the established
 //! Rust DAP implementations (Helix, Lapce, probe-rs) all define their own
 //! types. Our v1 surface is a handful of small `serde` structs — trivial to own
-//! and not worth an alpha dependency on the public build. See the plan's
-//! "DAP types: hand-rolled" section for the full rationale.
+//! and not worth an alpha dependency on the public build.
 //!
-//! The types are consumed by the request-dispatch loop that lands in a later
-//! commit (Phase 4.4); for this commit they are exercised only by the wire
-//! round-trip unit tests below.
+//! The types are consumed by the request-dispatch loop in [`super::server`].
 #![allow(dead_code)]
 
 use ironplc_container::{SourceColumn, SourceLine};
@@ -214,6 +211,12 @@ pub struct LaunchRequestArguments {
     /// single-threaded loop has no interactive `pause`).
     #[serde(default)]
     pub scan_limit: Option<u64>,
+    /// Cycle time to assume for a program whose task declares no `INTERVAL`,
+    /// in milliseconds. Defaults to 100 ms. A freewheeling task has no rate of
+    /// its own, so the debugger has nothing to advance program time by; the
+    /// session reports whichever value it used.
+    #[serde(default)]
+    pub freewheeling_interval_ms: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

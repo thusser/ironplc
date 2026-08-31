@@ -13,6 +13,7 @@ use crate::configuration::{ConfigurationDeclaration, Direction};
 use crate::core::{Id, Located, SourceSpan};
 use crate::extension::LanguageExtension;
 use crate::fold::Fold;
+use crate::scope::ScopeBearing;
 use crate::sfc::{Network, Sfc};
 use crate::textual::*;
 use crate::time::*;
@@ -909,9 +910,8 @@ impl ElementaryTypeName {
     /// directions, despite being equal width. Beckhoff's own
     /// documentation states no implicit conversion exists between
     /// bit-string and integer types even at equal width, but this was
-    /// confirmed permissive against a real TcXaeShell build (see
-    /// `specs/plans/twincat-status.md`, "Resolved: UDINT → DWORD implicit
-    /// conversion"). Scoped to exactly this pair -- other same-width
+    /// confirmed permissive against a real TcXaeShell build. Scoped to
+    /// exactly this pair -- other same-width
     /// bit-string/unsigned-integer pairs (`BYTE`↔`USINT`, `WORD`↔`UINT`,
     /// `LWORD`↔`ULINT`) and signed integers are not verified and must not
     /// be assumed to behave the same.
@@ -2728,6 +2728,7 @@ impl From<TypeName> for FunctionReturnType {
 ///
 /// See section 2.5.1.
 #[derive(Clone, Debug, PartialEq, Recurse)]
+#[recurse(scope)]
 pub struct FunctionDeclaration {
     pub name: Id,
     pub return_type: FunctionReturnType,
@@ -2750,6 +2751,7 @@ impl HasVariables for FunctionDeclaration {
 ///
 /// See section 2.5.2.
 #[derive(Clone, Debug, PartialEq, Recurse, Located)]
+#[recurse(scope)]
 pub struct FunctionBlockDeclaration {
     pub name: TypeName,
     pub variables: Vec<VarDecl>,
@@ -2763,7 +2765,7 @@ pub struct FunctionBlockDeclaration {
     /// unrepresentable on a plain FB rather than "present but empty."
     /// `Some` only when the source actually uses `EXTENDS`, `IMPLEMENTS`,
     /// or `ABSTRACT`. See `LanguageExtension` impl on `FunctionBlockOop` and
-    /// `specs/plans/2026-07-18-twincat-extends-implements-interface.md`.
+    /// `specs/design/beckhoff-twincat-dialect.md` §1.4.
     pub oop: Option<FunctionBlockOop>,
     /// `METHOD ... END_METHOD` blocks declared on this function block
     /// (OOP extension). Empty for an ordinary function block — same
@@ -2786,6 +2788,7 @@ pub struct FunctionBlockDeclaration {
 /// (own methods first, then the `EXTENDS` chain) is implemented outside
 /// the AST, in `ironplc-analyzer`.
 #[derive(Clone, Debug, PartialEq, Recurse, Located)]
+#[recurse(scope)]
 pub struct MethodDeclaration {
     pub name: Id,
     pub return_type: Option<FunctionReturnType>,
@@ -2865,7 +2868,7 @@ impl LanguageExtension for FunctionBlockOop {
 /// Only the header is represented — method and property signatures are not
 /// yet parsed (TwinCAT stores each as a separate `<Method>`/`<Property>` XML
 /// element, silently ignored today; see
-/// `specs/plans/2026-07-18-twincat-extends-implements-interface.md`). This
+/// `specs/design/beckhoff-twincat-dialect.md` §1.3). This
 /// is enough for an interface name to be recognized as a known type, so
 /// that variables declared with an interface type resolve instead of
 /// failing with "type not declared."
@@ -2910,6 +2913,7 @@ impl LanguageExtension for InterfaceDeclaration {
 ///
 /// See section 2.5.3.
 #[derive(Clone, Debug, PartialEq, Recurse)]
+#[recurse(scope)]
 pub struct ProgramDeclaration {
     pub name: Id,
     pub variables: Vec<VarDecl>,
