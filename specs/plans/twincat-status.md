@@ -6,6 +6,71 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-08-31: PR #1362 merged via #1449; `twincat-dev` synced to `main`
+
+PR #1362 is **closed**, superseded by garretfick's own **PR #1449**
+(merged 2026-08-28, `a860646a`). Same three commits (original
+authorship preserved), rebased onto a fresh `main` with conflicts
+resolved on his end -- including the exact `effect_of`/`METHOD_CALL`
+gap the 2026-08-24 entry below predicted whoever rebased #1362 would
+hit again. He also added four verifier tests, a disassembler test and
+arm, and updated `specs/design/bytecode-instruction-set.md`. Our
+METHOD-call codegen (including the void-`RETURN` stack-leak fix) is
+now on `main`, out of our hands.
+
+Synced `twincat-dev` to `main` (44 commits: our merge conflicted, since
+`main` now carries #1449's own version of everything twincat-dev's
+prior sync had improvised locally). Conflicts and resolutions:
+- **`compile_method.rs`** (add/add): took `main`'s version wholesale --
+  it's a strict superset, additionally fixing a method-local variable
+  leak between sibling methods (#1439) and binding a method's own name
+  to its return slot (`GetSpeed := speed` pattern), neither of which
+  `twincat-dev`'s version had.
+- **`compile_stmt.rs`**: same `MethodCall.receiver` match as before;
+  took `main`'s wording (`self_ref.span()` instead of `call.span()` for
+  the `SelfRef` diagnostic -- more precise).
+- **`compile.rs` / `compile_fn.rs`**: trivial -- `main` added a
+  `struct_array_vars` field to `SavedFbScope` (top-level `ARRAY OF
+  <struct>`, #1415, unrelated to OOP) that our snapshot/restore code
+  didn't know about yet; wired it through. Also a stray constant-pool
+  population block that `main`'s optimizer refactor had relocated
+  elsewhere in the same file -- dropped our copy at the old location.
+- **`opcode.rs`** (whole-file rewrite conflict): `main` replaced the
+  old per-opcode `pub const` declarations with a macro-generated table
+  (from the #1446 container-viewer work), and it already carries
+  `METHOD_CALL` fully wired through the new system. Took `main`'s
+  version wholesale.
+- **`end_to_end_methods.rs`** (add/add): no real conflict, just two
+  extra upstream tests appended after ours (own-name assignment,
+  method-local shadowing a field) -- kept both, all 7 tests unique.
+- Deleted `specs/plans/2026-08-12-oop-method-declarations-static-dispatch.md`
+  per `main`'s new policy (adopted since our last sync) that plans are
+  deleted before merge, not carried forward.
+
+**One bug introduced by the merge itself, caught before pushing**: the
+auto-merge (no conflict reported, so no manual review) left *two*
+`METHOD_CALL` arms in `verify.rs`'s `effect_of` match -- our old one
+from the 2026-08-24 fix below, and #1449's own version, both landing
+via clean recursive merge since neither textually overlapped the
+other's insertion point. Rust caught it only as an `unreachable_patterns`
+warning, not a build failure. Removed the dead (ours) arm, kept #1449's
+(uses a cleaner `method_return_depth` helper). Committed separately
+(`f5264b44`) since it was missed in the merge commit itself -- the fix
+was made in the working tree before running CI but never `git add`ed,
+so the merge commit as committed still had the duplicate; caught by
+`git status` showing an unstaged diff afterward, not by CI.
+
+Full `just` CI clean after both commits (compile, coverage ≥85%,
+clippy, fmt, dupes, plan-citations).
+
+Checked issue #1199 and open TwinCAT/OOP issues while here: no new
+comment since the 2026-08-24 one quoted below. Garretfick has opened
+~15 new parsing-defect issues since then (#1418-#1433 range) plus
+#1467 (STRING/WSTRING method-return `Diagnostic::todo`, formalizing a
+known limitation) -- all his own, none assigned to us, consistent with
+"refuse codegen until parsing is correct." Nothing of ours pending
+review; no open PRs.
+
 ## 2026-08-24: void-METHOD RETURN stack leak fixed; synced to `main` again
 
 garretfick flagged a real bug on PR #1362 (posted 2026-08-21, via Claude
