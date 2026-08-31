@@ -667,29 +667,6 @@ fn effect_of(
             Effect::new(entry.num_params, method_return_depth(code, callee))
         }
 
-        // METHOD_CALL (OOP extension, ADR-0041 Phase 1 static dispatch):
-        // like CALL, arguments are popped into the callee's parameter
-        // slots, but unlike CALL a method may be void (RET_VOID), so the
-        // push count can't be the fixed `RET_DEPTH` FUNCTION callees use.
-        // The fb_ref underneath the args is only peeked, never popped, so
-        // it contributes nothing to this instruction's own effect; the
-        // receiver's method's own trailing RET/RET_VOID (always its last
-        // instruction, by construction) says whether a value follows it.
-        METHOD_CALL => {
-            let callee = FunctionId::new(u16_at(operands, 0));
-            let entry = code
-                .get_function(callee)
-                .ok_or(StackImbalance::UnknownCallee {
-                    function_id,
-                    offset,
-                    callee,
-                })?;
-            let has_return_value = code
-                .get_function_bytecode(callee)
-                .is_some_and(|bc| bc.last() == Some(&RET));
-            Effect::new(entry.num_params, u16::from(has_return_value))
-        }
-
         _ => {
             return Err(StackImbalance::UnknownOpcode {
                 function_id,
