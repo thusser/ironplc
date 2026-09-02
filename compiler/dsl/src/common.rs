@@ -563,18 +563,38 @@ impl fmt::Display for BooleanLiteral {
 #[derive(Debug, PartialEq, Clone)]
 pub struct CharacterStringLiteral {
     pub value: Vec<char>,
+    /// The width the source spelled, which is what selects the delimiter:
+    /// single quotes for `STRING`, double quotes for `WSTRING`.
+    ///
+    /// The width belongs on the literal and not only on the declaration it
+    /// initializes because a literal also appears in statement bodies, where
+    /// there is no declaration to borrow it from.
+    pub width: StringType,
 }
 
 impl CharacterStringLiteral {
+    /// Creates a single-byte (`STRING`) literal.
     pub fn new(value: Vec<char>) -> Self {
-        Self { value }
+        Self {
+            value,
+            width: StringType::String,
+        }
+    }
+
+    /// Creates a double-byte (`WSTRING`) literal.
+    pub fn new_wide(value: Vec<char>) -> Self {
+        Self {
+            value,
+            width: StringType::WString,
+        }
     }
 }
 
 impl fmt::Display for CharacterStringLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s: String = self.value.iter().collect();
-        write!(f, "'{}'", s)
+        let delimiter = self.width.delimiter();
+        write!(f, "{delimiter}{s}{delimiter}")
     }
 }
 
@@ -1702,6 +1722,17 @@ impl StringType {
             StringType::WString => "WSTRING",
         }
     }
+
+    /// Returns the character that delimits a literal of this string type:
+    /// a single quote for `STRING`, a double quote for `WSTRING`.
+    ///
+    /// See IEC 61131-3 section 2.2.2.
+    pub fn delimiter(&self) -> char {
+        match self {
+            StringType::String => '\'',
+            StringType::WString => '"',
+        }
+    }
 }
 
 /// Declares a string type with restricted length.
@@ -2253,7 +2284,6 @@ impl VariableIdentifier {
         VariableIdentifier::Direct(DirectVariableIdentifier {
             name,
             address_assignment: location,
-            span: SourceSpan::default(),
         })
     }
 
@@ -2295,12 +2325,27 @@ impl Display for VariableIdentifier {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Recurse, Located)]
+#[derive(Clone, Debug, PartialEq, Recurse)]
 pub struct DirectVariableIdentifier {
     pub name: Option<Id>,
     pub address_assignment: AddressAssignment,
-    #[located(position)]
-    pub span: SourceSpan,
+}
+
+impl Located for DirectVariableIdentifier {
+    /// The span of the symbolic name, or of the address when the declaration
+    /// has no name (`VAR AT %IX0.0 : BOOL; END_VAR`).
+    ///
+    /// Deriving this from the parts rather than storing a span of its own is
+    /// deliberate: a stored span is one every construction site has to
+    /// remember to fill in, and none of them did -- every located variable
+    /// reported position 0, so `P4036` put its caret on the first character
+    /// of the file instead of on the variable.
+    fn span(&self) -> SourceSpan {
+        match &self.name {
+            Some(name) => name.span(),
+            None => self.address_assignment.position.clone(),
+        }
+    }
 }
 
 /// Qualifier types for definitions.
@@ -2335,6 +2380,18 @@ pub struct AddressAssignment {
     #[recurse(ignore)]
     pub address: Vec<u32>,
     pub position: SourceSpan,
+}
+
+impl AddressAssignment {
+    /// Returns this address with `position` as its source position.
+    ///
+    /// [`AddressAssignment::try_from`] parses the address out of the token
+    /// text alone, which carries no position, so the caller puts the token's
+    /// span back.
+    pub fn with_position(mut self, position: SourceSpan) -> Self {
+        self.position = position;
+        self
+    }
 }
 
 lazy_static! {
@@ -3002,7 +3059,6 @@ mod tests {
                     address: vec![0],
                     position: SourceSpan::default(),
                 },
-                span: SourceSpan::default(),
             }),
             var_type: VariableType::Var,
             qualifier: DeclarationQualifier::Unspecified,
@@ -3015,6 +3071,34 @@ mod tests {
         let mut decl = VarDecl::simple(name, "INT");
         decl.block = block;
         decl
+    }
+
+    #[test]
+    fn span_when_direct_variable_identifier_has_name_then_is_name_span() {
+        let identifier = VariableIdentifier::new_direct(
+            Some(Id::from("tempSensor").with_position(SourceSpan::range(37, 47))),
+            AddressAssignment::try_from("%I*")
+                .unwrap()
+                .with_position(SourceSpan::range(50, 53)),
+        );
+
+        let span = identifier.span();
+        assert_eq!(span.start, 37);
+        assert_eq!(span.end, 47);
+    }
+
+    #[test]
+    fn span_when_direct_variable_identifier_has_no_name_then_is_address_span() {
+        let identifier = VariableIdentifier::new_direct(
+            None,
+            AddressAssignment::try_from("%IX0.0")
+                .unwrap()
+                .with_position(SourceSpan::range(50, 56)),
+        );
+
+        let span = identifier.span();
+        assert_eq!(span.start, 50);
+        assert_eq!(span.end, 56);
     }
 
     #[test]
@@ -3166,15 +3250,18 @@ mod tests {
 
     #[test]
     fn test_character_string_literal_partial_eq_and_clone() {
-        let csl1 = CharacterStringLiteral {
-            value: vec!['a', 'b', 'c'],
-        };
+        let csl1 = CharacterStringLiteral::new(vec!['a', 'b', 'c']);
         let csl2 = csl1.clone();
         assert_eq!(csl1, csl2);
-        let csl3 = CharacterStringLiteral {
-            value: vec!['x', 'y', 'z'],
-        };
+        let csl3 = CharacterStringLiteral::new(vec!['x', 'y', 'z']);
         assert_ne!(csl1, csl3);
+    }
+
+    #[test]
+    fn eq_when_same_value_but_different_width_then_not_equal() {
+        let narrow = CharacterStringLiteral::new(vec!['a', 'b', 'c']);
+        let wide = CharacterStringLiteral::new_wide(vec!['a', 'b', 'c']);
+        assert_ne!(narrow, wide);
     }
 
     #[test]
@@ -3500,10 +3587,20 @@ mod tests {
 
     #[test]
     fn display_when_character_string_literal_then_quoted() {
-        let csl = CharacterStringLiteral {
-            value: vec!['h', 'i'],
-        };
+        let csl = CharacterStringLiteral::new(vec!['h', 'i']);
         assert_eq!(format!("{csl}"), "'hi'");
+    }
+
+    #[test]
+    fn display_when_wide_character_string_literal_then_double_quoted() {
+        let csl = CharacterStringLiteral::new_wide(vec!['h', 'i']);
+        assert_eq!(format!("{csl}"), "\"hi\"");
+    }
+
+    #[test]
+    fn delimiter_when_string_type_then_matches_iec_spelling() {
+        assert_eq!(StringType::String.delimiter(), '\'');
+        assert_eq!(StringType::WString.delimiter(), '"');
     }
 
     #[test]
@@ -3590,9 +3687,7 @@ mod tests {
 
     #[test]
     fn display_when_constant_kind_character_string_then_formatted() {
-        let ck = ConstantKind::CharacterString(CharacterStringLiteral {
-            value: vec!['a', 'b'],
-        });
+        let ck = ConstantKind::CharacterString(CharacterStringLiteral::new(vec!['a', 'b']));
         assert_eq!(format!("{ck}"), "'ab'");
     }
 

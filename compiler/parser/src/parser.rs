@@ -285,7 +285,11 @@ parser! {
     rule pragma() -> () = tok(TokenType::Pragma) ()
     rule _ = (whitespace() / comment() / pragma())*
 
-    // Lists of separated items with required ending separator
+    // Lists of separated items. The `periodsep`/`semisep` forms consume a
+    // trailing separator; the `_no_trailing` variants and `commasep_oneplus`
+    // do not, because IEC 61131-3 forbids a trailing comma in the lists that
+    // use them. `commasep_oneplus` once required one, which silently made a
+    // trailing comma legal everywhere it was used.
     rule periodsep<T>(x: rule<T>) -> Vec<T> = v:(x() ** (_ period() _)) _ period() {v}
     rule periodsep_oneplus_no_trailing<T>(x: rule<T>) -> Vec<T> = v:(x() ++ (_ period() _)) {v}
     rule periodsep_no_trailing<T>(x: rule<T>) -> Vec<T> = v:(x() ** (_ period() _)) {v}
@@ -336,7 +340,7 @@ parser! {
     rule constant() -> ConstantKind =
         real:real_literal() { ConstantKind::RealLiteral(real) }
         / integer:integer_literal() { ConstantKind::IntegerLiteral(integer) }
-        / c:character_string() { ConstantKind::CharacterString(CharacterStringLiteral::new(c)) }
+        / c:character_string_literal() { ConstantKind::CharacterString(c) }
         / duration:duration() { ConstantKind::Duration(duration) }
         / t:time_of_day() { ConstantKind::TimeOfDay(t) }
         / d:date() { ConstantKind::Date(d) }
@@ -405,6 +409,12 @@ parser! {
 
     // B.1.2.2 Character strings
     rule character_string() -> Vec<char> = single_byte_character_string() / double_byte_character_string()
+    // The literal keeps which of the two spellings the source used. A
+    // declaration does not need this because its own STRING/WSTRING keyword
+    // says the width, but a literal in a statement body has no such keyword.
+    rule character_string_literal() -> CharacterStringLiteral =
+      c:single_byte_character_string() { CharacterStringLiteral::new(c) }
+      / c:double_byte_character_string() { CharacterStringLiteral::new_wide(c) }
     rule single_byte_character_string() -> Vec<char>  = (tok(TokenType::String) tok(TokenType::Hash))? t:tok(TokenType::SingleByteString) {
       // The token includes the surrounding single quotes, so remove those when generating the literal
       let mut chars = t.text.chars();
@@ -662,9 +672,13 @@ parser! {
     rule array_specification() -> ArraySpecificationKind = tok(TokenType::Array) _ tok(TokenType::LeftBracket) _ ranges:subrange() ** (_ tok(TokenType::Comma) _ ) _ tok(TokenType::RightBracket) _ tok(TokenType::Of) _ ref_to:ref_to_keyword()? _ type_name:array_element_type() {
       SpecificationKind::Inline(ArraySubranges { ranges, type_name, ref_to } )
     }
+    // The length delimiter comes from string_length_spec() so that the array
+    // element type accepts the same spellings as every other string position
+    // -- standard `STRING[n]` brackets and the `STRING(n)` parenthesis
+    // extension, the latter gated by rule_token_no_paren_string_length.
     rule array_element_type() -> ArrayElementType =
-      tok:tok(TokenType::String) length:(_ tok(TokenType::LeftBracket) _ l:integer_ref() _ tok(TokenType::RightBracket) { l })? { ArrayElementType::String(StringSpecification { width: StringType::String, length, keyword_span: tok.span.clone() }) }
-      / tok:tok(TokenType::WString) length:(_ tok(TokenType::LeftBracket) _ l:integer_ref() _ tok(TokenType::RightBracket) { l })? { ArrayElementType::WString(StringSpecification { width: StringType::WString, length, keyword_span: tok.span.clone() }) }
+      tok:tok(TokenType::String) length:(_ l:string_length_spec() { l })? { ArrayElementType::String(StringSpecification { width: StringType::String, length, keyword_span: tok.span.clone() }) }
+      / tok:tok(TokenType::WString) length:(_ l:string_length_spec() { l })? { ArrayElementType::WString(StringSpecification { width: StringType::WString, length, keyword_span: tok.span.clone() }) }
       / tn:non_generic_type_name() { ArrayElementType::Named(tn) }
     rule array_initialization() -> Vec<ArrayInitialElementKind> = tok(TokenType::LeftBracket) _ init:array_initial_elements() ** (_ tok(TokenType::Comma) _ ) _ tok(TokenType::RightBracket) { init }
     rule array_initial_elements() -> ArrayInitialElementKind = size:integer() _ tok(TokenType::LeftParen) _ ai:array_initial_element()? _ tok(TokenType::RightParen) { ArrayInitialElementKind::repeated(size, ai) } / array_initial_element()
@@ -930,7 +944,7 @@ parser! {
     // There is no location_prefix or size_prefix rule because it would be ambiguous when the % prefix normally
     // resolved ambiguity. Therefore, the lexer matches the entire direct variable.
     pub rule direct_variable() -> AddressAssignment = t:tok(TokenType::DirectAddress) {?
-      AddressAssignment::try_from(t.text.as_str())
+      AddressAssignment::try_from(t.text.as_str()).map(|address| address.with_position(t.span.clone()))
     }
     // B.1.4.2 Multi-element variables
     // TODO support these
@@ -973,6 +987,14 @@ parser! {
     // We have to first handle the special case of enumeration or fb_name without an initializer
     // because these share the same syntax. We only know the type after trying to resolve the
     // type name.
+    //
+    // Do not add a rule here that decides at parse time that a bare type name
+    // names a function block. One existed (`fb_name_decl`) and was removed: it
+    // cannot be sound, because whether an identifier is a function-block type
+    // is not knowable until declarations are resolved. That is precisely why
+    // the `LateResolvedType` placeholder and
+    // `xform_resolve_late_bound_type_initializer` exist -- the ambiguity is
+    // deferred to the analyzer on purpose.
     rule var_init_decl() -> Vec<UntypedVarDecl> = located_var1_init_decl() / structured_var_init_decl__without_ambiguous() / string_var_declaration() / array_var_init_decl() / ref_to_var_init_decl() / fb_call_style_var_decl() / string_var_declaration() / var1_init_decl__with_ambiguous_struct()
     // Extension: a located variable (complete or
     // incomplete/wildcard address) declared inside an otherwise plain
@@ -1291,7 +1313,7 @@ parser! {
       }
     }
     rule incompl_location() -> AddressAssignment = tok(TokenType::At) _ t:tok(TokenType::DirectAddressIncomplete) {?
-      AddressAssignment::try_from(t.text.as_str())
+      AddressAssignment::try_from(t.text.as_str()).map(|address| address.with_position(t.span.clone()))
     }
     rule var_spec() -> VariableSpecificationKind =
       sr:subrange_specification__with_range() { VariableSpecificationKind::Subrange(sr) }

@@ -24,11 +24,11 @@ use super::compile::{
 use super::compile_expr::emit_load_var;
 use super::compile_setup::{
     debug_type_for_decl, debug_type_for_return, emit_function_local_prologue, map_var_section,
-    resolve_type_name,
 };
 use super::compile_stmt::{
     compile_body, compile_statements, resolve_string_max_length, resolve_string_spec_max_length,
 };
+use super::type_info::resolve_type_name;
 use crate::emit::Emitter;
 
 /// Records a debug [`VarNameEntry`] for a function- or FB-local variable
@@ -353,7 +353,7 @@ pub(crate) fn compile_user_function(
 
     // Emit initialization prologue: IEC 61131-3 functions are stateless, so
     // local variables must be re-initialized on every call. The flat variable
-    // table (ADR-0021) retains stale values between calls, so the prologue
+    // table (ADR-0046) retains stale values between calls, so the prologue
     // resets non-parameter locals to their declared initial values (or zero).
     emit_function_local_prologue(
         &mut func_emitter,

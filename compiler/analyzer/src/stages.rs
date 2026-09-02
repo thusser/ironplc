@@ -14,8 +14,9 @@ use crate::{
     function_environment::FunctionEnvironmentBuilder,
     ironplc_dsl::common::Library,
     result::SemanticResult,
-    rule_abstract_not_instantiated, rule_assignment_aggregate_type_compat, rule_bit_access_range,
-    rule_case_bit_string_label, rule_decl_struct_element_unique_names, rule_decl_subrange_limits,
+    rule_abstract_not_instantiated, rule_assignment_aggregate_type_compat,
+    rule_bit_and_partial_access_range, rule_case_bit_string_label,
+    rule_decl_struct_element_unique_names, rule_decl_subrange_limits,
     rule_enumeration_values_unique, rule_extends_field_duplicated,
     rule_function_block_call_unsupported, rule_function_block_invocation,
     rule_function_call_declared, rule_function_call_type_check, rule_method_call_declared,
@@ -160,6 +161,14 @@ pub fn resolve_types(
 
     // Recoverable: an unresolvable declaration is diagnosed but does not
     // discard the rest of the library's successfully resolved declarations.
+    //
+    // The reason this distinction exists is not one failing test. Corpus
+    // testing showed what looked like merge-order or file-pairing
+    // sensitivity: a source that analyzed cleanly alone failed once merged
+    // with unrelated code. The cause was never ordering -- a transform that
+    // accumulates diagnostics and then discards its whole result throws away
+    // every unrelated resolution it had already completed. A new transform
+    // that returns `Err` after a user-level diagnostic reintroduces that.
     let recoverable_xforms: Vec<
         fn(Library, &mut TypeEnvironment) -> Result<(Library, Vec<Diagnostic>), Vec<Diagnostic>>,
     > = vec![
@@ -359,7 +368,7 @@ pub(crate) fn semantic(
         rule_var_decl_global_const_requires_external_const::apply,
         rule_mixed_located_var_declarations::apply,
         rule_pou_hierarchy::apply,
-        rule_bit_access_range::apply,
+        rule_bit_and_partial_access_range::apply,
         rule_case_bit_string_label::apply,
         rule_ref_to::apply,
     ];
@@ -405,6 +414,46 @@ mod tests {
         let res = analyze(&[&lib], &CompilerOptions::default());
         let (_library, context) = res.unwrap();
         assert!(context.has_diagnostics());
+    }
+
+    /// Issue #1566: a second file must not displace the first file's
+    /// diagnostics. Every undefined variable across both files is reported.
+    #[test]
+    fn analyze_when_semantic_errors_in_two_files_then_reports_all() {
+        let file_a = "
+PROGRAM a
+VAR
+  x : INT;
+END_VAR
+  x := AAA_ONE;
+  x := AAA_TWO;
+END_PROGRAM";
+
+        let file_b = "
+PROGRAM b
+VAR
+  y : INT;
+END_VAR
+  y := BBB_ONE;
+END_PROGRAM";
+
+        let options = CompilerOptions::default();
+        let library_a = parse_program(file_a, &FileId::from_string("a.st"), &options).unwrap();
+        let library_b = parse_program(file_b, &FileId::from_string("b.st"), &options).unwrap();
+
+        let (_library, context) = analyze(&[&library_a, &library_b], &options).unwrap();
+
+        let reported: Vec<&String> = context
+            .diagnostics()
+            .iter()
+            .flat_map(|d| &d.described)
+            .collect();
+        for expected in ["variable=AAA_ONE", "variable=AAA_TWO", "variable=BBB_ONE"] {
+            assert!(
+                reported.iter().any(|d| d.as_str() == expected),
+                "expected {expected}, got {reported:?}"
+            );
+        }
     }
 
     #[test]

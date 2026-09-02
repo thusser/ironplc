@@ -46,8 +46,12 @@ use ironplc_container::debug_section::{
 };
 use ironplc_container::{
     CharWidth, Container, ContainerBuilder, FbTypeId, FunctionId, TaskType, UserFbDescriptor,
-    VarIndex, STRING_HEADER_BYTES,
+    VarIndex,
 };
+// The string data-region layout lives in `ironplc-container` so the analyzer
+// and codegen size strings the same way. Re-exported here because the rest of
+// codegen reaches for these through `compile`.
+pub(crate) use ironplc_container::{string_region_size, DEFAULT_STRING_MAX_LENGTH};
 use ironplc_dsl::common::{
     FunctionBlockDeclaration, FunctionDeclaration, InitialValueAssignmentKind, Library,
     LibraryElementKind, ProgramDeclaration, StringType, VarDecl, VariableType,
@@ -62,11 +66,12 @@ use ironplc_analyzer::{FunctionEnvironment, SemanticContext, TypeEnvironment};
 use crate::emit::Emitter;
 
 use super::compile_fn::{compile_user_function, compile_user_function_block};
-use super::compile_setup::{assign_variables, emit_initial_values, resolve_type_name};
+use super::compile_setup::{assign_variables, emit_initial_values};
 use super::compile_stmt::compile_body;
+use super::type_info::resolve_type_name;
 
 /// The native operation width used for arithmetic and comparisons.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum OpWidth {
     /// 32-bit integer operations (for SINT, INT, DINT, USINT, UINT, UDINT).
     W32,
@@ -79,7 +84,7 @@ pub(crate) enum OpWidth {
 }
 
 /// Whether a type uses signed or unsigned semantics for division and comparison.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Signedness {
     Signed,
     Unsigned,
@@ -121,9 +126,6 @@ pub(crate) enum PoolConstant {
     WStr(Vec<u8>),
 }
 
-/// The IEC 61131-3 default maximum length for STRING (254 characters).
-pub(crate) const DEFAULT_STRING_MAX_LENGTH_U16: u16 = 254;
-
 /// Metadata for a STRING/WSTRING variable allocated in the data region.
 #[derive(Clone)]
 pub(crate) struct StringVarInfo {
@@ -147,13 +149,6 @@ pub(crate) fn char_width_for_string_type(width: &StringType) -> CharWidth {
         StringType::String => NARROW_CHAR_WIDTH,
         StringType::WString => WIDE_CHAR_WIDTH,
     }
-}
-
-/// Total bytes needed in the data region for a STRING/WSTRING value with the
-/// given maximum length (in code units) and `char_width`: header plus
-/// `max_length * char_width` payload bytes.
-pub(crate) fn string_region_size(max_length: u16, char_width: CharWidth) -> u32 {
-    STRING_HEADER_BYTES as u32 + (max_length as u32) * (char_width.byte_width() as u32)
 }
 
 /// Encode a character-string literal into bytes for the constant pool.
@@ -1174,7 +1169,13 @@ pub(crate) struct CompileContext {
     /// True when any WSTRING (wide) string is declared. Temp buffers are then
     /// sized in wide bytes so an intermediate wide value fits (ADR-0035).
     pub(crate) has_wide_string: bool,
-    /// Number of temp buffers needed (one per string load in the init function).
+    /// Number of temp buffers needed: one per string-operation call site,
+    /// counted across every function, not just the init function.
+    ///
+    /// This is a count of *static* sites, but the VM rewinds its allocator only
+    /// on function return, so a site inside a loop consumes one buffer per
+    /// iteration. A loop over a string operation therefore exhausts the pool
+    /// and traps `V9009`.
     pub(crate) num_temp_bufs: u16,
     /// Debug info: variable name entries collected during assign_variables.
     pub(crate) debug_var_names: Vec<VarNameEntry>,
