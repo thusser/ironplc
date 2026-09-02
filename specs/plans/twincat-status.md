@@ -6,6 +6,18 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-02: routine sync to `main`, no conflicts
+
+20 commits, all garretfick's own bug-fixing sweep (constant-range
+checks, install.sh, `--dump-vars`, discovery docs, steering-doc
+reorg, etc.) -- nothing TwinCAT/OOP-specific. Clean merge, no
+conflicts (`869efe16`). Full `just` CI clean (compile, coverage
+≥85%, clippy, fmt, dupes).
+
+Checked issue #1199 and thusser's PRs/assigned issues while here:
+no new activity since the 2026-08-24 comment quoted below; no open
+PRs, nothing assigned. Nothing pending for us right now.
+
 ## 2026-08-31: PR #1362 merged via #1449; `twincat-dev` synced to `main`
 
 PR #1362 is **closed**, superseded by garretfick's own **PR #1449**
