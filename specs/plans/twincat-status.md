@@ -6,6 +6,42 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-04: PR #1625 opened -- shared OOP corpus fixture (#1428)
+
+Opened **[#1625](https://github.com/ironplc/ironplc/pull/1625)**
+against upstream `main`, from `feature/oop-shared-corpus-fixture`:
+adds `compiler/resources/test/oop.st`, one shared fixture covering the
+already-shipped OOP surface (`INTERFACE`/`EXTENDS`, multi-interface
+`IMPLEMENTS`, `ABSTRACT` FB, `METHOD` declarations, method calls,
+`THIS^`/`SUPER^` field/method access and subscript), registered as a
+new golden-pair case in `plc2plc/src/tests/corpus.rs`. Plan written and
+committed first (`specs/plans/2026-09-04-oop-shared-corpus-fixture.md`,
+`d3570868`), removed before the PR per the branch workflow. First draft
+of the fixture was narrower than intended -- caught before opening the
+PR (Tim asked "that's a pretty small test file, intentional?") and
+expanded to also cover `THIS^` calling a method, `SUPER^` reading a
+field, multi-interface `IMPLEMENTS`, and a subscript through `THIS^`,
+none of which the first draft had even though each already round-trips
+individually elsewhere. Full `just` CI clean throughout.
+
+Verified clean before starting: #1428 itself still open/unassigned/
+0 comments since filing; none of garretfick's currently-open PRs touch
+plc2plc, the parser test files, or the shared corpus; recent commit
+history on those exact files is all unrelated. Deliberately does not
+touch `PROPERTY`, `INTERFACE` bodies, or access-specifier syntax --
+all still unparsed (#1419-#1424) and still his active lane.
+
+Also merged the branch into `twincat-dev` (`15170359`) per the usual
+practice of carrying work here whether or not the upstream PR has
+merged yet.
+
+**Correction to this session's own initial recommendation**: originally
+proposed picking up #1428's "enforce round-trip re-parsing everywhere"
+item as the independent piece to work on -- turned out to already be
+closed, via PR #1417, merged 2026-08-23 (same day #1428 was filed).
+Should have checked before recommending it; caught and corrected before
+any implementation started, pivoted to the fixture-gap item instead.
+
 ## 2026-09-04: routine sync to `main`, no conflicts
 
 8 commits, all garretfick's own work (constant-range diagnostics,
