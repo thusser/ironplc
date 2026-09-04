@@ -6,6 +6,33 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-04: routine sync to `main`, no conflicts
+
+8 commits, all garretfick's own work (constant-range diagnostics,
+function-form built-ins for AND/OR/XOR/NOT, single-PROGRAM
+enforcement, symbol-order preservation) -- nothing touching
+TwinCAT/OOP files or the test files this branch is about to add
+fixtures to. Clean merge, no conflicts (`f48090dd`). Full `just` CI
+clean.
+
+Also settled on the next independent piece of work: issue #1428
+("no OOP fixtures in any corpus or golden set") turned out to be
+mostly already closed -- PR #1417 (merged 2026-08-23, same day #1428
+was filed) already added round-trip re-parse enforcement to the
+plc2plc golden corpus, which was the item recommended here initially.
+What's still open: `compiler/resources/test/` (40 shared `.st`
+fixtures) and `plc2plc/src/tests/corpus.rs`'s golden-pair list (17
+cases) have no OOP entry -- the existing OOP coverage
+(`methods.rs`/`fb_inheritance.rs`/`this_super.rs` in both `parser`
+and `plc2plc`) is all inline per-file Rust string literals, hand-
+duplicated between the two crates rather than sharing one canonical
+source. Plan: add `compiler/resources/test/oop.st` covering the
+already-shipped, stable OOP surface (EXTENDS/IMPLEMENTS/INTERFACE,
+ABSTRACT FB, METHOD declarations, method calls, THIS^/SUPER^) and
+register it in plc2plc's golden corpus. Deliberately does not touch
+PROPERTY/INTERFACE-body/access-specifier grammar, which is still
+garretfick's active, unfinished lane (#1419-1424).
+
 ## 2026-09-02: routine sync to `main`, no conflicts
 
 20 commits, all garretfick's own bug-fixing sweep (constant-range
