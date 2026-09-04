@@ -29,6 +29,7 @@ mod rule_abstract_not_instantiated;
 mod rule_assignment_aggregate_type_compat;
 mod rule_bit_and_partial_access_range;
 mod rule_case_bit_string_label;
+mod rule_constant_range;
 mod rule_decl_struct_element_unique_names;
 mod rule_decl_subrange_limits;
 mod rule_enumeration_values_unique;
@@ -64,8 +65,10 @@ mod string_similarity;
 pub mod symbol_environment;
 mod type_attributes;
 mod type_category;
+mod type_compat;
 mod type_environment;
 mod type_table;
+pub mod value_range;
 mod variable_type;
 mod xform_fold_constant_expressions;
 mod xform_fold_initializer_expressions;
@@ -93,6 +96,9 @@ pub use function_environment::{
 };
 pub use intermediate_type::IntermediateType;
 pub use intermediates::enumeration::resolve_ordinal_values;
+pub use intermediates::operator_function_form::{
+    operator_function_form, FormOf, OperatorFunctionForm,
+};
 pub use semantic_context::{SemanticContext, SemanticContextBuilder};
 pub use type_attributes::TypeAttributes;
 pub use type_category::TypeCategory;
@@ -112,5 +118,7 @@ mod spec_requirements {
 mod spec_conformance;
 #[cfg(test)]
 mod spec_conformance_adr;
+#[cfg(test)]
+mod spec_conformance_keyword_function_forms;
 #[cfg(test)]
 mod spec_conformance_pointer_to;

@@ -13,6 +13,7 @@
 mod common;
 
 mod codegen_max_call_depth;
+mod compile_arith_identity;
 mod compile_array;
 mod compile_bool;
 mod compile_case;
@@ -24,6 +25,7 @@ mod compile_func_forms;
 mod compile_if;
 mod compile_loops;
 mod compile_mux;
+mod compile_program_count;
 mod compile_shift;
 mod compile_struct;
 mod compile_this_super;
@@ -36,6 +38,7 @@ mod end_to_end_add;
 mod end_to_end_adr;
 mod end_to_end_aggregate_copy;
 mod end_to_end_any_int_literals;
+mod end_to_end_arith_identity;
 mod end_to_end_array;
 mod end_to_end_array_of_struct;
 mod end_to_end_array_ref_to;
