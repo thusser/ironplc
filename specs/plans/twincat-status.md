@@ -6,6 +6,50 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-07: PR #1625 merged; PR #1666 opened -- real .TcIO interface fixture (#1428)
+
+garretfick merged #1625 himself directly (two merge-commits resolving
+conflicts against `main`, no review comments) -- `oop.st` and its golden
+pair are now on upstream `main` as `c8d7d4e5`. Synced `twincat-dev` to
+the post-merge `main` (32 commits, clean merge, full CI green), pushed.
+
+Checked #1428's remaining items for a second independently-doable piece:
+item 2 asks for a real `.TcPOU` *and* `.TcIO` fixture (not inline XML).
+The `.TcPOU` half turned out to already be done -- garretfick's own PR
+#1452 added `twincat_method_solution/.../FB_Motor.TcPOU` with sibling
+`<Method>` elements. The `.TcIO` half (Beckhoff's file type for a
+standalone `INTERFACE`, the `<Itf>` element) had zero real-file
+coverage: only inline XML string literals in
+`sources/src/parsers/twincat_parser/tests.rs`. No open PR touched it.
+
+Wrote and committed a plan
+(`specs/plans/2026-09-07-twincat-tcio-interface-fixture.md`), then
+implementing it surfaced something the plan hadn't accounted for:
+`analyzer/src/rule_unsupported_extension.rs` unconditionally flags
+`INTERFACE` and `IMPLEMENTS` as P9999 regardless of dialect -- interface
+dispatch is a later ADR-0041 phase, not built yet. A happy-path
+`check --dialect twincat` test can never pass against real
+`INTERFACE`/`IMPLEMENTS` content today. Updated the plan in place and
+wrote the test as a negative assertion instead (`ironplcc check` fails
+with exactly the two expected P9999 diagnostics, at the right files) --
+this still proves the actual gap (the `.TcIO` file is discovered,
+parsed, and position-mapped correctly through the real CLI pipeline),
+just not via a green `check`.
+
+Added `ironplc-cli/resources/test/twincat_interface_solution/` (a
+`.sln`/`.tsproj`/`.plcproj` scaffold, `I_Drivable.TcIO`, `FB_Axis.TcPOU`
+implementing it, `MAIN.TcPOU`) and
+`check_when_twincat_solution_declares_interface_then_p9999` in
+`ironplc-cli/tests/cli.rs`. Full CI green
+(`cd compiler && just`, `cd specs && just`). Plan removed before
+opening the PR. Opened
+**[#1666](https://github.com/ironplc/ironplc/pull/1666)** against
+upstream `main` from `feature/twincat-tcio-interface-fixture`, and
+merged the same commits into `twincat-dev` (clean, no conflicts).
+
+Once interface dispatch actually lands, this test's assertions should
+flip from failure to success.
+
 ## 2026-09-04: PR #1625 opened -- shared OOP corpus fixture (#1428)
 
 Opened **[#1625](https://github.com/ironplc/ironplc/pull/1625)**
