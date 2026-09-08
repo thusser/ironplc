@@ -6,6 +6,42 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-08: PR #1681 opened -- VAR PERSISTENT support (#1679)
+
+Picked up #1679 (the two issues filed earlier today) as the next
+independent task. Implementation turned out larger than the issue's own
+suggested fix once the grammar was actually read: `RETAIN` reaches
+`FUNCTION_BLOCK`/`PROGRAM`/`VAR_GLOBAL` bodies through three genuinely
+different code paths (a dedicated `retentive_var_declarations()`
+production for FB/METHOD bodies, a flexible optional-qualifier group
+for `program_var_declarations()`, and another for
+`global_var_declarations__qualifier()`), not one shared rule -- so
+`PERSISTENT` needed a new rule mirroring the first and one added
+alternative to each of the other two, not a single grammar change.
+
+Gated behind a new `allow_persistent_var` flag (`[Codesys, TwinCat]`,
+matching `allow_reference_to`/`allow_pointer_to`/`allow_adr` --
+`PERSISTENT` isn't IEC-standard the way `RETAIN` is, so unlike `RETAIN`
+it doesn't parse unconditionally). Full CLI wiring (`ironplc-cli/bin/main.rs`) and a `FLAG_FIXTURES` entry
+were both required and easy to miss -- both untested by `cargo build`,
+caught only by `cargo test`/`just`. Same lesson as the rebasing-era
+finding that any new dialect flag needs CLI wiring + a feature-flag
+fixture checked explicitly, now confirmed on a forward feature add
+rather than a rebase.
+
+Bonus find while implementing: `sources/src/xml/transform.rs`'s
+`transform_var_list` already read a PLCopen-XML `persistent` attribute
+into `VarList.persistent` (schema + position-parsing side both
+complete) but never checked it -- silently dropped on the floor. Fixed
+in the same PR since it's the same qualifier reaching the same DSL
+enum.
+
+Full CI green (`cd compiler && just`, `cd specs && just`). Plan removed
+before opening. Opened
+**[#1681](https://github.com/ironplc/ironplc/pull/1681)** against
+upstream `main` from `feature/twincat-var-persistent`, merged cleanly
+into `twincat-dev`.
+
 ## 2026-09-08: Full TwinCAT dialect gap audit; filed #1679, #1680
 
 garretfick closed **#1199** (the top-level TwinCAT tracking issue) on
