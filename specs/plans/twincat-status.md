@@ -6,6 +6,50 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-08: PR #1682 opened -- S=/R= set/reset operators (#1680)
+
+Picked up #1680 next. The issue's own suggested fix (written before
+this investigation) speculated new `SetAssign`/`ResetAssign` tokens and
+explicitly flagged "check whether REF= is one token or two before
+choosing" -- so checked. Finding: `REF=` (`ref_bind_op()` in
+`parser.rs`) is **two** separately-lexed tokens (an identifier spelled
+`REF` immediately followed by a bare `=` with no whitespace, matched
+contextually inside `assignment_statement()`), not a dedicated keyword
+token -- and it turns out **not gated by any dialect flag at all**
+(confirmed by grep across the analyzer and `xform_demote_keywords.rs`;
+`r REF= x;` parses under every dialect today, apparently a pre-existing
+gap rather than intentional).
+
+This mattered more for `S`/`R` than it did for `REF`: single-letter
+names are extremely common as real variable names, so a dedicated
+keyword token would have meant tokenizing every bare `S`/`R` as a
+keyword first and relying on demotion catching every non-operator use
+-- a much larger blast radius than `REFERENCE`/`POINTER`/`ABSTRACT`.
+Followed `REF=`'s two-token, grammar-contextual technique instead,
+which sidesteps that risk entirely. Net effect: **no new dialect
+flag** for this feature -- smaller in surface area than `VAR
+PERSISTENT`, once the lexing question was settled instead of guessed.
+Told the user about this scope change (removing the flag I'd
+originally described) before implementing, since it revised the plan
+significantly from what was first proposed.
+
+Codegen explicitly refuses (`P9999`) for `S=`/`R=` rather than emit an
+unconditional store -- there's no lowering yet for "write only when
+true, otherwise unchanged," matching garretfick's own stated philosophy
+closing #1199 and the identical precedent already set for
+`THIS^`/`SUPER^` in `compile_this_super.rs`.
+
+Also caught before pushing: `cd specs && just`'s plan-citation check
+correctly failed on a test doc comment that referenced "the plan"
+(which gets deleted before merge) -- fixed with a small follow-up
+commit before opening the PR.
+
+Full CI green. Opened
+**[#1682](https://github.com/ironplc/ironplc/pull/1682)** against
+upstream `main` from `feature/twincat-set-reset-bind`, merged cleanly
+into `twincat-dev` (automatic merge, no conflicts, alongside the
+already-landed `VAR PERSISTENT` changes).
+
 ## 2026-09-08: PR #1681 opened -- VAR PERSISTENT support (#1679)
 
 Picked up #1679 (the two issues filed earlier today) as the next
