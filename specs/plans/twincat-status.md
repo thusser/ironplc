@@ -6,6 +6,56 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-08: Full TwinCAT dialect gap audit; filed #1679, #1680
+
+garretfick closed **#1199** (the top-level TwinCAT tracking issue) on
+2026-09-08, saying "largely speaking the issues here are resolved. I'd
+like to handle remaining issues one-by-one." Prompted a genuine
+assessment of how far that actually gets us: confirmed by direct
+`ironplcc check --dialect twincat` runs that `INTERFACE`, `IMPLEMENTS`,
+`ABSTRACT`, `THIS^`, and `SUPER^` all unconditionally fail semantic
+analysis with P9999 regardless of dialect flags -- so what's closed is
+"parses TwinCAT XML/projects, basic ST, static method dispatch on
+concrete types," not the OOP surface a real TwinCAT/CODESYS codebase
+actually leans on.
+
+Ran a full dialect audit (forked, ~270s / 136 tool calls) to find gaps
+outside the already-tracked OOP corner. Key discovery: **issue #1434**
+("Tracking: OOP support gaps vs. CODESYS and IEC 61131-3 Ed. 3")
+already exists with a parsed/analyzed/executes table and 13 linked
+sub-issues -- a better version of any OOP-gap issue we'd have filed
+ourselves, including things neither of us had found (`VAR_INST`/
+`VAR_STAT` not parsed -- #1425; TwinCAT `<Property>` XML elements
+silently discarded -- #1418; `CLASS`/`NAMESPACE` -- #1429/#1430). No new
+OOP issue filed; #1434 already covers that ground.
+
+Outside OOP, confirmed two genuine, previously-unfiled, high-impact
+gaps (each a hard P0002, verified empirically, not doc-inferred) and
+filed them, matching the existing #1419-#1430 one-construct-per-issue
+style:
+
+- **[#1679](https://github.com/ironplc/ironplc/issues/1679)** --
+  `VAR PERSISTENT` is not parsed at all (no token, no
+  `DeclarationQualifier` variant). Not mentioned in
+  `beckhoff-twincat-dialect.md`. Standard mechanism for values
+  surviving a reload/reboot; used constantly in real projects.
+- **[#1680](https://github.com/ironplc/ironplc/issues/1680)** -- `S=`/
+  `R=` set/reset assignment operators are not parsed. Common idiom for
+  edge-latched booleans. Suggested following the existing `REF=`
+  precedent (`ref_bind_op()` in `parser.rs:1163`) rather than a new
+  pattern.
+
+Lower-traffic gaps found but not filed (judgment call, revisit if they
+become relevant): `UNION`/`END_UNION`, bare `CONTINUE` in loops,
+`LTIME` sub-millisecond literal suffixes (`ns`/`us` -- only `ms`
+currently parses, which defeats `LTIME`'s point). Also noted: the
+design doc itself has stale claims in both directions (undersells
+things that already work, like enum underlying types and `REF=`) --
+already tracked by open issue #1498, not re-filed.
+
+Nothing implemented this round -- audit and issue-filing only, no code
+changes, `twincat-dev` unchanged except this entry.
+
 ## 2026-09-07: PR #1625 merged; PR #1666 opened -- real .TcIO interface fixture (#1428)
 
 garretfick merged #1625 himself directly (two merge-commits resolving
