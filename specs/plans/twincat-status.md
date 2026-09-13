@@ -6,6 +6,30 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-13: PRs #1681 and #1682 merged upstream; twincat-dev synced
+
+Both `VAR PERSISTENT` (#1681) and `S=`/`R=` (#1682) are now on upstream
+`main`. #1681 needed one fix after review: garretfick flagged a failing
+"Build Website / Documentation Job" -- the docs site has a Sphinx
+extension (`docs/extensions/ironplc_flags.py`) that cross-checks every
+`--allow-*` flag in `options.rs` against `enabling-dialects-and-
+features.rst` and `ironplcc.rst`, including each dialect's own
+**Enables:** list. `allow_persistent_var` was missing from both files
+and both dialect lists -- same category of "hand-maintained list,
+invisible to `cargo build`" gap as the CLI-wiring/`FLAG_FIXTURES` one
+already in memory, just on the docs side this time. Fixed, verified
+with a full local `sphinx-build -a -W -n` before pushing, merged.
+
+Synced `twincat-dev` to the post-merge `main` (34 commits: OOP EXTENDS
+field-inheritance codegen, STRING_TO_* behavior policies, P4050 unused-
+var-hides-global rule, and more). One real conflict, in
+`assignment_statement()` in `parser.rs`: upstream changed
+`expression()`'s return type from `ExprKind` to `Expr` directly, so
+every `Assignment { ..., value: Expr::new(expr), ... }` construction
+(including the two new `S=`/`R=` branches) needed to drop the
+`Expr::new(...)` wrapper. Resolved by taking `origin/main`'s side
+(`value: expr`) in all four affected branches. Full CI green after.
+
 ## 2026-09-08: PR #1682 opened -- S=/R= set/reset operators (#1680)
 
 Picked up #1680 next. The issue's own suggested fix (written before
