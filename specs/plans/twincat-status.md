@@ -26,9 +26,16 @@ is not being worked.
 **Corpus re-check.** Re-ran the standing per-file check (`ironplcc check
 --dialect twincat`, one file at a time) against all 8 real solutions under
 `/home/husser/code/brotlib`, built from the post-sync tree (`main` @
-`4223ec06`, debug build): **41/174 files pass clean (23.6%)**.
+`4223ec06`, debug build).
 
-| Code | Count |
+**Two numbers, and only one of them is about the compiler.** The
+dependency-independent measure -- the one matching ADR-0012's yardstick of
+"zero parse errors on syntactically valid vendor code" -- is syntax
+acceptance: **117/174 files (67.2%) parse with no `P0002`.** Only
+**41/174 (23.6%) are clean of *all* diagnostics**, and that lower figure
+is dominated by the library graph below, not by parser gaps.
+
+| Code | Count (first code per file) |
 |---|---|
 | P0002 syntax | 57 |
 | P2008 cross-file resolution | 36 |
@@ -38,29 +45,62 @@ is not being worked.
 | P4012 non-FB invocation | 2 |
 | P4016 duplicate function name | 1 |
 
-Per solution: BROTLib 21/58, IAG50cm 8/51, AstroBROT 4/23, MONETN 2/11,
-HalfBROT 2/11, MONETcommon 2/10, MONETRoof 1/6, MONETS 1/4.
+**Per-solution numbers are confounded and must not be read as a
+cross-solution comparison.** The solutions depend on each other:
 
-**This headline is not comparable to the 2026-08-20 checkpoint (48/166),
-and the reason is one solution, not a general regression:**
+```
+AstroBROT      (leaf -- vendor libraries only)
+MONETRoof      (leaf -- vendor libraries only)
+BROTLib        -> AstroBROT
+IAG50cm        -> BROTLib
+HalfBROT       -> AstroBROT, BROTLib
+MONETcommon    -> AstroBROT, BROTLib, HalfBROT
+MONETN         -> AstroBROT, BROTLib, HalfBROT, MONETRoof
+MONETS         -> AstroBROT, BROTLib, HalfBROT, MONETRoof, MONETcommon
+```
 
-- Seven of the eight solutions *improved* or held: BROTLib 20->21,
-  AstroBROT 3->4, MONETN 1->2, HalfBROT 1->2, MONETRoof 0->1,
-  MONETcommon 0->2, MONETS 1->1. Excluding IAG50cm that is 26/116 ->
-  33/123, i.e. better.
-- IAG50cm fell 22/50 -> 8/51, and **that baseline does not reproduce**:
-  the Sep 9 `release` binary and the Sep 23 `debug` binary both give
-  exactly 8/51, and IAG50cm has no `.TcPOU` changes since 2026-08-20
-  (only a `GVL_Version` rename; `git log` in that repo). Treat the old
-  22/50 as a stale or differently-measured figure, not a regression
-  caused by this sync.
+A downstream project references its dependencies as **library
+interfaces**, not source, and IronPLC bundles none of them. A
+project-level check of `IAG50cm.sln` says so directly: `P6011`
+(14 occurrences, e.g. `project references compatibility library
+'BROTLib', which IronPLC does not bundle`), followed by 37 `P2008` and
+50 `P4007` -- that one missing interface cascading, not parser or
+analyzer defects. Even the leaves are not clean: `AstroBROT` references
+`Tc2_Standard`/`Tc3_Module`, which are also unbundled. So in per-file
+isolation no `BROTLib`/`AstroBROT`/`HalfBROT`/`MONETcommon` declaration
+can resolve anywhere downstream, and the "clean" column below mostly
+ranks each solution by how many unbundled siblings it references:
 
-The dominant IAG50cm P0002s are genuine open parser gaps, not noise:
-qualified enum-value initializers (`HomingMode : MC_HomingMode :=
-MC_HomingMode.MC_DefaultHoming;`) and a method call through a
-pointer-deref receiver (`pCover^.SetState(pCover^.fbCoverClosingState);`,
-the #1422 receiver limitation). Both are the same corpus gaps earlier
-entries already recorded; neither is new.
+| Solution | parses (valid) | clean of all codes (confounded) |
+|---|---|---|
+| AstroBROT | 20/23 | 4/23 |
+| BROTLib | 48/58 | 21/58 |
+| HalfBROT | 8/11 | 2/11 |
+| IAG50cm | 25/51 | 8/51 |
+| MONETcommon | 6/10 | 2/10 |
+| MONETN | 5/11 | 2/11 |
+| MONETRoof | 3/6 | 1/6 |
+| MONETS | 2/4 | 1/4 |
+
+Combining the source directories into one unit is not a valid substitute:
+`IAG50cm/ + BROTLib/ + AstroBROT/` in a single invocation produces a
+different wrong answer (`P4016` duplicate function name, `P4044`
+duplicate field), because it stops modelling them as separate libraries.
+A fair per-solution number needs each solution's dependency closure --
+which is the declaration-only/external-library gap itself, not something
+the corpus check can work around.
+
+**The one conclusion that survives the confound is the syntax one.**
+IAG50cm's `P0002`s are genuine open parser gaps: qualified enum-value
+initializers (`HomingMode : MC_HomingMode := MC_HomingMode.MC_DefaultHoming;`)
+and a method call through a pointer-deref receiver
+(`pCover^.SetState(pCover^.fbCoverClosingState);`, the #1422 receiver
+limitation). Both are gaps earlier entries already recorded; neither is
+new. The 2026-08-20 headline (48/166) is likewise a "clean" number and so
+is not comparable for the same reason; its IAG50cm 22/50 does not
+reproduce even as a clean count (the Sep 9 `release` and Sep 23 `debug`
+binaries both give 8/51, and IAG50cm has no `.TcPOU` changes since
+2026-08-20), but neither figure should be over-read.
 
 ## 2026-09-13: PRs #1681 and #1682 merged upstream; twincat-dev synced
 
@@ -866,9 +906,11 @@ history needs to be dug up later (it is **not** pushed anywhere).
   point -- since resolved by #1301's OOP foundation landing. Re-measured
   on 2026-08-20: 48/166 (~29%) per-file against fresh `main` v0.239.0 --
   see the 2026-08-20 corpus re-check entry above. Re-measured again
-  2026-09-23 against `main` @ `4223ec06`: 41/174 (23.6%). The drop is
-  entirely IAG50cm's unreproducible 22/50 baseline -- the other seven
-  solutions improved or held (see the 2026-09-23 entry).
+  2026-09-23 against `main` @ `4223ec06`: 117/174 (67.2%) parse with no
+  `P0002` -- the dependency-independent measure -- while only 41/174
+  (23.6%) are clean of all diagnostics, a figure dominated by unbundled
+  sibling/vendor library interfaces rather than by compiler defects (see
+  the 2026-09-23 entry).
 
 ## Architecture change: compiler-builtin registration rejected, replaced by compatibility libraries
 
