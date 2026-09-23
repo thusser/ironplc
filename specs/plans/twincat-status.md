@@ -6,6 +6,62 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-23: synced to `main` @ `4223ec06` (42 commits); corpus re-checked
+
+Routine sync, clean this time -- and notably the first in a while with
+**zero conflicts**. `twincat-dev` merged `origin/main` (`4088b9c9` ->
+`4223ec06`, 42 commits) with nothing to resolve, because there is no
+overlapping code left to fight over: upstream absorbed or superseded
+everything this branch had carried (method codegen via #1449,
+`VAR PERSISTENT`/`S=`/`R=` via their own PRs #1681/#1682). After the merge
+the only thing unique to `twincat-dev` is this living document.
+
+The 42 upstream commits are arithmetic/temporal/string correctness work
+(arithmetic operator overloads for time and date types, temporal literal
+range P2039, enum flag gating, string temp buffers) -- **no OOP commits**.
+That is the direct answer to "what is still blocking us": upstream's
+attention is elsewhere, and the OOP backlog (see #1434 and its sub-issues)
+is not being worked.
+
+**Corpus re-check.** Re-ran the standing per-file check (`ironplcc check
+--dialect twincat`, one file at a time) against all 8 real solutions under
+`/home/husser/code/brotlib`, built from the post-sync tree (`main` @
+`4223ec06`, debug build): **41/174 files pass clean (23.6%)**.
+
+| Code | Count |
+|---|---|
+| P0002 syntax | 57 |
+| P2008 cross-file resolution | 36 |
+| P9999 not-implemented-in-codegen | 18 |
+| P4038 non-constant initializer | 11 |
+| P4017 undeclared function | 8 |
+| P4012 non-FB invocation | 2 |
+| P4016 duplicate function name | 1 |
+
+Per solution: BROTLib 21/58, IAG50cm 8/51, AstroBROT 4/23, MONETN 2/11,
+HalfBROT 2/11, MONETcommon 2/10, MONETRoof 1/6, MONETS 1/4.
+
+**This headline is not comparable to the 2026-08-20 checkpoint (48/166),
+and the reason is one solution, not a general regression:**
+
+- Seven of the eight solutions *improved* or held: BROTLib 20->21,
+  AstroBROT 3->4, MONETN 1->2, HalfBROT 1->2, MONETRoof 0->1,
+  MONETcommon 0->2, MONETS 1->1. Excluding IAG50cm that is 26/116 ->
+  33/123, i.e. better.
+- IAG50cm fell 22/50 -> 8/51, and **that baseline does not reproduce**:
+  the Sep 9 `release` binary and the Sep 23 `debug` binary both give
+  exactly 8/51, and IAG50cm has no `.TcPOU` changes since 2026-08-20
+  (only a `GVL_Version` rename; `git log` in that repo). Treat the old
+  22/50 as a stale or differently-measured figure, not a regression
+  caused by this sync.
+
+The dominant IAG50cm P0002s are genuine open parser gaps, not noise:
+qualified enum-value initializers (`HomingMode : MC_HomingMode :=
+MC_HomingMode.MC_DefaultHoming;`) and a method call through a
+pointer-deref receiver (`pCover^.SetState(pCover^.fbCoverClosingState);`,
+the #1422 receiver limitation). Both are the same corpus gaps earlier
+entries already recorded; neither is new.
+
 ## 2026-09-13: PRs #1681 and #1682 merged upstream; twincat-dev synced
 
 Both `VAR PERSISTENT` (#1681) and `S=`/`R=` (#1682) are now on upstream
@@ -809,7 +865,10 @@ history needs to be dug up later (it is **not** pushed anywhere).
   gate (`P9004`, 46 files) as the single largest remaining bucket at that
   point -- since resolved by #1301's OOP foundation landing. Re-measured
   on 2026-08-20: 48/166 (~29%) per-file against fresh `main` v0.239.0 --
-  see the 2026-08-20 corpus re-check entry above.
+  see the 2026-08-20 corpus re-check entry above. Re-measured again
+  2026-09-23 against `main` @ `4223ec06`: 41/174 (23.6%). The drop is
+  entirely IAG50cm's unreproducible 22/50 baseline -- the other seven
+  solutions improved or held (see the 2026-09-23 entry).
 
 ## Architecture change: compiler-builtin registration rejected, replaced by compatibility libraries
 
@@ -901,14 +960,22 @@ rankings and construct names are not reliable cost estimates on their own.
    today's `main` sync. Verified directly: `THIS^._SendTelemetry();`
    inside a FUNCTION_BLOCK now parses clean (no `P0002`), stopping only
    at semantic resolution (`P9999` "not yet resolved by IronPLC", from
-   `rule_method_call_declared.rs`). What remains isn't parse-level
-   anymore, isn't independent, and isn't ours to pick up: garretfick
-   opened **#1406** 2026-08-22 ("Reject SUPER^ where there's no base
-   type, and THIS^ outside a function block") as the deliberate
-   next small PR after #1403, and his 2026-08-24 comment on #1199 says
-   he's actively working parsing correctness right now. Don't start
-   this -- it's mid-flight under him, and duplicating it would repeat
-   the exact "too much similar code" complaint he already raised.
+   `rule_method_call_declared.rs`). What remains is not a separate
+   parse fix: it is the OOP wall below (interfaces, dispatch, codegen).
+
+   **Ownership corrected 2026-09-23.** The "mid-flight under him, don't
+   start it" guidance this bullet used to carry is stale. As of
+   2026-09-23 every open #1434 sub-issue is unassigned, has zero
+   comments, and has seen no activity since filing (2026-08-23), and
+   upstream has shipped no OOP commit since 2026-09-13. What he actually
+   said -- 2026-08-24 ("I'm continuing on this work") and 2026-09-08
+   ("I'd like to handle remaining issues one-by-one") -- is a statement
+   of intent, not a live workstream. The "too much similar code" comment
+   he made on 2026-08-13 was about test duplication on the METHOD PRs,
+   and is now backed by the repo's own `dupes` check: a style constraint
+   (match existing patterns, share helpers), not a ban on this area.
+   Coordinate before starting -- a comment naming the piece costs one
+   message -- but do not treat the area as off-limits.
 4. **`P2008` remaining pieces**: genuinely external Beckhoff-library types
    with no source in the corpus (`MC_Home`, `AXIS_REF`, etc. --
    Motion/System libraries, not fixable without stub/declaration-only
