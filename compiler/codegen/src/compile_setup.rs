@@ -20,7 +20,7 @@ use ironplc_analyzer::TypeEnvironment;
 
 use super::compile::{
     char_width_for_string_type, emit_string_literal_load, string_region_size, CompileContext,
-    FbInstanceInfo, OpType, OpWidth, Signedness, StringVarInfo, VarTypeInfo, DEFAULT_OP_TYPE,
+    FbInstanceInfo, OpType, OpWidth, StringVarInfo, DEFAULT_OP_TYPE,
 };
 use super::compile_call::resolve_fb_type;
 use super::compile_expr::{compile_constant, emit_store_var, emit_truncation, resolve_variable};
@@ -84,17 +84,9 @@ pub(crate) fn assign_variables(
                     let char_width = char_width_for_string_type(&string_init.width);
 
                     // Allocate space in the data region: [max_length: u16][cur_length: u16][data]
-                    let data_offset = ctx.data_region_offset;
                     let total_bytes = string_region_size(max_length, char_width);
-                    ctx.data_region_offset = ctx
-                        .data_region_offset
-                        .checked_add(total_bytes)
-                        .ok_or_else(|| {
-                            Diagnostic::not_implemented(Label::span(
-                                string_init.span(),
-                                "Data region overflow",
-                            ))
-                        })?;
+                    let data_offset =
+                        crate::data_region::reserve(ctx, total_bytes, &string_init.span())?;
 
                     if max_length > ctx.max_string_capacity {
                         ctx.max_string_capacity = max_length;
@@ -129,16 +121,11 @@ pub(crate) fn assign_variables(
                     if let Some((type_id, num_fields, field_map)) = resolve_fb_type(&fb_name) {
                         // Standard library function block.
                         let instance_size = num_fields as u32 * 8;
-                        let data_offset = ctx.data_region_offset;
-                        ctx.data_region_offset = ctx
-                            .data_region_offset
-                            .checked_add(instance_size)
-                            .ok_or_else(|| {
-                                Diagnostic::not_implemented(Label::span(
-                                    decl.identifier.span(),
-                                    "Data region overflow",
-                                ))
-                            })?;
+                        let data_offset = crate::data_region::reserve(
+                            ctx,
+                            instance_size,
+                            &decl.identifier.span(),
+                        )?;
 
                         ctx.fb_instances.insert(
                             id.clone(),
@@ -149,27 +136,30 @@ pub(crate) fn assign_variables(
                                 field_indices: field_map,
                             },
                         );
-                    } else if let Some(user_fb) = ctx.user_fb_types.get(&fb_name) {
+                    } else if let Some((num_fields, type_id, field_indices)) =
+                        ctx.user_fb_types.get(&fb_name).map(|user_fb| {
+                            (
+                                user_fb.num_fields,
+                                user_fb.type_id,
+                                user_fb.field_indices.clone(),
+                            )
+                        })
+                    {
                         // User-defined function block.
-                        let instance_size = user_fb.num_fields as u32 * 8;
-                        let data_offset = ctx.data_region_offset;
-                        ctx.data_region_offset = ctx
-                            .data_region_offset
-                            .checked_add(instance_size)
-                            .ok_or_else(|| {
-                                Diagnostic::not_implemented(Label::span(
-                                    decl.identifier.span(),
-                                    "Data region overflow",
-                                ))
-                            })?;
+                        let instance_size = num_fields as u32 * 8;
+                        let data_offset = crate::data_region::reserve(
+                            ctx,
+                            instance_size,
+                            &decl.identifier.span(),
+                        )?;
 
                         ctx.fb_instances.insert(
                             id.clone(),
                             FbInstanceInfo {
                                 var_index: index,
-                                type_id: user_fb.type_id,
+                                type_id,
                                 data_offset,
-                                field_indices: user_fb.field_indices.clone(),
+                                field_indices,
                             },
                         );
                     }
@@ -213,17 +203,8 @@ pub(crate) fn assign_variables(
                     }
                 }
                 InitialValueAssignmentKind::Reference(ref_init) => {
-                    // References are stored as 64-bit variable-table indices (unsigned).
-                    ctx.var_types.insert(
-                        id.clone(),
-                        VarTypeInfo {
-                            op_width: OpWidth::W64,
-                            signedness: Signedness::Unsigned,
-                            storage_bits: 64,
-                        },
-                    );
-                    crate::compile_array::register_ref_to_array_metadata(
-                        ctx, builder, id, index, ref_init,
+                    crate::compile_reference::register_reference_variable(
+                        ctx, builder, types, id, index, ref_init,
                     )?;
                     (iec_type_tag::OTHER, "REF_TO".into())
                 }
@@ -279,7 +260,10 @@ pub(crate) fn assign_variables(
                 InitialValueAssignmentKind::LateResolvedType(_) => {
                     // LateResolvedType should have been resolved before codegen.
                     // If we reach here, it indicates a bug in the compiler.
-                    return Err(Diagnostic::internal_error());
+                    return Err(Diagnostic::internal_error_at(Label::span(
+                        decl.identifier.span(),
+                        "Variable type was not resolved before code generation",
+                    )));
                 }
                 // Other initializer kinds (EnumeratedValues, etc.)
                 // do not yet have type info tracked in codegen.
@@ -451,6 +435,7 @@ pub(crate) fn emit_initial_values(
                             data_offset,
                             &fields,
                             &[],
+                            &decl.identifier.span(),
                         )?;
                     } else if let Some(constant) = &simple.initial_value {
                         let var_index = ctx.var_index(id)?;
@@ -480,8 +465,8 @@ pub(crate) fn emit_initial_values(
                         // If there's an initial value, load and store it. The
                         // literal is encoded at the variable's width so the
                         // store's encoding check passes (ADR-0034).
-                        if let Some(chars) = &string_init.initial_value {
-                            emit_string_literal_load(emitter, ctx, chars, char_width);
+                        if let Some(lit) = &string_init.initial_value {
+                            emit_string_literal_load(emitter, ctx, &lit.value, char_width);
                             emitter.emit_str_store_var(data_offset);
                         }
                     }
@@ -632,6 +617,7 @@ pub(crate) fn emit_initial_values(
                             data_offset,
                             &fields,
                             &struct_init.elements_init,
+                            &decl.identifier.span(),
                         )?;
                     }
                 }
@@ -768,8 +754,8 @@ pub(crate) fn emit_function_local_prologue(
                         let char_width = info.char_width;
                         emitter.emit_str_init(data_offset, max_length, char_width);
 
-                        if let Some(chars) = &string_init.initial_value {
-                            emit_string_literal_load(emitter, ctx, chars, char_width);
+                        if let Some(lit) = &string_init.initial_value {
+                            emit_string_literal_load(emitter, ctx, &lit.value, char_width);
                             emitter.emit_str_store_var(data_offset);
                         }
                     }
@@ -844,6 +830,7 @@ pub(crate) fn emit_function_local_prologue(
             struct_info.data_offset,
             &fields,
             &[],
+            &return_id.span(),
         )?;
     } else if let Some(info) = ctx.string_vars.get(return_id) {
         // STRING/WSTRING return: initialize the string header in the data region.

@@ -58,16 +58,23 @@ struct LibraryRenderer {
     indents: usize,
 }
 
+/// The spelling of a character string: its characters as written, inside
+/// the delimiter `width` selects. The characters are not re-encoded; see
+/// `visit_character_string_literal` for why.
+fn character_string_text(width: &StringType, value: &[char]) -> String {
+    let delimiter = width.delimiter();
+    let mut val = String::from(delimiter);
+    val.extend(value.iter());
+    val.push(delimiter);
+    val
+}
+
 impl LibraryRenderer {
     fn new() -> Self {
         Self {
             buffer: String::new(),
             indents: 0,
         }
-    }
-
-    fn write_char(&mut self, val: char) {
-        self.buffer.push(val);
     }
 
     fn write(&mut self, val: &str) {
@@ -250,11 +257,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         // Escaping can only become correct once the parser decodes escapes and
         // `value` holds decoded characters -- see the character-string arm of
         // the round-trip tests.
-        let delimiter = node.width.delimiter();
-        let mut val = String::from(delimiter);
-        val.extend(node.value.iter());
-        val.push(delimiter);
-        self.write_ws(&val);
+        self.write_ws(&character_string_text(&node.width, &node.value));
         Ok(())
     }
 
@@ -562,13 +565,8 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         self.write_ws("]");
 
         if let Some(init) = &node.init {
-            let delimiter = node.width.delimiter();
-
             self.write_ws(":=");
-
-            self.write_char(delimiter);
-            self.write(init);
-            self.write_char(delimiter);
+            self.write(&character_string_text(&init.width, &init.value));
         }
 
         Ok(())
@@ -823,14 +821,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
 
         if let Some(init) = &node.initial_value {
             self.write_ws(":=");
-
-            let delimiter = node.width.delimiter();
-
-            self.write_char(delimiter);
-            for c in init.iter() {
-                self.write_char(*c);
-            }
-            self.write_char(delimiter);
+            self.write(&character_string_text(&init.width, &init.value));
         }
 
         Ok(())
@@ -1723,9 +1714,11 @@ impl Visitor<Diagnostic> for LibraryRenderer {
             }
             dsl::textual::ExprKind::Deref(expr) => {
                 self.visit_expr(expr)?;
-                // No separating space: the parser's `unary_expression`
-                // rule allows no whitespace between the operand and the
-                // `^`, so `myRef ^` would not re-parse.
+                // No separating space: the tight spelling is the canonical
+                // output, not a parser constraint. #1437 widened
+                // `unary_expression` to take `_` before the caret, so
+                // `myRef ^` re-parses as well -- the `deref_operator` row in
+                // `parser/src/tests/whitespace.rs`.
                 self.write("^");
                 Ok(())
             }
@@ -1847,9 +1840,10 @@ impl Visitor<Diagnostic> for LibraryRenderer {
     ) -> Result<Self::Value, Diagnostic> {
         self.visit_symbolic_variable_kind(&node.subscripted_variable)?;
 
-        // No space before `[`: the parser's `symbolic_variable` rule admits
-        // none between a variable and its subscript. Inside the brackets is
-        // fine -- `subscript_list` allows it.
+        // No space before `[`: the tight spelling is the canonical output,
+        // not a parser constraint -- `symbolic_variable` has admitted a gap
+        // before a subscript since #1437. Inside the brackets is fine too,
+        // and there `subscript_list` is what allows it.
         self.write("[");
         visit_comma_separated!(self, node.subscripts.iter(), Expr);
         self.write_ws("]");

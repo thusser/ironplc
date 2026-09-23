@@ -115,3 +115,11 @@ P9998,InternalError,Internal error indicating a bug in the compiler
 P9999,NotImplemented,Capability is not implemented (yet!)
 P2037,AggregateAssignmentTypeMismatch,Assignment between arrays or structures requires identical types
 P4050,ProgramVariableHidesGlobal,Program variable has the same name as a global variable
+P4051,CaseLabelRangeInvalid,CASE label range minimum value is greater than the maximum
+P4052,StringLiteralCharOutOfRange,Character string literal contains a character that the string type cannot represent
+P4053,CaseSelectorTypeInvalid,CASE selector is not an integer or enumeration type
+P4054,FunctionBlockInFunction,Function declares or invokes a function block instance
+P4055,EnumExplicitValueNotAllowed,Explicit enumeration member value requires choosing a dialect or --allow-enum-explicit-values flag
+P4056,EnumBaseTypeNotAllowed,Enumeration base-type suffix requires choosing a dialect or --allow-enum-base-type flag
+P2038,DateLiteralOutOfRange,Date literal is outside the range the date type can represent
+P2039,DurationLiteralOutOfRange,Duration literal is outside the range the duration type can represent
