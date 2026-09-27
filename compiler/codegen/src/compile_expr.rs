@@ -30,18 +30,17 @@ use crate::emit::Emitter;
 
 /// Returns the operation type from an expression's resolved type annotation.
 ///
-/// The analyzer must have populated `expr.resolved_type`. A missing or
-/// unrecognized resolved type is a compiler bug.
-pub(crate) fn op_type(expr: &Expr) -> Result<OpType, Diagnostic> {
+/// The analyzer must have populated `expr.resolved_type` with an elementary
+/// type or a user-defined type in `ctx.named_types`. Anything else -- an
+/// array or a structure, say -- is a compiler bug.
+pub(crate) fn op_type(ctx: &CompileContext, expr: &Expr) -> Result<OpType, Diagnostic> {
     let resolved = expr
         .resolved_type
         .as_ref()
         .ok_or_else(|| unresolved_expr_type(expr))?;
-    // Enum types resolve to user-defined names (e.g. "COLOR") which
-    // resolve_type_name doesn't handle. Fall back to DINT since all
-    // enums use W32/Signed at codegen level (REQ-EN-codegen-003).
-    let info =
-        resolve_type_name(&resolved.name).unwrap_or(crate::compile_enum::enum_var_type_info());
+    let info = resolve_type_name(&resolved.name)
+        .or_else(|| ctx.named_types.get(resolved).copied())
+        .ok_or_else(|| unresolved_expr_type(expr))?;
     Ok((info.op_width, info.signedness))
 }
 
@@ -120,26 +119,26 @@ pub(crate) fn unresolved_expr_type(expr: &Expr) -> Diagnostic {
 /// OR, XOR), recurses into the first operand. For other expressions (bare
 /// boolean variables, parenthesized expressions), returns the expression's
 /// own resolved type.
-pub(crate) fn condition_op_type(expr: &Expr) -> Result<OpType, Diagnostic> {
+pub(crate) fn condition_op_type(ctx: &CompileContext, expr: &Expr) -> Result<OpType, Diagnostic> {
     match &expr.kind {
         ExprKind::Compare(compare) => match compare.op {
             CompareOp::And
             | CompareOp::Or
             | CompareOp::Xor
             | CompareOp::AndThen
-            | CompareOp::OrElse => condition_op_type(&compare.left),
+            | CompareOp::OrElse => condition_op_type(ctx, &compare.left),
             _ => {
                 // String comparisons take a dedicated path in compile_expr
                 // that emits an i32 boolean; the operand op_type is unused.
                 if expr_is_string(&compare.left) {
                     return Ok(DEFAULT_OP_TYPE);
                 }
-                op_type(&compare.left)
+                op_type(ctx, &compare.left)
             }
         },
-        ExprKind::UnaryOp(unary) if unary.op == UnaryOp::Not => condition_op_type(&unary.term),
-        ExprKind::Expression(inner) => condition_op_type(inner),
-        _ => op_type(expr),
+        ExprKind::UnaryOp(unary) if unary.op == UnaryOp::Not => condition_op_type(ctx, &unary.term),
+        ExprKind::Expression(inner) => condition_op_type(ctx, inner),
+        _ => op_type(ctx, expr),
     }
 }
 /// Compiles an expression, leaving the result on the stack.
@@ -155,7 +154,9 @@ pub(crate) fn compile_expr(
     match &expr.kind {
         ExprKind::Const(constant) => compile_constant(emitter, ctx, constant, op_type),
         ExprKind::Variable(variable) => compile_variable_read(emitter, ctx, variable, op_type),
-        ExprKind::BinaryOp(binary) => compile_binary_arith(emitter, ctx, binary, op_type),
+        ExprKind::BinaryOp(binary) => {
+            compile_binary_arith(emitter, ctx, binary, expr.resolved_type.as_ref(), op_type)
+        }
         ExprKind::UnaryOp(unary) => match unary.op {
             UnaryOp::Neg => {
                 compile_expr(emitter, ctx, &unary.term, op_type)?;
@@ -275,7 +276,6 @@ fn compile_time_count(
     ctx: &mut CompileContext,
     count: i128,
     literal: &str,
-    problem: Problem,
     span: &SourceSpan,
     op_type: OpType,
 ) -> Result<(), Diagnostic> {
@@ -284,12 +284,12 @@ fn compile_time_count(
     // answer from a catch-all.
     match op_type.0 {
         OpWidth::W32 => {
-            let value = within_storage(count, 32, op_type.1, literal, problem, span)?;
+            let value = within_storage(count, 32, op_type.1, literal, span)?;
             let pool_index = ctx.add_i32_constant(value as i32);
             emitter.emit_load_const_i32(pool_index);
         }
         OpWidth::W64 => {
-            let value = within_storage(count, 64, op_type.1, literal, problem, span)?;
+            let value = within_storage(count, 64, op_type.1, literal, span)?;
             let pool_index = ctx.add_i64_constant(value as i64);
             emitter.emit_load_const_i64(pool_index);
         }
@@ -310,31 +310,36 @@ fn compile_time_count(
     Ok(())
 }
 
-/// Returns `count` when a `bits`-wide integer of `signedness` holds it, and
-/// reports `problem` against the literal when it does not.
+/// Returns `count`, or an internal error when a `bits`-wide integer of
+/// `signedness` cannot hold it.
 ///
-/// The value is returned rather than narrowed here: a count that fits is
-/// bit-cast by the caller, so `u32::MAX` seconds is stored as -1 and read back
-/// unsigned, which is what the unsigned opcodes expect.
+/// `rule_temporal_literal_range` holds every temporal literal to the range its
+/// own type gives it, and a literal only reaches storage at least that wide --
+/// narrowing one into the shorter type is rejected too. So by the time a count
+/// arrives here it fits, and a count that does not is a broken invariant
+/// rather than something to report against the program: the diagnostic names
+/// the compiler, not the source.
+///
+/// The check remains because being wrong here is silent. Truncating a count
+/// emits a different value than the program wrote -- `T#30d` became a
+/// *negative* 19.7 days -- which no test of the program's behaviour would
+/// attribute to codegen.
 fn within_storage(
     count: i128,
     bits: u32,
     signedness: Signedness,
     literal: &str,
-    problem: Problem,
     span: &SourceSpan,
 ) -> Result<i128, Diagnostic> {
-    let (minimum, maximum) =
-        ironplc_analyzer::value_range::for_integer(bits, signedness == Signedness::Signed);
-    if count < minimum || count > maximum {
-        return Err(Diagnostic::problem(
-            problem,
-            Label::span(
-                span.clone(),
-                format!("{literal} is outside the range {minimum} to {maximum} its type stores"),
+    let signed = signedness == Signedness::Signed;
+    if !ironplc_analyzer::value_range::fits(count, bits, signed) {
+        let (minimum, maximum) = ironplc_analyzer::value_range::for_integer(bits, signed);
+        return Err(Diagnostic::internal_error_at(Label::span(
+            span.clone(),
+            format!(
+                "{literal} holds {count}, outside the range {minimum} to {maximum} its type stores"
             ),
-        )
-        .with_context("value", &count.to_string()));
+        )));
     }
     Ok(count)
 }
@@ -493,7 +498,6 @@ pub(crate) fn compile_constant(
             ctx,
             lit.interval.whole_milliseconds(),
             "Duration literal",
-            Problem::DurationLiteralOutOfRange,
             &lit.span,
             op_type,
         ),
@@ -506,7 +510,6 @@ pub(crate) fn compile_constant(
             ctx,
             i128::from(lit.whole_milliseconds()),
             "Time-of-day literal",
-            Problem::DurationLiteralOutOfRange,
             &lit.span,
             op_type,
         ),
@@ -515,7 +518,6 @@ pub(crate) fn compile_constant(
             ctx,
             i128::from(lit.seconds_since_epoch()),
             "Date literal",
-            Problem::DateLiteralOutOfRange,
             &lit.span,
             op_type,
         ),
@@ -524,7 +526,6 @@ pub(crate) fn compile_constant(
             ctx,
             i128::from(lit.seconds_since_epoch()),
             "Date literal",
-            Problem::DateLiteralOutOfRange,
             &lit.span,
             op_type,
         ),
@@ -865,31 +866,12 @@ pub(crate) fn compile_variable_read(
                     emitter.emit_add_i64();
                     emitter.emit_load_array(var_index, desc_index);
                 }
-                crate::compile_array::ResolvedAccess::StructFieldStringArrayElement {
-                    var_index,
-                    scratch_var_index,
-                    string_desc_index,
-                    field_byte_offset,
-                    ref dimensions,
-                    subscripts,
-                } => {
-                    let span = variable_span(variable);
-                    // 1. Compute base: struct_data_offset + field_byte_offset → scratch.
-                    emitter.emit_load_var_i32(var_index);
-                    let offset_const = ctx.add_i32_constant(field_byte_offset as i32);
-                    emitter.emit_load_const_i32(offset_const);
-                    emitter.emit_add_i32();
-                    emitter.emit_store_var_i32(scratch_var_index);
-                    // 2. Compute flat index.
-                    crate::compile_array::emit_flat_index(
-                        emitter,
-                        ctx,
-                        &subscripts,
-                        dimensions,
-                        &span,
-                    )?;
-                    // 3. Load string element.
-                    emitter.emit_str_load_array_elem(scratch_var_index, string_desc_index);
+                crate::compile_array::ResolvedAccess::StructFieldStringArrayElement(element) => {
+                    element.emit_base_and_index(emitter, ctx, &variable_span(variable))?;
+                    emitter.emit_str_load_array_elem(
+                        element.scratch_var_index,
+                        element.string_desc_index,
+                    );
                 }
             }
             Ok(())

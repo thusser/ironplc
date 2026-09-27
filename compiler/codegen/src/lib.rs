@@ -46,6 +46,7 @@ mod compile_short_circuit;
 mod compile_stmt;
 mod compile_string;
 mod compile_struct;
+mod compile_struct_init;
 mod compile_time_arith;
 mod data_region;
 mod emit;
@@ -67,6 +68,8 @@ mod spec_requirements {
 mod spec_conformance;
 #[cfg(test)]
 mod spec_conformance_adr;
+#[cfg(test)]
+mod spec_conformance_arithmetic_operator_overloads;
 #[cfg(test)]
 mod spec_conformance_behavior_policies;
 #[cfg(test)]

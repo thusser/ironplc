@@ -16,15 +16,16 @@ use crate::{
     result::SemanticResult,
     rule_abstract_not_instantiated, rule_assignment_aggregate_type_compat,
     rule_bit_and_partial_access_range, rule_case_bit_string_label, rule_case_selector_type,
-    rule_constant_range, rule_date_literal_range, rule_decl_struct_element_unique_names,
-    rule_enum_base_type_allowed, rule_enum_explicit_value_allowed, rule_enumeration_values_unique,
+    rule_constant_range, rule_decl_struct_element_unique_names, rule_enum_base_type_allowed,
+    rule_enum_explicit_value_allowed, rule_enumeration_values_unique,
     rule_extends_field_duplicated, rule_function_block_call_unsupported,
     rule_function_block_invocation, rule_function_call_declared, rule_function_call_type_check,
     rule_method_call_declared, rule_mixed_located_var_declarations, rule_no_top_level_var_global,
     rule_operator_operand_type_check, rule_pou_hierarchy, rule_program_task_definition_exists,
-    rule_program_var_hides_global, rule_range_limits, rule_ref_to, rule_stdlib_type_redefinition,
-    rule_string_encoding_compat, rule_string_literal_char_range,
-    rule_struct_initializer_expression_allowed, rule_task_names_unique, rule_unsupported_extension,
+    rule_program_var_hides_global, rule_range_limits, rule_real_literal_range, rule_ref_to,
+    rule_stdlib_type_redefinition, rule_string_encoding_compat, rule_string_length_range,
+    rule_string_literal_char_range, rule_struct_initializer_expression_allowed,
+    rule_task_names_unique, rule_temporal_literal_range, rule_unsupported_extension,
     rule_use_declared_enumerated_value, rule_use_declared_symbolic_var,
     rule_var_decl_const_initialized, rule_var_decl_const_not_fb,
     rule_var_decl_global_const_requires_external_const, rule_var_decl_initializer_type_compat,
@@ -35,7 +36,7 @@ use crate::{
     type_table, xform_fold_constant_expressions, xform_fold_initializer_expressions,
     xform_insert_implicit_deref, xform_int_to_bool_initializer, xform_mark_unwritten_constants,
     xform_named_to_positional_args, xform_resolve_adr, xform_resolve_constant_expressions,
-    xform_resolve_expr_types, xform_resolve_late_bound_expr_kind,
+    xform_resolve_decl_types, xform_resolve_expr_types, xform_resolve_late_bound_expr_kind,
     xform_resolve_late_bound_type_initializer, xform_resolve_symbol_and_function_environment,
     xform_resolve_type_aliases, xform_resolve_type_decl_environment, xform_toposort_declarations,
 };
@@ -275,6 +276,12 @@ pub fn resolve_types(
         xform_named_to_positional_args::apply(lib, &function_environment)
     });
 
+    // Record the type id each declaration declares, entering types spelled
+    // out in place as anonymous types.
+    library = run_reverting_on_error(library, &mut diagnostics, |lib| {
+        xform_resolve_decl_types::apply(lib, &mut type_environment)
+    });
+
     // Resolve expression types using the function environment.
     library = run_reverting_on_error(library, &mut diagnostics, |lib| {
         xform_resolve_expr_types::apply(lib, &mut type_environment, &function_environment, options)
@@ -333,9 +340,9 @@ pub(crate) fn semantic(
     let functions: Vec<fn(&Library, &SemanticContext, &CompilerOptions) -> SemanticResult> = vec![
         rule_abstract_not_instantiated::apply,
         rule_assignment_aggregate_type_compat::apply,
-        rule_date_literal_range::apply,
         rule_decl_struct_element_unique_names::apply,
         rule_range_limits::apply,
+        rule_real_literal_range::apply,
         rule_enum_base_type_allowed::apply,
         rule_enum_explicit_value_allowed::apply,
         rule_enumeration_values_unique::apply,
@@ -352,7 +359,9 @@ pub(crate) fn semantic(
         rule_task_names_unique::apply,
         rule_stdlib_type_redefinition::apply,
         rule_string_encoding_compat::apply,
+        rule_string_length_range::apply,
         rule_string_literal_char_range::apply,
+        rule_temporal_literal_range::apply,
         rule_struct_initializer_expression_allowed::apply,
         rule_use_declared_enumerated_value::apply,
         rule_use_declared_symbolic_var::apply,

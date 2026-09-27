@@ -4,20 +4,165 @@ use time::{
     Date, Duration, PrimitiveDateTime, Time,
 };
 
-use crate::{common::FixedPoint, core::SourceSpan};
+use crate::{
+    common::{ElementaryTypeName, FixedPoint},
+    core::SourceSpan,
+};
 
 const SECOND_PER_DAY: u64 = Second::per(Day) as u64;
 const SECOND_PER_HOUR: u64 = Second::per(Hour) as u64;
 const SECOND_PER_MINUTE: u64 = Second::per(Minute) as u64;
+
+/// The count a temporal literal holds, together with the storage its own type
+/// gives that count.
+///
+/// A temporal value is an integer count in a fixed unit — milliseconds for a
+/// duration or a time of day, seconds since 1970-01-01 for a date or a
+/// date-and-time — and the literal's type decides how many bits hold it and
+/// whether they are signed. Answering all three together is what lets one
+/// range check serve every family: the caller asks whether `count` fits
+/// `bits` of the stated signedness and needs to know nothing else about dates
+/// or durations.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct StoredCount {
+    /// The count, in the unit the type stores.
+    ///
+    /// Wider than any storage so that a value the storage cannot hold arrives
+    /// intact to be judged, rather than having been truncated on the way.
+    pub count: i128,
+    /// How many bits hold it: 32 for the short member, 64 for the long one.
+    pub bits: u32,
+    /// Whether those bits are signed. A duration is signed because it can be
+    /// negative (ADR-0021); the calendar types are unsigned counts from the
+    /// epoch (ADR-0025).
+    pub signed: bool,
+}
+
+impl TemporalWidth {
+    /// How many bits this width holds.
+    pub fn bits(&self) -> u32 {
+        match self {
+            TemporalWidth::Short => 32,
+            TemporalWidth::Long => 64,
+        }
+    }
+}
+
+/// Which member of a temporal family a literal names: the 32-bit type or the
+/// 64-bit one.
+///
+/// IEC 61131-3 pairs each temporal type with a wider one -- `TIME` with
+/// `LTIME`, `DATE` with `LDATE`, `TIME_OF_DAY` with `LTIME_OF_DAY`,
+/// `DATE_AND_TIME` with `LDATE_AND_TIME` -- and a literal's prefix says which
+/// one it is: `T#1h` is a `TIME` and `LTIME#1h` an `LTIME`.
+///
+/// The width belongs on the literal and not only on the declaration it
+/// initializes, for the reason [`CharacterStringLiteral::width`] gives: a
+/// literal also appears in statement bodies, where there is no declaration to
+/// borrow it from. Without it every temporal literal resolved to the 32-bit
+/// type, which held a 64-bit literal to a 32-bit range (issue #1560).
+///
+/// [`CharacterStringLiteral::width`]: crate::common::CharacterStringLiteral::width
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TemporalWidth {
+    /// The 32-bit member: `TIME`, `DATE`, `TIME_OF_DAY`, `DATE_AND_TIME`.
+    Short,
+    /// The 64-bit member: `LTIME`, `LDATE`, `LTIME_OF_DAY`, `LDATE_AND_TIME`.
+    Long,
+}
 
 // See section 2.2.2
 #[derive(Debug, PartialEq, Clone)]
 pub struct DurationLiteral {
     pub span: SourceSpan,
     pub interval: Duration,
+    /// The width the source spelled, which is what selects the prefix:
+    /// `TIME#`/`T#` for the 32-bit type, `LTIME#` for the 64-bit one.
+    pub width: TemporalWidth,
 }
 
 impl DurationLiteral {
+    /// Creates a literal spanning `span` and measuring `interval`.
+    ///
+    /// Every constructor funnels through here so that what a duration literal
+    /// is made of is stated once. The width defaults to the 32-bit member of
+    /// the family, as [`CharacterStringLiteral::new`] defaults to `STRING`;
+    /// a caller that knows better says so with
+    /// [`with_width`](Self::with_width).
+    ///
+    /// [`CharacterStringLiteral::new`]: crate::common::CharacterStringLiteral::new
+    pub fn new(span: SourceSpan, interval: Duration) -> Self {
+        Self {
+            span,
+            interval,
+            width: TemporalWidth::Short,
+        }
+    }
+
+    /// Returns the literal with `width` recorded as the member of the family
+    /// its prefix named.
+    pub fn with_width(mut self, width: TemporalWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// The IEC 61131-3 type this literal is: the duration type its prefix named.
+    ///
+    /// A literal states its own type, so it is checked against that type's
+    /// range wherever it is written, the way a prefixed integer literal is
+    /// (`INT#40000` is not an `INT` whatever it is stored into).
+    pub fn type_name(&self) -> ElementaryTypeName {
+        match self.width {
+            TemporalWidth::Short => ElementaryTypeName::TIME,
+            TemporalWidth::Long => ElementaryTypeName::LTIME,
+        }
+    }
+
+    /// The millisecond count this literal holds and the storage its type gives
+    /// it.
+    ///
+    /// A duration is signed: subtracting a later time from an earlier one
+    /// gives a negative result (ADR-0021).
+    pub fn stored_count(&self) -> StoredCount {
+        StoredCount {
+            count: self.interval.whole_milliseconds(),
+            bits: self.width.bits(),
+            signed: true,
+        }
+    }
+
+    /// Creates a literal of `value` units, where one unit is `seconds_per_unit`
+    /// seconds and `whole_units` builds the whole part.
+    ///
+    /// A fixed-point literal carries its whole part and a femtosecond
+    /// fraction separately, and days, hours and minutes each scale that
+    /// fraction by their own unit before it becomes a duration. Only the unit
+    /// differs between them, so only the unit is passed in.
+    fn from_whole_unit(
+        value: FixedPoint,
+        whole_units: fn(i64) -> Duration,
+        seconds_per_unit: u64,
+    ) -> Self {
+        let whole = whole_units(value.whole as i64);
+
+        // `femptos / FRACTIONAL_UNITS` is the fraction of one unit, so the
+        // fraction in microseconds is
+        //
+        //     femptos / 1e15 * seconds_per_unit * 1e6 == femptos * seconds_per_unit / 1e9
+        //
+        // computed in `u128` because the numerator does not fit a `u64`: half
+        // a day is 5e14 femtos times 86,400 seconds, which is 4.3e19 against a
+        // `u64::MAX` of 1.8e19. The quotient is at most 8.64e10 microseconds,
+        // one whole unit's worth, so it always fits the `i64` a `Duration`
+        // takes.
+        let fraction = Duration::microseconds(
+            (u128::from(value.femptos) * u128::from(seconds_per_unit)
+                / (FixedPoint::FRACTIONAL_UNITS as u128 / 1_000_000)) as i64,
+        );
+
+        Self::new(value.span, whole + fraction)
+    }
+
     /// Create a new `DurationLiteral` with the given number of days.
     ///
     /// ```rust
@@ -27,18 +172,7 @@ impl DurationLiteral {
     /// assert_eq!(DurationLiteral::days(FixedPoint::parse("1").unwrap()).interval, Duration::days(1));
     /// ```
     pub fn days(days: FixedPoint) -> Self {
-        // The whole part is entirely seconds
-        let whole_seconds = Duration::days(days.whole as i64);
-
-        // The fraction has both seconds and one part femptoseconds
-        let fraction_seconds = Duration::microseconds(
-            (days.femptos * SECOND_PER_DAY / FixedPoint::FRACTIONAL_UNITS) as i64,
-        );
-
-        Self {
-            span: days.span,
-            interval: whole_seconds + fraction_seconds,
-        }
+        Self::from_whole_unit(days, Duration::days, SECOND_PER_DAY)
     }
 
     /// Create a new `DurationLiteral` with the given number of hours.
@@ -47,22 +181,11 @@ impl DurationLiteral {
     /// use ironplc_dsl::common::FixedPoint;
     /// use ironplc_dsl::time::DurationLiteral;
     /// use time::Duration;
-    /// assert_eq!(DurationLiteral::seconds(FixedPoint::parse("1").unwrap()).interval, Duration::seconds(1));
-    /// assert_eq!(DurationLiteral::seconds(FixedPoint::parse("1.001").unwrap()).interval, Duration::seconds(1) + Duration::milliseconds(1));
+    /// assert_eq!(DurationLiteral::hours(FixedPoint::parse("1").unwrap()).interval, Duration::hours(1));
+    /// assert_eq!(DurationLiteral::hours(FixedPoint::parse("1.5").unwrap()).interval, Duration::minutes(90));
     /// ```
     pub fn hours(hours: FixedPoint) -> Self {
-        // The whole part is entirely seconds
-        let whole_seconds = Duration::hours(hours.whole as i64);
-
-        // The fraction has both seconds and one part femptoseconds
-        let fraction_seconds = Duration::microseconds(
-            (hours.femptos * SECOND_PER_HOUR / FixedPoint::FRACTIONAL_UNITS) as i64,
-        );
-
-        Self {
-            span: hours.span,
-            interval: whole_seconds + fraction_seconds,
-        }
+        Self::from_whole_unit(hours, Duration::hours, SECOND_PER_HOUR)
     }
 
     /// Create a new `DurationLiteral` with the given number of minutes.
@@ -71,21 +194,11 @@ impl DurationLiteral {
     /// use ironplc_dsl::common::FixedPoint;
     /// use ironplc_dsl::time::DurationLiteral;
     /// use time::Duration;
-    /// assert_eq!(DurationLiteral::seconds(FixedPoint::parse("1").unwrap()).interval, Duration::seconds(1));
-    /// assert_eq!(DurationLiteral::seconds(FixedPoint::parse("1.001").unwrap()).interval, Duration::seconds(1) + Duration::milliseconds(1));
+    /// assert_eq!(DurationLiteral::minutes(FixedPoint::parse("1").unwrap()).interval, Duration::minutes(1));
+    /// assert_eq!(DurationLiteral::minutes(FixedPoint::parse("1.5").unwrap()).interval, Duration::seconds(90));
     /// ```
     pub fn minutes(minutes: FixedPoint) -> Self {
-        // The whole part is entirely seconds
-        let whole_seconds = Duration::minutes(minutes.whole as i64);
-
-        // The fraction has both seconds and one part femptoseconds
-        let fraction_seconds = Duration::microseconds(
-            (minutes.femptos * SECOND_PER_MINUTE / FixedPoint::FRACTIONAL_UNITS) as i64,
-        );
-        Self {
-            span: minutes.span,
-            interval: whole_seconds + fraction_seconds,
-        }
+        Self::from_whole_unit(minutes, Duration::minutes, SECOND_PER_MINUTE)
     }
 
     /// Create a new `DurationLiteral` with the given number of seconds.
@@ -100,10 +213,7 @@ impl DurationLiteral {
     pub fn seconds(seconds: FixedPoint) -> Self {
         let whole_seconds = Duration::seconds(seconds.whole as i64);
         let fraction_seconds = Duration::nanoseconds((seconds.femptos / 1_000_000) as i64);
-        Self {
-            span: seconds.span,
-            interval: whole_seconds + fraction_seconds,
-        }
+        Self::new(seconds.span, whole_seconds + fraction_seconds)
     }
 
     /// Create a new `DurationLiteral` with the given number of milliseconds.
@@ -122,17 +232,17 @@ impl DurationLiteral {
         let whole_milliseconds = Duration::milliseconds((millis.whole % 1_000) as i64);
 
         let fraction_nanoseconds = Duration::nanoseconds((millis.femptos / 1_000_000_000) as i64);
-        Self {
-            span: millis.span,
-            interval: whole_seconds + whole_milliseconds + fraction_nanoseconds,
-        }
+        Self::new(
+            millis.span,
+            whole_seconds + whole_milliseconds + fraction_nanoseconds,
+        )
     }
 
     pub fn plus(&self, other: DurationLiteral) -> Self {
-        DurationLiteral {
-            span: SourceSpan::join(&self.span, &other.span),
-            interval: self.interval + other.interval,
-        }
+        Self::new(
+            SourceSpan::join(&self.span, &other.span),
+            self.interval + other.interval,
+        )
     }
 }
 
@@ -148,6 +258,9 @@ pub struct TimeOfDayLiteral {
     value: Time,
     /// The literal's position in the source text.
     pub span: SourceSpan,
+    /// The width the source spelled: `TIME_OF_DAY#`/`TOD#` for the 32-bit
+    /// type, `LTIME_OF_DAY#`/`LTOD#` for the 64-bit one.
+    pub width: TemporalWidth,
 }
 
 impl TimeOfDayLiteral {
@@ -155,6 +268,41 @@ impl TimeOfDayLiteral {
         Self {
             value,
             span: SourceSpan::default(),
+            width: TemporalWidth::Short,
+        }
+    }
+
+    /// Returns the literal with `width` recorded as the member of the family
+    /// its prefix named.
+    pub fn with_width(mut self, width: TemporalWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// The IEC 61131-3 type this literal is: the time of day type its prefix named.
+    ///
+    /// A literal states its own type, so it is checked against that type's
+    /// range wherever it is written, the way a prefixed integer literal is
+    /// (`INT#40000` is not an `INT` whatever it is stored into).
+    pub fn type_name(&self) -> ElementaryTypeName {
+        match self.width {
+            TemporalWidth::Short => ElementaryTypeName::TimeOfDay,
+            TemporalWidth::Long => ElementaryTypeName::LTimeOfDay,
+        }
+    }
+
+    /// The millisecond-since-midnight count this literal holds and the storage
+    /// its type gives it.
+    ///
+    /// The count is unsigned and bounded by 86,399,999 by construction, so it
+    /// fits either width; the range check is vacuous rather than absent, so
+    /// that a bound which stopped holding would be reported rather than
+    /// silently truncated.
+    pub fn stored_count(&self) -> StoredCount {
+        StoredCount {
+            count: i128::from(self.whole_milliseconds()),
+            bits: self.width.bits(),
+            signed: false,
         }
     }
 
@@ -197,6 +345,9 @@ pub struct DateLiteral {
     pub value: Date,
     /// The literal's position in the source text.
     pub span: SourceSpan,
+    /// The width the source spelled: `DATE#`/`D#` for the 32-bit type,
+    /// `LDATE#` for the 64-bit one.
+    pub width: TemporalWidth,
 }
 
 impl DateLiteral {
@@ -204,6 +355,39 @@ impl DateLiteral {
         Self {
             value,
             span: SourceSpan::default(),
+            width: TemporalWidth::Short,
+        }
+    }
+
+    /// Returns the literal with `width` recorded as the member of the family
+    /// its prefix named.
+    pub fn with_width(mut self, width: TemporalWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// The IEC 61131-3 type this literal is: the date type its prefix named.
+    ///
+    /// A literal states its own type, so it is checked against that type's
+    /// range wherever it is written, the way a prefixed integer literal is
+    /// (`INT#40000` is not an `INT` whatever it is stored into).
+    pub fn type_name(&self) -> ElementaryTypeName {
+        match self.width {
+            TemporalWidth::Short => ElementaryTypeName::DATE,
+            TemporalWidth::Long => ElementaryTypeName::LDATE,
+        }
+    }
+
+    /// The epoch-second count this literal holds and the storage its type
+    /// gives it.
+    ///
+    /// The count is unsigned (ADR-0025), so a date before 1970-01-01 has
+    /// nowhere to go at either width.
+    pub fn stored_count(&self) -> StoredCount {
+        StoredCount {
+            count: i128::from(self.seconds_since_epoch()),
+            bits: self.width.bits(),
+            signed: false,
         }
     }
 
@@ -245,6 +429,9 @@ pub struct DateAndTimeLiteral {
     value: PrimitiveDateTime,
     /// The literal's position in the source text.
     pub span: SourceSpan,
+    /// The width the source spelled: `DATE_AND_TIME#`/`DT#` for the 32-bit
+    /// type, `LDATE_AND_TIME#`/`LDT#` for the 64-bit one.
+    pub width: TemporalWidth,
 }
 
 impl DateAndTimeLiteral {
@@ -252,6 +439,38 @@ impl DateAndTimeLiteral {
         Self {
             value,
             span: SourceSpan::default(),
+            width: TemporalWidth::Short,
+        }
+    }
+
+    /// Returns the literal with `width` recorded as the member of the family
+    /// its prefix named.
+    pub fn with_width(mut self, width: TemporalWidth) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// The IEC 61131-3 type this literal is: the date and time type its prefix named.
+    ///
+    /// A literal states its own type, so it is checked against that type's
+    /// range wherever it is written, the way a prefixed integer literal is
+    /// (`INT#40000` is not an `INT` whatever it is stored into).
+    pub fn type_name(&self) -> ElementaryTypeName {
+        match self.width {
+            TemporalWidth::Short => ElementaryTypeName::DateAndTime,
+            TemporalWidth::Long => ElementaryTypeName::LDateAndTime,
+        }
+    }
+
+    /// The epoch-second count this literal holds and the storage its type
+    /// gives it.
+    ///
+    /// As with [`DateLiteral::stored_count`], the count is unsigned.
+    pub fn stored_count(&self) -> StoredCount {
+        StoredCount {
+            count: i128::from(self.seconds_since_epoch()),
+            bits: self.width.bits(),
+            signed: false,
         }
     }
 

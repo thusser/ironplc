@@ -17,6 +17,7 @@ use crate::scope::ScopeBearing;
 use crate::sfc::{Network, Sfc};
 use crate::textual::*;
 use crate::time::*;
+use crate::type_id::TypeId;
 use crate::visitor::Visitor;
 
 /// Container for elementary constants.
@@ -2048,6 +2049,12 @@ pub struct VarDecl {
     /// coincidence if this field were compared.
     #[recurse(ignore)]
     pub block: BlockId,
+    /// The type the declaration declares, by identity. Populated by the
+    /// analyzer; `None` before it runs and for a declaration whose type it
+    /// could not resolve. Left out of `PartialEq` like `block`: it is
+    /// derived from `initializer`.
+    #[recurse(ignore)]
+    pub type_id: Option<TypeId>,
 }
 
 impl PartialEq for VarDecl {
@@ -2071,6 +2078,7 @@ impl VarDecl {
                 type_name,
             )),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2086,6 +2094,7 @@ impl VarDecl {
                 keyword_span: SourceSpan::default(),
             }),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2103,6 +2112,7 @@ impl VarDecl {
                 },
             ),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2120,6 +2130,7 @@ impl VarDecl {
                 initial_value: Some(LateResolvedInitialValue::Value(Id::from(initial_value))),
             }),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2141,6 +2152,7 @@ impl VarDecl {
                 },
             ),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2158,6 +2170,7 @@ impl VarDecl {
                 },
             ),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2174,6 +2187,7 @@ impl VarDecl {
                 },
             ),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2191,6 +2205,7 @@ impl VarDecl {
                 LateResolvedInitializer::bare(TypeName::from(type_name)),
             ),
             block: next_block_id(),
+            type_id: None,
         }
     }
 
@@ -2207,49 +2222,7 @@ impl VarDecl {
     }
 
     pub fn type_name(&self) -> TypeReference {
-        match &self.initializer {
-            InitialValueAssignmentKind::None(_source_span) => TypeReference::Unspecified,
-            InitialValueAssignmentKind::Simple(simple_initializer) => {
-                TypeReference::Named(simple_initializer.type_name.clone())
-            }
-            InitialValueAssignmentKind::String(string_initializer) => {
-                TypeReference::Named(string_initializer.type_name())
-            }
-            InitialValueAssignmentKind::EnumeratedValues(_enumerated_values_initializer) => {
-                TypeReference::Inline
-            }
-            InitialValueAssignmentKind::EnumeratedType(enumerated_initial_value_assignment) => {
-                TypeReference::Named(enumerated_initial_value_assignment.type_name.clone())
-            }
-            InitialValueAssignmentKind::FunctionBlock(function_block_initial_value_assignment) => {
-                TypeReference::Named(function_block_initial_value_assignment.type_name.clone())
-            }
-            InitialValueAssignmentKind::FunctionBlockCall(function_block_call_initializer) => {
-                TypeReference::Named(function_block_call_initializer.type_name.clone())
-            }
-            InitialValueAssignmentKind::Subrange(subrange_specification_kind) => {
-                match subrange_specification_kind {
-                    SpecificationKind::Inline(_subrange_specification) => TypeReference::Inline,
-                    SpecificationKind::Named(type_name) => TypeReference::Named(type_name.clone()),
-                }
-            }
-            InitialValueAssignmentKind::Structure(structure_initialization_declaration) => {
-                TypeReference::Named(structure_initialization_declaration.type_name.clone())
-            }
-            InitialValueAssignmentKind::Array(array_initial_value_assignment) => {
-                match &array_initial_value_assignment.spec {
-                    SpecificationKind::Named(type_name) => TypeReference::Named(type_name.clone()),
-                    SpecificationKind::Inline(_) => TypeReference::Inline,
-                }
-            }
-            InitialValueAssignmentKind::Reference(_) => TypeReference::Inline,
-            InitialValueAssignmentKind::LateResolvedType(late) => {
-                TypeReference::Named(late.type_name.clone())
-            }
-            InitialValueAssignmentKind::SimpleExpr(simple_expr_initializer) => {
-                TypeReference::Named(simple_expr_initializer.type_name.clone())
-            }
-        }
+        self.initializer.type_reference()
     }
 }
 
@@ -2641,6 +2614,54 @@ pub enum LateResolvedInitialValue {
 }
 
 impl InitialValueAssignmentKind {
+    /// Returns the type this initializer declares: the name it states, or
+    /// [`TypeReference::Inline`] for a type spelled out in place.
+    pub fn type_reference(&self) -> TypeReference {
+        match self {
+            InitialValueAssignmentKind::None(_source_span) => TypeReference::Unspecified,
+            InitialValueAssignmentKind::Simple(simple_initializer) => {
+                TypeReference::Named(simple_initializer.type_name.clone())
+            }
+            InitialValueAssignmentKind::String(string_initializer) => {
+                TypeReference::Named(string_initializer.type_name())
+            }
+            InitialValueAssignmentKind::EnumeratedValues(_enumerated_values_initializer) => {
+                TypeReference::Inline
+            }
+            InitialValueAssignmentKind::EnumeratedType(enumerated_initial_value_assignment) => {
+                TypeReference::Named(enumerated_initial_value_assignment.type_name.clone())
+            }
+            InitialValueAssignmentKind::FunctionBlock(function_block_initial_value_assignment) => {
+                TypeReference::Named(function_block_initial_value_assignment.type_name.clone())
+            }
+            InitialValueAssignmentKind::FunctionBlockCall(function_block_call_initializer) => {
+                TypeReference::Named(function_block_call_initializer.type_name.clone())
+            }
+            InitialValueAssignmentKind::Subrange(subrange_specification_kind) => {
+                match subrange_specification_kind {
+                    SpecificationKind::Inline(_subrange_specification) => TypeReference::Inline,
+                    SpecificationKind::Named(type_name) => TypeReference::Named(type_name.clone()),
+                }
+            }
+            InitialValueAssignmentKind::Structure(structure_initialization_declaration) => {
+                TypeReference::Named(structure_initialization_declaration.type_name.clone())
+            }
+            InitialValueAssignmentKind::Array(array_initial_value_assignment) => {
+                match &array_initial_value_assignment.spec {
+                    SpecificationKind::Named(type_name) => TypeReference::Named(type_name.clone()),
+                    SpecificationKind::Inline(_) => TypeReference::Inline,
+                }
+            }
+            InitialValueAssignmentKind::Reference(_) => TypeReference::Inline,
+            InitialValueAssignmentKind::LateResolvedType(late) => {
+                TypeReference::Named(late.type_name.clone())
+            }
+            InitialValueAssignmentKind::SimpleExpr(simple_expr_initializer) => {
+                TypeReference::Named(simple_expr_initializer.type_name.clone())
+            }
+        }
+    }
+
     /// Returns whether the declaration states an initial value: a literal,
     /// enumerated or string value, at least one array element, at least one
     /// structure member, or a reference target. A function-block instance
@@ -3244,6 +3265,7 @@ mod tests {
             qualifier: DeclarationQualifier::Unspecified,
             initializer: InitialValueAssignmentKind::None(SourceSpan::default()),
             block,
+            type_id: None,
         }
     }
 
