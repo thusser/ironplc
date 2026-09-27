@@ -6,6 +6,50 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-09-27: OOP work picked up; three PRs and one issue opened
+
+garretfick is not working on OOP dispatch (#1434). He is fixing codegen
+wrong-result bugs only, and handed the OOP syntax work over. Dispatch needs
+a design doc first, covering both static and opt-in dynamic dispatch;
+syntax work needs none.
+
+Opened today:
+
+- **#1870** design doc `specs/design/oop-dispatch.md` (branch
+  `oop-dispatch-design`). Proposes a closed-world branch over implementers
+  (no new opcode), fat interface references, one opt-in flag. Four
+  decisions asked of garretfick in a comment on #1434.
+- **#1871** PROPERTY syntax (branch `property-syntax`, refs #1420/#1692).
+  Accessors are stored as `MethodDeclaration`s; `GET`/`SET` stay
+  identifiers outside a property because of `RS.SET`.
+- **#1872** method calls in expression position (branch
+  `method-call-expression`, closes #1421). New P4057 for a void method in
+  an expression.
+- **#1869** `REF=` skips the type check between function blocks.
+
+**Still to check in XAE** (Windows machine, TwinCAT 3.1.4024):
+
+- **Trailing comma in an FB call's argument list.** MONETN and MONETS
+  `MAIN.TcPOU` now get past `IF CabinetControl.IsStartPushed() THEN` (#1872)
+  and fail next at
+
+  ```
+  	bBrakeOpen		:= HydraulicsControl.brakeOpen,
+  );
+  ```
+
+  Production code, so TwinCAT presumably accepts it, but unverified. Check
+  in XAE before filing an issue: an FB call and a function call, each with
+  a trailing comma after the last argument, positional and named.
+- **Method call through a pointer to an unrelated FB** (`p := ADR(o);
+  p^.M();` with `p : POINTER TO FB_Base`). TwinCAT accepts the `ADR()`
+  without a warning; what runs at the call is unknown. Only needed once the
+  dispatch design (#1870) is agreed.
+
+Next blockers in the corpus, most frequent first: method calls on
+`p^`/`a[i]` receivers (#1422), access modifiers `METHOD PUBLIC`/`PRIVATE`
+(#1424).
+
 ## 2026-09-23: synced to `main` @ `4223ec06` (42 commits); corpus re-checked
 
 Routine sync, clean this time -- and notably the first in a while with
