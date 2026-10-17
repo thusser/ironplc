@@ -6,6 +6,84 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-10-17: synced to `main` @ `be6c29bf1`; corpus re-checked; method-call receivers planned
+
+`twincat-dev` merged `origin/main` (258 commits) with no conflicts, merge
+commit `b94a517cc`. `cargo test --workspace` passes (9990 tests) and
+`cd compiler && just` passes. The only difference from `main` is this
+document.
+
+**Where the OOP PRs are.** All four were rebased or merged onto current
+`main` today and are waiting for garretfick's review:
+
+- **#2148** (a variable in scope hides an enumerated value). The reworked
+  version, decided once from the symbol environment, had never been pushed; the
+  PR still showed the first approach. It is pushed now.
+- **#2000** (`THIS^`/`SUPER^` typing). Same story: the review fixes were only
+  local. It now contains #2148's commit and drops out of the diff when #2148
+  merges. #1999 and #1998 are redundant and stay open until #2000 merges.
+- **#1900** (interfaces as types) and **#1901** (`IMPLEMENTS` conformance), the
+  second stacked on the first. All six findings from the review of #1901 were
+  re-run and pass; two of them (GET/SET scopes, inherited properties) came
+  with #2310 on `main`.
+
+Merged since the last entry: #1871 (PROPERTY), #1872 (method calls in
+expressions), #1892 (interface prototypes), #2310 (GET/SET scopes, properties
+as symbols), #2317 (a field that redeclares an inherited property, P4044).
+#2066 was closed as superseded by those. Access modifiers (#1424) are closed.
+
+**Corpus re-check.** `ironplcc check --dialect twincat`, one file at a time,
+over the 8 solutions under `/home/husser/code/brotlib`. This run takes every
+`.TcPOU`, `.TcIO`, `.TcGVL` and `.TcDUT`, 218 files, so the numbers are not
+comparable with the 174-file run in the 2026-09-23 entry. The first error code
+per file:
+
+| Code | Files |
+|---|---|
+| clean | 46 |
+| P0002 syntax | 91 |
+| P2008 cross-file resolution | 37 |
+| P9999 not implemented | 21 |
+| P4017 undeclared function | 12 |
+| P4038 non-constant initializer | 7 |
+| P4007, P4012, P4016 | 4 |
+
+The dependency confound from 2026-09-23 still applies to P2008 and P4017.
+
+**What the 91 syntax errors are.** Classified by a regular expression on the
+offending line, so the counts are approximate, and only the first error per
+file is seen:
+
+- **Qualified names, about 50 files:** `EXTENDS TcUnit.FB_TestSuite` (40),
+  `IMPLEMENTS BROTLib.I_Telescope` (3), a declared type `BROTLib.E_Blink` (3),
+  and constants such as `GVL_Math.LREAL_MIN` (4). Issue #1430. Most of the 40
+  are the `*Tests` projects. Needs a design decision with garretfick, since it
+  probably also needs the library mechanism.
+- **Method calls through a pointer, about 15 files:**
+  `pCover^.SetState(pCover^.fbCoverOpeningState);`. Issue #1422, now planned.
+- **Smaller:** `FB_X(THIS)` as a call-style initializer; empty or trailing
+  arguments (`JogForward :=,`, `Error=> ,`); `RETURN(value)`; `SUPER^();`;
+  qualified enum values as CASE labels (#1942); `AT %Q*` wildcard addresses; a
+  bare constant as an initializer (#1890); and `FOR step := 0 TO 1 DO`, which
+  I have not looked into (a keyword clash on `step` is a guess).
+
+**Method-call receivers (#1422).** Plan PR #2369,
+`specs/plans/2026-10-17-method-call-receivers.md`. `MethodCall.receiver` becomes
+a `SymbolicVariableKind`, so `a.b.M()`, `p^.M()` and `a[i].M()` parse through
+the existing variable chain; the method resolves on the receiver's declared
+type. Three PRs: a prefactor, then analysis, then the lowered route. Open
+questions for review are in the PR.
+
+**Still to check in XAE** (carried over, plus two new):
+
+- Trailing comma in an FB call's argument list, positional and named (from
+  2026-09-27; now also in the failing-syntax list above).
+- Method call through a pointer to an unrelated FB (`p := ADR(o); p^.M();`).
+- **New:** `p^.M()` where `p : POINTER TO FB_Base` holds an instance of a
+  derived block. Which method runs? The plan calls `FB_Base`'s.
+- **New:** `p^.M()` inside a FUNCTION, with `p` a pointer parameter. The plan
+  proposes reporting it like `m.M()`, which is unverified.
+
 ## 2026-09-27: OOP work picked up; three PRs and one issue opened
 
 garretfick is not working on OOP dispatch (#1434). He is fixing codegen
