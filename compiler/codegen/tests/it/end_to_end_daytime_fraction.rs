@@ -1,0 +1,190 @@
+//! End-to-end tests for the fractional seconds of time-of-day and
+//! date-and-time literals (issue #1921).
+//!
+//! The fraction reaches the stored count at the type's own unit
+//! (ADR-0025): milliseconds for `TIME_OF_DAY` and `LTIME_OF_DAY`, seconds
+//! for `DATE_AND_TIME` and `LDATE_AND_TIME`. A finer fraction is truncated,
+//! as a sub-millisecond `TIME` literal is (ADR-0021).
+
+use ironplc_parser::options::{CompilerOptions, Dialect};
+use rstest::rstest;
+
+use crate::common::{assert_run_with, datetime, time, PrimitiveDateTime, Snapshot, Time, Value};
+
+fn edition3() -> CompilerOptions {
+    CompilerOptions::from_dialect(Dialect::Iec61131_3Ed3)
+}
+
+#[rstest]
+// The program from issue #1921: 10h = 36,000,000 ms, plus 250 ms.
+#[case::tod_initializer(
+    "
+PROGRAM main
+  VAR
+    a : TIME_OF_DAY := TOD#10:00:00.250;
+    ms : DINT;
+  END_VAR
+  ms := TOD_TO_DINT(a);
+END_PROGRAM
+",
+    "ms",
+    Value::Int(36_000_250)
+)]
+#[case::time_of_day_assignment(
+    "
+PROGRAM main
+  VAR
+    a : TIME_OF_DAY;
+  END_VAR
+  a := TIME_OF_DAY#23:59:59.999;
+END_PROGRAM
+",
+    "a",
+    time!(23:59:59.999).into()
+)]
+// A fraction below the millisecond is truncated, as for `T#`.
+#[case::tod_sub_millisecond_truncated(
+    "
+PROGRAM main
+  VAR
+    a : TIME_OF_DAY := TOD#10:00:00.0009;
+  END_VAR
+  a := a;
+END_PROGRAM
+",
+    "a",
+    time!(10:00).into()
+)]
+#[case::tod_constant(
+    "
+PROGRAM main
+  VAR CONSTANT
+    start : TIME_OF_DAY := TOD#10:00:00.5;
+  END_VAR
+  VAR
+    a : TIME_OF_DAY;
+  END_VAR
+  a := start;
+END_PROGRAM
+",
+    "a",
+    time!(10:00:00.5).into()
+)]
+#[case::tod_plus_time(
+    "
+PROGRAM main
+  VAR
+    a : TIME_OF_DAY;
+  END_VAR
+  a := TOD#10:00:00.250 + T#250ms;
+END_PROGRAM
+",
+    "a",
+    time!(10:00:00.5).into()
+)]
+// Before the fix both literals were 10:00:00, so the comparison was FALSE.
+#[case::tod_comparison(
+    "
+PROGRAM main
+  VAR
+    later : BOOL;
+  END_VAR
+  later := TOD#10:00:00.250 > TOD#10:00:00.100;
+END_PROGRAM
+",
+    "later",
+    Value::Bool(true)
+)]
+// The 0.75 s fraction is below the one-second unit of DATE_AND_TIME and is
+// truncated.
+#[case::dt_fraction_truncated(
+    "
+PROGRAM main
+  VAR
+    d : DATE_AND_TIME := DT#2024-01-02-10:00:00.75;
+  END_VAR
+  d := d;
+END_PROGRAM
+",
+    "d",
+    datetime!(2024-01-02 10:00).into()
+)]
+#[case::date_and_time_fraction_truncated(
+    "
+PROGRAM main
+  VAR
+    d : DATE_AND_TIME;
+  END_VAR
+  d := DATE_AND_TIME#2024-01-02-10:00:00.75;
+END_PROGRAM
+",
+    "d",
+    datetime!(2024-01-02 10:00).into()
+)]
+fn end_to_end_when_short_daytime_literal_has_fraction_then_stored_at_type_unit(
+    #[case] source: &str,
+    #[case] name: &str,
+    #[case] expected: Value,
+) {
+    assert_eq!(Snapshot::run(source, &edition3()).read(name), expected);
+}
+
+#[rstest]
+#[case::ltod_initializer(
+    "
+PROGRAM main
+  VAR
+    a : LTIME_OF_DAY := LTOD#10:00:00.250;
+  END_VAR
+  a := a;
+END_PROGRAM
+",
+    time!(10:00:00.25)
+)]
+#[case::ltime_of_day_assignment(
+    "
+PROGRAM main
+  VAR
+    a : LTIME_OF_DAY;
+  END_VAR
+  a := LTIME_OF_DAY#23:59:59.999;
+END_PROGRAM
+",
+    time!(23:59:59.999)
+)]
+fn end_to_end_when_long_time_of_day_literal_has_fraction_then_stored_at_type_unit(
+    #[case] source: &str,
+    #[case] expected: Time,
+) {
+    assert_run_with(source, &edition3(), &[("a", expected)]);
+}
+
+#[rstest]
+#[case::ldt_fraction_truncated(
+    "
+PROGRAM main
+  VAR
+    d : LDT := LDT#2024-01-02-10:00:00.75;
+  END_VAR
+  d := d;
+END_PROGRAM
+",
+    datetime!(2024-01-02 10:00)
+)]
+#[case::ldate_and_time_fraction_truncated(
+    "
+PROGRAM main
+  VAR
+    d : LDATE_AND_TIME;
+  END_VAR
+  d := LDATE_AND_TIME#2024-01-02-10:00:00.75;
+END_PROGRAM
+",
+    datetime!(2024-01-02 10:00)
+)]
+fn end_to_end_when_long_date_and_time_literal_has_fraction_then_stored_at_type_unit(
+    #[case] source: &str,
+    #[case] expected: PrimitiveDateTime,
+) {
+    assert_run_with(source, &edition3(), &[("d", expected)]);
+}

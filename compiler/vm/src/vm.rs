@@ -6,10 +6,13 @@ use ironplc_container::{
 
 use crate::buffers::VmBuffers;
 use crate::builtin;
+use crate::clock::Clock;
 use crate::debug::PauseReason;
 use crate::debug_hook::{DebugHook, HookAction, NoopDebugHook};
 use crate::error::Trap;
 use crate::frame_stack::{FbCallReturn, Frame, FrameStack};
+use crate::intrinsic;
+use crate::intrinsic_id::Intrinsic;
 #[cfg(feature = "profiling")]
 use crate::profile::InstructionProfile;
 use crate::scheduler::{ProgramInstanceState, TaskScheduler, TaskState};
@@ -20,8 +23,6 @@ use crate::value::Slot;
 use crate::variable_table::{VariableScope, VariableTable};
 use core::fmt::Write as FmtWrite;
 use ironplc_container::opcode;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 
 /// Context for a fault that occurred during task execution.
 #[derive(Debug)]
@@ -49,17 +50,19 @@ impl Vm {
     /// Consumes the empty VM and returns a ready VM.
     ///
     /// Returns `Err(Trap)` if the container's declared call depth is invalid
-    /// or exceeds the frame buffer. The check runs here, before either entry
-    /// path ([`start`](VmReady::start) or [`resume`](VmReady::resume)), and
-    /// before any buffer is written. The error is a bare [`Trap`] rather than
-    /// a [`FaultContext`] because it belongs to the container, not to any
-    /// task or program instance.
+    /// or exceeds the frame buffer, or if it declares the system uptime
+    /// variables without slots to hold them. The checks run here, before
+    /// either entry path ([`start`](VmReady::start) or
+    /// [`resume`](VmReady::resume)), and before any buffer is written. The
+    /// error is a bare [`Trap`] rather than a [`FaultContext`] because it
+    /// belongs to the container, not to any task or program instance.
     pub fn load<'a>(
         self,
         container: &'a Container,
         bufs: &'a mut VmBuffers,
     ) -> Result<VmReady<'a>, Trap> {
         validate_call_depth(container, bufs.frames.len())?;
+        validate_system_uptime(container, bufs.vars.len())?;
 
         // Populate task_states from the container's task table.
         for (i, t) in container.task_table.tasks.iter().enumerate() {
@@ -131,6 +134,36 @@ fn validate_call_depth(container: &Container, capacity: usize) -> Result<(), Tra
         return Err(Trap::ProgramExceedsCallDepth {
             required: declared,
             capacity: capacity.min(u16::MAX as usize) as u16,
+        });
+    }
+    Ok(())
+}
+
+/// The number of variable slots the system uptime variables occupy:
+/// `__SYSTEM_UP_TIME` at index 0 and `__SYSTEM_UP_LTIME` at index 1.
+const SYSTEM_UPTIME_VARIABLE_COUNT: u16 = 2;
+
+/// Validates that a container declaring the system uptime variables has
+/// slots for them.
+///
+/// `FLAG_HAS_SYSTEM_UPTIME` promises that the uptime variables occupy the
+/// first two variable slots, which every scan writes before running tasks.
+/// The flag is read from the container file, so nothing else guarantees the
+/// promise holds. Both the declared variable count and the embedder's buffer
+/// backing the variables must hold the two slots; the scan writes to the
+/// buffer.
+fn validate_system_uptime(container: &Container, var_capacity: usize) -> Result<(), Trap> {
+    if container.header.flags & ironplc_container::FLAG_HAS_SYSTEM_UPTIME == 0 {
+        return Ok(());
+    }
+    let available = container
+        .header
+        .num_variables
+        .min(var_capacity.min(u16::MAX as usize) as u16);
+    if available < SYSTEM_UPTIME_VARIABLE_COUNT {
+        return Err(Trap::VariableTableTooSmall {
+            required: SYSTEM_UPTIME_VARIABLE_COUNT,
+            available,
         });
     }
     Ok(())
@@ -362,13 +395,20 @@ impl<'a> VmRunning<'a> {
     /// Executes one scheduling round: collects ready tasks, executes them
     /// in priority order, and updates timing.
     ///
-    /// The caller provides `uptime_us` (microseconds since VM start).
+    /// The caller provides `uptime_us` (microseconds since VM start), the
+    /// PLC's time, which it may simulate. It also provides the `clock` that
+    /// measures how long each task actually executes, for the watchdog and
+    /// the task's execution statistics (see [`Clock`]).
     /// Sleep logic is the caller's responsibility.
     ///
     /// Returns `Ok(())` if the round completes. Returns `Err(FaultContext)` if
     /// a trap occurs during execution. The caller should transition to
     /// `VmFaulted` on trap.
-    pub fn run_round(&mut self, uptime_us: u64) -> Result<(), FaultContext> {
+    pub fn run_round<C: Clock>(
+        &mut self,
+        uptime_us: u64,
+        clock: &mut C,
+    ) -> Result<(), FaultContext> {
         // Build a scheduler temporarily borrowing task_states.
         // We need to collect ready task indices into ready_buf, then drop the scheduler
         // before iterating, so we can mutably borrow task_states during record_execution.
@@ -393,8 +433,7 @@ impl<'a> VmRunning<'a> {
             let task_idx = self.ready_buf[ri];
             let task_id = self.task_states[task_idx].task_id;
 
-            #[cfg(not(target_arch = "wasm32"))]
-            let start = Instant::now();
+            let start_us = clock.now_us();
             let mut last_instance_id = InstanceId::DEFAULT;
 
             // Iterate over program instances for this task.
@@ -414,16 +453,15 @@ impl<'a> VmRunning<'a> {
                         task_id,
                         instance_id,
                     })?;
-                debug_assert!(
-                    matches!(outcome, ExecuteOutcome::Completed),
-                    "NoopDebugHook can never pause a scan"
-                );
+                // `NoopDebugHook` cannot pause: its pause type is uninhabited.
+                match outcome {
+                    ExecuteOutcome::Completed => {}
+                    ExecuteOutcome::Paused(never) => match never {},
+                }
             }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            let elapsed_us = start.elapsed().as_micros() as u64;
-            #[cfg(target_arch = "wasm32")]
-            let elapsed_us = 0u64;
+            // A clock that went backwards measures zero rather than wrapping.
+            let elapsed_us = clock.now_us().saturating_sub(start_us);
 
             // Watchdog check: if the task has a watchdog configured and
             // execution exceeded the timeout, trap.
@@ -458,7 +496,10 @@ impl<'a> VmRunning<'a> {
         // Because nothing ever truncates this buffer, a leak in any round
         // persists, so a single check after a scenario detects a leak in
         // every round of it.
-        self.scan_count += 1;
+        //
+        // Saturates rather than overflowing: `VmReady::resume` can start the
+        // counter anywhere up to `u64::MAX`.
+        self.scan_count = self.scan_count.saturating_add(1);
         Ok(())
     }
 
@@ -485,11 +526,15 @@ impl<'a> VmRunning<'a> {
     /// fire the moment execution paused. The shared per-instance execution
     /// core lives in [`run_instance`](Self::run_instance); only the
     /// scheduling/lifecycle policy around it differs between the two drivers.
-    pub fn run_round_debug<H: DebugHook>(
+    pub fn run_round_debug<H>(
         &mut self,
         uptime_us: u64,
         hook: &mut H,
-    ) -> Result<RoundOutcome, FaultContext> {
+    ) -> Result<RoundOutcome, FaultContext>
+    where
+        H: DebugHook,
+        H::Pause: Into<PauseReason>,
+    {
         // No program instance → nothing to debug; the scan is a no-op.
         if self.program_instances.is_empty() {
             self.phase = Phase::CompletedScan;
@@ -532,11 +577,12 @@ impl<'a> VmRunning<'a> {
 
         match outcome {
             ExecuteOutcome::Paused(reason) => {
+                let reason = reason.into();
                 self.phase = Phase::PausedAt(reason);
                 Ok(RoundOutcome::Paused(reason))
             }
             ExecuteOutcome::Completed => {
-                self.scan_count += 1;
+                self.scan_count = self.scan_count.saturating_add(1);
                 self.phase = Phase::CompletedScan;
                 // A scan step's landing is this boundary, which no
                 // per-instruction hook can see; ask the hook whether one is in
@@ -566,14 +612,18 @@ impl<'a> VmRunning<'a> {
             return;
         }
         let time_ms = (uptime_us / 1000) as i64;
+        // `Vm::load` rejected any container whose variable buffer cannot hold
+        // both slots (`validate_system_uptime`), so neither store can fail;
+        // the results are discarded rather than unwrapped so this path has no
+        // panic.
         // __SYSTEM_UP_TIME at VarIndex(0): i32 milliseconds (wrapping)
-        self.variables
-            .store(VarIndex::new(0), Slot::from_i32(time_ms as i32))
-            .expect("system uptime variable must exist at index 0");
+        let _ = self
+            .variables
+            .store(VarIndex::new(0), Slot::from_i32(time_ms as i32));
         // __SYSTEM_UP_LTIME at VarIndex(1): i64 milliseconds (non-wrapping)
-        self.variables
-            .store(VarIndex::new(1), Slot::from_i64(time_ms))
-            .expect("system uptime variable must exist at index 1");
+        let _ = self
+            .variables
+            .store(VarIndex::new(1), Slot::from_i64(time_ms));
     }
 
     /// Runs one program instance's entry function through the shared dispatch
@@ -599,7 +649,7 @@ impl<'a> VmRunning<'a> {
         frame_count: usize,
         temp_alloc_next: u16,
         hook: &mut H,
-    ) -> Result<(ExecuteOutcome, usize, u16), Trap> {
+    ) -> Result<(ExecuteOutcome<H::Pause>, usize, u16), Trap> {
         let entry_function_id = self.program_instances[instance_index].entry_function_id;
         let var_table_offset = self.program_instances[instance_index].var_table_offset;
         let var_table_count = self.program_instances[instance_index].var_table_count;
@@ -1022,7 +1072,7 @@ fn execute(
     let mut hook = NoopDebugHook;
     // Fresh, non-resumable run: the frame stack starts empty (so the entry
     // frame is pushed) and no temp-buffer allocations carry over. The noop
-    // hook can never pause, so `Completed` is the only reachable outcome.
+    // hook's pause type is uninhabited, so `Completed` is the only outcome.
     let mut frame_count = 0usize;
     let mut temp_alloc_next = 0u16;
     match execute_with_hook(
@@ -1043,9 +1093,7 @@ fn execute(
         &mut hook,
     )? {
         ExecuteOutcome::Completed => Ok(()),
-        ExecuteOutcome::Paused(_) => {
-            unreachable!("NoopDebugHook always returns HookAction::Continue")
-        }
+        ExecuteOutcome::Paused(never) => match never {},
     }
 }
 
@@ -1055,12 +1103,15 @@ fn execute(
 /// returned). `Paused` means the debug hook requested a stop before an
 /// instruction executed; the frame stack, operand stack, and temp-buffer
 /// allocator position are all preserved so a later call can resume.
+///
+/// `P` is the hook's [`DebugHook::Pause`] type. For a hook that cannot
+/// pause it is uninhabited, and so is `Paused`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecuteOutcome {
+pub enum ExecuteOutcome<P = PauseReason> {
     /// The program returned normally.
     Completed,
     /// The hook paused execution before an instruction.
-    Paused(PauseReason),
+    Paused(P),
 }
 
 /// Executes the entry function until its frame stack drains (program
@@ -1096,12 +1147,12 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
     temp_alloc_next: &mut u16,
     #[cfg(feature = "profiling")] profile: &mut InstructionProfile,
     hook: &mut H,
-) -> Result<ExecuteOutcome, Trap> {
+) -> Result<ExecuteOutcome<H::Pause>, Trap> {
     let mut temp_alloc = string_ops::TempBufAllocator::new(max_temp_buf_bytes);
     // Restore the temp-buffer bump position captured at the last pause. On a
     // fresh run this is 0 (nothing allocated yet).
     temp_alloc.rewind_to(*temp_alloc_next);
-    let mut frame_stack = FrameStack::resume(frames, *frame_count);
+    let mut frame_stack = FrameStack::resume(frames, *frame_count)?;
     if frame_stack.is_empty() {
         // Fresh run: push the entry frame. When resuming a paused instance
         // the frame stack is non-empty and the entry frame (plus any deeper
@@ -1138,12 +1189,10 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
     //      revealed caller's `pc` is already correct), then clear `pc_dirty`.
     //   4. Pause: store the *un-advanced* `pc` so the paused opcode re-executes
     //      on resume, then return `Paused` without reaching the writeback.
-    while !frame_stack.is_empty() {
+    while let Some(top) = frame_stack.top() {
         // Snapshot the top frame's authoritative `pc` into the working copy.
-        let (current_function_id, scope, mut pc) = {
-            let top = frame_stack.top().expect("non-empty by loop condition");
-            (top.function_id, top.scope, top.pc)
-        };
+        // The fields are copied out so the borrow of `frame_stack` ends here.
+        let (current_function_id, scope, mut pc) = (top.function_id, top.scope, top.pc);
         let bytecode = container
             .code
             .get_function_bytecode(current_function_id)
@@ -1176,7 +1225,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                 // not yet run `pc += 1`), so the paused opcode re-executes on
                 // resume. The frame stack and temp-allocator position are
                 // preserved so the caller can resume this instance later.
-                commit_pc(&mut frame_stack, pc);
+                commit_pc(&mut frame_stack, pc)?;
                 *frame_count = frame_stack.len();
                 *temp_alloc_next = temp_alloc.next();
                 return Ok(ExecuteOutcome::Paused(reason));
@@ -1235,6 +1284,12 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                 variables.store(index, slot)?;
             }
             // --- Indirect load/store (reference dereference) ---
+            //
+            // The target is checked against the program instance's scope,
+            // not the current frame's: a reference (a VAR_IN_OUT argument,
+            // or a REF_TO passed down) names a variable in a caller's frame,
+            // which the callee's own scope does not cover. Another program
+            // instance's partition is still out of reach.
             opcode::LOAD_INDIRECT => {
                 let ref_slot = stack.pop()?;
                 if ref_slot.is_null_ref() {
@@ -1243,7 +1298,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                 let target_index = ref_slot
                     .as_var_index()
                     .ok_or(Trap::InvalidVariableIndex(VarIndex::new(u16::MAX)))?;
-                scope.check_access(target_index)?;
+                entry_scope.check_access(target_index)?;
                 let value = variables.load(target_index)?;
                 stack.push(value)?;
             }
@@ -1255,7 +1310,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                 let target_index = ref_slot
                     .as_var_index()
                     .ok_or(Trap::InvalidVariableIndex(VarIndex::new(u16::MAX)))?;
-                scope.check_access(target_index)?;
+                entry_scope.check_access(target_index)?;
                 let value = stack.pop()?;
                 variables.store(target_index, value)?;
             }
@@ -1551,7 +1606,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                         string_ops::verify_encoding(left_width, right_width)?;
                         let w = left_width.as_usize();
 
-                        // Lengths are code units; compare the full byte spans.
+                        // Lengths are code units; compare the full spans.
                         let left_len =
                             string_ops::str_read_cur_len(data_region, left_offset) as usize * w;
                         let left_start = left_offset + STRING_HEADER_BYTES;
@@ -1562,7 +1617,9 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                         let right_start = right_offset + STRING_HEADER_BYTES;
                         let right_data = &data_region[right_start..right_start + right_len];
 
-                        let cmp_val = match left_data.cmp(right_data) {
+                        let order =
+                            string_ops::compare_code_units(left_data, right_data, left_width);
+                        let cmp_val = match order {
                             core::cmp::Ordering::Less => -1i32,
                             core::cmp::Ordering::Equal => 0i32,
                             core::cmp::Ordering::Greater => 1i32,
@@ -1613,7 +1670,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                 // `FrameStack::push` returns Trap::CallStackOverflow on
                 // capacity overflow — same trap as the old depth-counter
                 // check.
-                commit_pc(&mut frame_stack, pc);
+                commit_pc(&mut frame_stack, pc)?;
                 hook.before_call(func_id);
                 frame_stack.push(Frame {
                     function_id: func_id,
@@ -2447,86 +2504,79 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                 let type_id = read_u16_le(bytecode, &mut pc)?;
                 let fb_ref = stack.peek()?.as_i32() as u32;
                 let instance_start = fb_ref as usize;
-                match type_id {
-                    opcode::fb_type::TON | opcode::fb_type::TOF | opcode::fb_type::TP => {
-                        let instance_size = crate::intrinsic::TIMER_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        let time = uptime_us as i64;
-                        match type_id {
-                            opcode::fb_type::TON => crate::intrinsic::ton(slice, time)?,
-                            opcode::fb_type::TOF => crate::intrinsic::tof(slice, time)?,
-                            opcode::fb_type::TP => crate::intrinsic::tp(slice, time)?,
-                            _ => unreachable!(),
-                        }
-                    }
-                    opcode::fb_type::CTU => {
-                        let instance_size = crate::intrinsic::CTU_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::ctu(slice)?;
-                    }
-                    opcode::fb_type::CTD => {
-                        let instance_size = crate::intrinsic::CTD_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::ctd(slice)?;
-                    }
-                    opcode::fb_type::CTUD => {
-                        let instance_size = crate::intrinsic::CTUD_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::ctud(slice)?;
-                    }
-                    opcode::fb_type::SR => {
-                        let instance_size = crate::intrinsic::SR_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::sr(slice)?;
-                    }
-                    opcode::fb_type::RS => {
-                        let instance_size = crate::intrinsic::RS_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::rs(slice)?;
-                    }
-                    opcode::fb_type::R_TRIG => {
-                        let instance_size = crate::intrinsic::R_TRIG_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::r_trig(slice)?;
-                    }
-                    opcode::fb_type::F_TRIG => {
-                        let instance_size = crate::intrinsic::F_TRIG_INSTANCE_FIELDS * 8;
-                        let instance_end = instance_start + instance_size;
-                        if instance_end > data_region.len() {
-                            return Err(Trap::DataRegionOutOfBounds(instance_start as u32));
-                        }
-                        let slice = &mut data_region[instance_start..instance_end];
-                        crate::intrinsic::f_trig(slice)?;
-                    }
-                    _ => {
+                // An intrinsic FB runs natively over its instance's fields;
+                // each arm names the fields it owns, so the slice it is
+                // handed is exactly that long.
+                match Intrinsic::of(type_id) {
+                    Some(Intrinsic::Ton) => intrinsic::ton(
+                        intrinsic_instance(
+                            data_region,
+                            instance_start,
+                            intrinsic::TIMER_INSTANCE_FIELDS,
+                        )?,
+                        uptime_us as i64,
+                    )?,
+                    Some(Intrinsic::Tof) => intrinsic::tof(
+                        intrinsic_instance(
+                            data_region,
+                            instance_start,
+                            intrinsic::TIMER_INSTANCE_FIELDS,
+                        )?,
+                        uptime_us as i64,
+                    )?,
+                    Some(Intrinsic::Tp) => intrinsic::tp(
+                        intrinsic_instance(
+                            data_region,
+                            instance_start,
+                            intrinsic::TIMER_INSTANCE_FIELDS,
+                        )?,
+                        uptime_us as i64,
+                    )?,
+                    Some(Intrinsic::Ctu(width)) => intrinsic::ctu(
+                        intrinsic_instance(
+                            data_region,
+                            instance_start,
+                            intrinsic::CTU_INSTANCE_FIELDS,
+                        )?,
+                        width,
+                    )?,
+                    Some(Intrinsic::Ctd(width)) => intrinsic::ctd(
+                        intrinsic_instance(
+                            data_region,
+                            instance_start,
+                            intrinsic::CTD_INSTANCE_FIELDS,
+                        )?,
+                        width,
+                    )?,
+                    Some(Intrinsic::Ctud(width)) => intrinsic::ctud(
+                        intrinsic_instance(
+                            data_region,
+                            instance_start,
+                            intrinsic::CTUD_INSTANCE_FIELDS,
+                        )?,
+                        width,
+                    )?,
+                    Some(Intrinsic::Sr) => intrinsic::sr(intrinsic_instance(
+                        data_region,
+                        instance_start,
+                        intrinsic::SR_INSTANCE_FIELDS,
+                    )?)?,
+                    Some(Intrinsic::Rs) => intrinsic::rs(intrinsic_instance(
+                        data_region,
+                        instance_start,
+                        intrinsic::RS_INSTANCE_FIELDS,
+                    )?)?,
+                    Some(Intrinsic::RTrig) => intrinsic::r_trig(intrinsic_instance(
+                        data_region,
+                        instance_start,
+                        intrinsic::R_TRIG_INSTANCE_FIELDS,
+                    )?)?,
+                    Some(Intrinsic::FTrig) => intrinsic::f_trig(intrinsic_instance(
+                        data_region,
+                        instance_start,
+                        intrinsic::F_TRIG_INSTANCE_FIELDS,
+                    )?)?,
+                    None => {
                         // User-defined FB: look up in the container's user FB table.
                         let fb_type_id = FbTypeId::new(type_id);
                         let user_fb = container
@@ -2570,7 +2620,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                         // `fb_return` records what `handle_frame_return`
                         // needs to copy variable slots back to the data
                         // region after the FB body returns.
-                        commit_pc(&mut frame_stack, pc);
+                        commit_pc(&mut frame_stack, pc)?;
                         hook.before_call(func_id);
                         frame_stack.push(Frame {
                             function_id: func_id,
@@ -2639,7 +2689,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
                     instance_count: func.num_locals,
                 };
 
-                commit_pc(&mut frame_stack, pc);
+                commit_pc(&mut frame_stack, pc)?;
                 hook.before_call(function_id);
                 frame_stack.push(Frame {
                     function_id,
@@ -2900,7 +2950,7 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
             // the frame we snapshotted at the top of the iteration. Push/pop
             // arms cleared `pc_dirty`, so this never clobbers a newly-pushed
             // callee's `pc: 0` or a freshly-popped caller's already-correct pc.
-            commit_pc(&mut frame_stack, pc);
+            commit_pc(&mut frame_stack, pc)?;
         }
     }
 
@@ -2919,14 +2969,14 @@ pub(crate) fn execute_with_hook<H: DebugHook>(
 /// writeback, the CALL / FB_CALL caller-save, and the pause path). Folding
 /// them here keeps all four spellings identical and greppable.
 ///
-/// Panics if the frame stack is empty; every caller holds the loop invariant
-/// that a frame is live at the commit point.
+/// Every caller holds the loop invariant that a frame is live at the commit
+/// point, but none holds a reference to it: the same iteration pushes and
+/// pops `frame_stack`. So an empty stack is reported as
+/// [`Trap::CallStackUnderflow`] rather than assumed away.
 #[inline(always)]
-fn commit_pc(frame_stack: &mut FrameStack, pc: usize) {
-    frame_stack
-        .top_mut()
-        .expect("commit_pc requires a non-empty frame stack")
-        .pc = pc;
+fn commit_pc(frame_stack: &mut FrameStack, pc: usize) -> Result<(), Trap> {
+    frame_stack.top_mut().ok_or(Trap::CallStackUnderflow)?.pc = pc;
+    Ok(())
 }
 
 /// Pops the topmost frame, rewinds the temp-buffer allocator to the
@@ -2938,6 +2988,9 @@ fn commit_pc(frame_stack: &mut FrameStack, pc: usize) {
 /// the single choke point for frame pops, so [`DebugHook::after_return`]
 /// fires here exactly once per pop — keeping a hook's depth counter in
 /// lock-step with `frame_stack.len()`.
+///
+/// Every caller holds the loop invariant that the returning frame is live;
+/// an empty stack is reported as [`Trap::CallStackUnderflow`].
 fn handle_frame_return<H: DebugHook>(
     temp_alloc: &mut string_ops::TempBufAllocator,
     frame_stack: &mut FrameStack,
@@ -2945,9 +2998,7 @@ fn handle_frame_return<H: DebugHook>(
     variables: &mut VariableTable,
     hook: &mut H,
 ) -> Result<(), Trap> {
-    let popped = frame_stack
-        .pop()
-        .expect("caller must hold the loop invariant: non-empty before return");
+    let popped = frame_stack.pop().ok_or(Trap::CallStackUnderflow)?;
     temp_alloc.rewind_to(popped.temp_alloc_mark);
 
     if let Some(fbr) = popped.fb_return {
@@ -2960,6 +3011,21 @@ fn handle_frame_return<H: DebugHook>(
     hook.after_return(returning_to);
 
     Ok(())
+}
+
+/// The instance of an intrinsic function block: the `fields` 8-byte slots
+/// starting at `instance_start` in the data region.
+///
+/// Returns [`Trap::DataRegionOutOfBounds`] at `instance_start` when the
+/// instance does not fit.
+fn intrinsic_instance(
+    data_region: &mut [u8],
+    instance_start: usize,
+    fields: usize,
+) -> Result<&mut [u8], Trap> {
+    data_region
+        .get_mut(instance_start..instance_start + fields * 8)
+        .ok_or(Trap::DataRegionOutOfBounds(instance_start as u32))
 }
 
 /// Reads a single byte from bytecode at pc, advancing pc by 1.
@@ -3047,9 +3113,41 @@ impl core::fmt::Write for StackFmtBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{assert_trap, single_function_container, steel_thread_container};
+    use crate::test_support::{
+        assert_trap, load_and_start, single_function_container, steel_thread_container,
+    };
     use crate::VmBuffers;
     use ironplc_container::ContainerBuilder;
+
+    #[test]
+    fn commit_pc_when_frame_stack_empty_then_call_stack_underflow() {
+        let mut frames: [Frame; 0] = [];
+        let mut frame_stack = FrameStack::new(&mut frames);
+
+        assert_eq!(
+            commit_pc(&mut frame_stack, 0),
+            Err(Trap::CallStackUnderflow)
+        );
+    }
+
+    #[test]
+    fn handle_frame_return_when_frame_stack_empty_then_call_stack_underflow() {
+        let mut frames: [Frame; 0] = [];
+        let mut frame_stack = FrameStack::new(&mut frames);
+        let mut temp_alloc = string_ops::TempBufAllocator::new(0);
+        let mut slots: [Slot; 0] = [];
+        let mut variables = VariableTable::new(&mut slots);
+
+        let result = handle_frame_return(
+            &mut temp_alloc,
+            &mut frame_stack,
+            &mut [],
+            &mut variables,
+            &mut NoopDebugHook,
+        );
+
+        assert_eq!(result, Err(Trap::CallStackUnderflow));
+    }
 
     #[test]
     fn vm_load_when_valid_container_then_returns_ready() {
@@ -3066,7 +3164,7 @@ mod tests {
     fn vm_run_round_when_steel_thread_then_x_is_10_y_is_42() {
         let c = steel_thread_container();
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         vm.run_round(0).unwrap();
 
@@ -3078,7 +3176,7 @@ mod tests {
     fn vm_run_round_when_invalid_opcode_then_trap() {
         let c = single_function_container(&[0xFF], 0, &[]);
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert_trap(&mut vm, Trap::InvalidInstruction(0xFF));
     }
@@ -3147,7 +3245,7 @@ mod tests {
             .build();
 
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
         assert_trap(&mut vm, Trap::StackOverflow);
     }
 
@@ -3156,7 +3254,7 @@ mod tests {
         // ADD_I32 tries to pop 2 values from an empty stack
         let c = single_function_container(&[0x20], 0, &[]);
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert_trap(&mut vm, Trap::StackUnderflow);
     }
@@ -3170,7 +3268,7 @@ mod tests {
         ];
         let c = single_function_container(&bytecode, 0, &[]);
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert_trap(&mut vm, Trap::InvalidConstantIndex(ConstantIndex::new(0)));
     }
@@ -3185,7 +3283,7 @@ mod tests {
         ];
         let c = single_function_container(&bytecode, 1, &[42]);
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert_trap(&mut vm, Trap::InvalidVariableIndex(VarIndex::new(5)));
     }
@@ -3199,7 +3297,7 @@ mod tests {
         ];
         let c = single_function_container(&bytecode, 1, &[]);
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert_trap(&mut vm, Trap::InvalidVariableIndex(VarIndex::new(5)));
     }
@@ -3243,7 +3341,7 @@ mod tests {
             .max_call_depth(2) // SCAN -> add (2 frames)
             .build();
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
         vm.run_round(0).unwrap();
 
         // result should be 3 + 7 = 10
@@ -3254,7 +3352,7 @@ mod tests {
     fn execute_when_empty_bytecode_then_ok() {
         let c = single_function_container(&[], 0, &[]);
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert!(vm.run_round(0).is_ok());
     }
@@ -3381,7 +3479,7 @@ mod tests {
             .max_call_depth(1)
             .build();
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         assert!(vm.run_round(0).is_ok());
     }
@@ -3401,7 +3499,7 @@ mod tests {
         // to the uptime globals -- the VM still knows the clock it ran with.
         let c = steel_thread_container();
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         vm.run_round(2_500_000).unwrap();
 
@@ -3412,7 +3510,7 @@ mod tests {
     fn uptime_when_round_advances_then_follows_the_clock() {
         let c = steel_thread_container();
         let mut b = VmBuffers::from_container(&c);
-        let mut vm = Vm::new().load(&c, &mut b).unwrap().start().unwrap();
+        let mut vm = load_and_start(&c, &mut b).unwrap();
 
         vm.run_round(1_000).unwrap();
         assert_eq!(vm.uptime(), Duration::from_millis(1));

@@ -20,8 +20,8 @@ use ironplc_dsl::common::{TypeName, VariableType};
 use ironplc_dsl::core::Id;
 
 use crate::function_environment::FunctionSignature;
-use crate::intermediate_type::IntermediateType;
 use crate::semantic_context::SemanticContext;
+use crate::semantic_type::SemanticType;
 use crate::symbol_environment::{ScopeKind, SymbolEnvironment, SymbolInfo, SymbolKind};
 use crate::type_attributes::TypeAttributes;
 
@@ -84,7 +84,6 @@ pub enum TypeSymbolKind {
     String,
     Reference,
     FunctionBlock,
-    Function,
     Alias,
 }
 
@@ -99,23 +98,21 @@ impl TypeSymbolKind {
             TypeSymbolKind::String => "string",
             TypeSymbolKind::Reference => "reference",
             TypeSymbolKind::FunctionBlock => "function_block",
-            TypeSymbolKind::Function => "function",
             TypeSymbolKind::Alias => "alias",
         }
     }
 }
 
-impl From<&IntermediateType> for TypeSymbolKind {
-    fn from(intermediate: &IntermediateType) -> Self {
-        match intermediate {
-            IntermediateType::Enumeration { .. } => TypeSymbolKind::Enumeration,
-            IntermediateType::Structure { .. } => TypeSymbolKind::Structure,
-            IntermediateType::Array { .. } => TypeSymbolKind::Array,
-            IntermediateType::Subrange { .. } => TypeSymbolKind::Subrange,
-            IntermediateType::String { .. } => TypeSymbolKind::String,
-            IntermediateType::Reference { .. } => TypeSymbolKind::Reference,
-            IntermediateType::FunctionBlock { .. } => TypeSymbolKind::FunctionBlock,
-            IntermediateType::Function { .. } => TypeSymbolKind::Function,
+impl From<&SemanticType> for TypeSymbolKind {
+    fn from(semantic_type: &SemanticType) -> Self {
+        match semantic_type {
+            SemanticType::Enumeration { .. } => TypeSymbolKind::Enumeration,
+            SemanticType::Structure { .. } => TypeSymbolKind::Structure,
+            SemanticType::Array { .. } => TypeSymbolKind::Array,
+            SemanticType::Subrange { .. } => TypeSymbolKind::Subrange,
+            SemanticType::String { .. } => TypeSymbolKind::String,
+            SemanticType::Reference { .. } => TypeSymbolKind::Reference,
+            SemanticType::FunctionBlock { .. } => TypeSymbolKind::FunctionBlock,
             _ => TypeSymbolKind::Alias,
         }
     }
@@ -181,7 +178,7 @@ impl<'a> FunctionSymbolView<'a> {
 /// A function parameter, augmented with its outline direction.
 #[derive(Debug, Clone, Copy)]
 pub struct ParameterView<'a> {
-    pub param: &'a crate::intermediate_type::IntermediateFunctionParameter,
+    pub param: &'a crate::semantic_type::SemanticFunctionParameter,
     pub direction: VariableDirection,
 }
 
@@ -209,6 +206,13 @@ impl SymbolEnvironment {
 }
 
 impl SemanticContext {
+    /// The name of the type the variable `info` describes was declared
+    /// with, or `None` when it has no name (a type spelled out in place,
+    /// such as an inline array) or the analyzer could not resolve it.
+    pub fn variable_type_name(&self, info: &SymbolInfo) -> Option<&TypeName> {
+        self.types().name_of(info.type_id?)
+    }
+
     /// All `PROGRAM` declarations in the global scope, with their
     /// variables resolved.
     pub fn programs(&self) -> Vec<ProgramSymbol<'_>> {
@@ -285,20 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn type_symbol_kind_from_intermediate_when_enumeration_then_enumeration() {
-        let kind = TypeSymbolKind::from(&IntermediateType::Enumeration {
-            underlying_type: Box::new(IntermediateType::Int {
-                size: crate::intermediate_type::ByteSized::B8,
-            }),
+    fn type_symbol_kind_from_semantic_type_when_enumeration_then_enumeration() {
+        let kind = TypeSymbolKind::from(&SemanticType::Enumeration {
+            members: crate::enumeration_members::EnumerationMembers::default(),
         });
         assert_eq!(kind, TypeSymbolKind::Enumeration);
     }
 
     #[test]
-    fn type_symbol_kind_from_intermediate_when_function_block_then_function_block() {
-        let kind = TypeSymbolKind::from(&IntermediateType::FunctionBlock {
+    fn type_symbol_kind_from_semantic_type_when_function_block_then_function_block() {
+        let kind = TypeSymbolKind::from(&SemanticType::FunctionBlock {
             name: "FB".to_string(),
-            fields: vec![],
         });
         assert_eq!(kind, TypeSymbolKind::FunctionBlock);
     }
@@ -396,6 +397,29 @@ mod tests {
     }
 
     #[test]
+    fn user_defined_types_when_alias_of_elementary_or_sized_string_then_returned() {
+        let ctx = analyze_source(
+            "TYPE\nMyBool : BOOL;\nMyInt : INT := 5;\nMyStr : STRING[10];\nEND_TYPE\nPROGRAM p\nEND_PROGRAM",
+        );
+        let types = ctx.user_defined_types();
+        let kind_of = |name: &str| {
+            types
+                .iter()
+                .find(|t| t.name == &TypeName::from(name))
+                .map(|t| t.kind)
+        };
+        assert_eq!(kind_of("MyBool"), Some(TypeSymbolKind::Alias));
+        assert_eq!(kind_of("MyInt"), Some(TypeSymbolKind::Alias));
+        assert_eq!(kind_of("MyStr"), Some(TypeSymbolKind::String));
+    }
+
+    #[test]
+    fn user_defined_types_excludes_elementary_types() {
+        let ctx = analyze_source("PROGRAM p\nEND_PROGRAM");
+        assert!(ctx.user_defined_types().is_empty());
+    }
+
+    #[test]
     fn user_defined_types_excludes_function_block_types() {
         let ctx = analyze_source(
             "FUNCTION_BLOCK fb\nEND_FUNCTION_BLOCK\nPROGRAM p\nVAR inst : fb; END_VAR\nEND_PROGRAM",
@@ -404,7 +428,7 @@ mod tests {
         let has_fb_type = types.iter().any(|t| {
             matches!(
                 t.attributes.representation,
-                IntermediateType::FunctionBlock { .. }
+                SemanticType::FunctionBlock { .. }
             )
         });
         assert!(

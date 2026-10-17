@@ -1,8 +1,7 @@
-use crate::{intermediate_type::IntermediateType, type_environment::TypeAttributes};
+use crate::{semantic_type::SemanticType, type_environment::TypeAttributes};
 
 use ironplc_container::CharWidth;
-use ironplc_dsl::common::{StringDeclaration, StringInitializer, StringType};
-use ironplc_dsl::core::Located;
+use ironplc_dsl::common::{StringDeclaration, StringInitializer, StringSpecification, StringType};
 
 /// Maps an IEC 61131-3 `StringType` to its per-code-unit byte width per
 /// ADR-0016: STRING is Latin-1 (1 byte), WSTRING is UTF-16LE (2 bytes).
@@ -15,26 +14,32 @@ fn char_width_for(width: &StringType) -> CharWidth {
 
 pub fn from(initializer: &StringInitializer) -> TypeAttributes {
     // String type with specific length: MY_STRING : STRING[10];
-    TypeAttributes::new(
-        initializer.span(),
-        IntermediateType::String {
-            max_len: initializer
-                .length
-                .as_ref()
-                .and_then(|len| len.as_integer().map(|i| i.value)),
-            char_width: char_width_for(&initializer.width),
-        },
-    )
+    TypeAttributes::new(SemanticType::String {
+        max_len: initializer
+            .length
+            .as_ref()
+            .and_then(|len| len.as_integer().map(|i| i.value)),
+        char_width: char_width_for(&initializer.width),
+    })
+}
+
+/// The string type `spec` spells as an array's element: `STRING[10]` of
+/// `ARRAY[1..3] OF STRING[10]`.
+pub fn from_spec(spec: &StringSpecification) -> TypeAttributes {
+    TypeAttributes::new(SemanticType::String {
+        max_len: spec
+            .length
+            .as_ref()
+            .and_then(|len| len.as_integer().map(|i| i.value)),
+        char_width: char_width_for(&spec.width),
+    })
 }
 
 pub fn from_decl(decl: &StringDeclaration) -> TypeAttributes {
-    TypeAttributes::new(
-        decl.type_name.span(),
-        IntermediateType::String {
-            max_len: decl.length.as_integer().map(|i| i.value),
-            char_width: char_width_for(&decl.width),
-        },
-    )
+    TypeAttributes::new(SemanticType::String {
+        max_len: decl.length.as_integer().map(|i| i.value),
+        char_width: char_width_for(&decl.width),
+    })
 }
 
 #[cfg(test)]
@@ -44,7 +49,7 @@ mod tests {
     use ironplc_parser::options::CompilerOptions;
 
     use crate::{
-        intermediate_type::IntermediateType, type_environment::TypeEnvironmentBuilder,
+        semantic_type::SemanticType, type_environment::TypeEnvironmentBuilder,
         xform_resolve_type_decl_environment::apply,
     };
 
@@ -67,7 +72,7 @@ END_TYPE
         let my_str_type = env.get(&TypeName::from("MY_STR")).unwrap();
         assert!(matches!(
             &my_str_type.representation,
-            IntermediateType::String {
+            SemanticType::String {
                 max_len: None,
                 char_width: CharWidth::Narrow,
             }
@@ -93,7 +98,7 @@ END_TYPE
         let my_wstr_type = env.get(&TypeName::from("MY_WSTR")).unwrap();
         assert!(matches!(
             &my_wstr_type.representation,
-            IntermediateType::String {
+            SemanticType::String {
                 max_len: Some(100),
                 char_width: CharWidth::Wide,
             }
@@ -120,7 +125,7 @@ END_TYPE
         let my_string_type = env.get(&TypeName::from("MY_STRING")).unwrap();
         assert!(matches!(
             &my_string_type.representation,
-            IntermediateType::String {
+            SemanticType::String {
                 max_len: Some(50),
                 char_width: CharWidth::Narrow,
             }

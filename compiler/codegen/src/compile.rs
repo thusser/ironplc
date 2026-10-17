@@ -29,7 +29,8 @@
 //!
 //! # Not yet supported
 //!
-//! - TODO: STRING[N] in VAR_IN_OUT (parsed, but runtime pass-by-reference not implemented)
+//! - TODO: VAR_IN_OUT of a non-elementary type such as STRING[N] (only
+//!   elementary types are passed by reference)
 //! - TODO: STRING[N] in STRUCT members (parsed, but struct compilation not implemented)
 //!
 //! # Integer type strategy: promote-operate-truncate
@@ -41,38 +42,34 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ironplc_container::debug_section::{
-    EnumDefEntry, FuncNameEntry, StringLayoutEntry, VarNameEntry,
-};
+use ironplc_container::debug_section::{FuncNameEntry, StringLayoutEntry, VarNameEntry};
 use ironplc_container::{
-    CharWidth, Container, ContainerBuilder, FbTypeId, FunctionId, TaskType, UserFbDescriptor,
-    VarIndex,
+    CharWidth, Container, ContainerBuilder, FbTypeId, FunctionId, UserFbDescriptor, VarIndex,
 };
 // The string data-region layout lives in `ironplc-container` so the analyzer
 // and codegen size strings the same way. Re-exported here because the rest of
 // codegen reaches for these through `compile`.
 pub(crate) use ironplc_container::{string_region_size, DEFAULT_STRING_MAX_LENGTH};
 use ironplc_dsl::common::{
-    FunctionBlockDeclaration, FunctionDeclaration, InitialValueAssignmentKind, Library,
-    LibraryElementKind, ProgramDeclaration, StringType, TypeName, VarDecl, VariableType,
+    FunctionBlockDeclaration, FunctionDeclaration, LibraryElementKind, ProgramDeclaration,
+    StringType, VarDecl, VariableType,
 };
-use ironplc_dsl::configuration::{
-    ConfigurationDeclaration, ProgramConfiguration, TaskConfiguration,
-};
-use ironplc_dsl::core::{FileId, Id, Located};
+use ironplc_dsl::core::{Id, Located};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
 use ironplc_parser::options::{CompilerOptions, StringToNumFailure, StringToNumNonNumeric};
-use ironplc_problems::Problem;
 
-use ironplc_analyzer::system_globals::SYSTEM_UPTIME_GLOBALS;
-use ironplc_analyzer::{FunctionEnvironment, SemanticContext, TypeEnvironment};
+use ironplc_analyzer::{
+    BuiltinFunction, CleanAnalysis, FunctionEnvironment, MethodOwners, SemanticType,
+    StandardFunctionBlock, TypeEnvironment,
+};
 
 use crate::emit::Emitter;
 
 use super::compile_fn::{compile_user_function, compile_user_function_block};
-use super::compile_setup::{assign_variables, emit_initial_values};
+use ironplc_ir::execution::SystemGlobal;
+
+use super::compile_setup::{assign_system_globals, assign_variables, emit_initial_values};
 use super::compile_stmt::compile_body;
-use super::type_info::resolve_type_name;
 
 /// The native operation width used for arithmetic and comparisons.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -110,6 +107,14 @@ pub(crate) type OpType = (OpWidth, Signedness);
 
 /// The default operation type: 32-bit signed (used for pure-constant expressions).
 pub(crate) const DEFAULT_OP_TYPE: OpType = (OpWidth::W32, Signedness::Signed);
+
+/// The type of a value of the default operation type, stored at its full
+/// width.
+pub(crate) const DEFAULT_VAR_TYPE_INFO: VarTypeInfo = VarTypeInfo {
+    op_width: OpWidth::W32,
+    signedness: Signedness::Signed,
+    storage_bits: 32,
+};
 
 /// Maximum number of data-region slots (or array elements) that a single variable
 /// may occupy. Keeps flat-index arithmetic within i32 range.
@@ -194,15 +199,6 @@ pub(crate) fn emit_string_literal_load(
     emitter.emit_load_const_str(pool_index);
 }
 
-/// Compiles a library into a bytecode container.
-///
-/// Finds the first PROGRAM declaration in the library and compiles it
-/// into a container suitable for execution by the VM. Only user-defined
-/// functions reachable from the program root are included; unreachable
-/// functions are automatically excluded.
-///
-/// Returns an error if no program is found or if the program contains
-/// unsupported constructs.
 /// Options that affect code generation.
 ///
 /// Every front end derives this from the project's [`CompilerOptions`] via
@@ -210,12 +206,12 @@ pub(crate) fn emit_string_literal_load(
 /// it has exactly one definition.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CodegenOptions {
-    /// When `true`, inject `__SYSTEM_UP_TIME` (TIME) and `__SYSTEM_UP_LTIME`
-    /// (LTIME) as implicit globals at the start of the variable table.
-    pub system_uptime_global: bool,
     /// The behavior policies `STRING_TO_<numeric>` calls are compiled under
     /// (ADR-0049). They select the builtin func_id the call emits.
     pub string_to_num: StringToNumPolicies,
+    /// Which route each statement is compiled by: from the AST, or from the
+    /// lowered program where lowering supports it.
+    pub route: crate::lowered::Route,
 }
 
 /// The two behavior policies of a `STRING_TO_<numeric>` conversion.
@@ -228,47 +224,55 @@ pub struct StringToNumPolicies {
 impl From<&CompilerOptions> for CodegenOptions {
     fn from(options: &CompilerOptions) -> Self {
         CodegenOptions {
-            system_uptime_global: options.allow_system_uptime_global,
             string_to_num: StringToNumPolicies {
                 non_numeric: options.policy_string_to_num_non_numeric,
                 failure: options.policy_string_to_num_failure,
             },
+            route: crate::lowered::Route::default(),
         }
     }
 }
 
+/// Compiles a library into a bytecode container.
+///
+/// Compiles the program instance the analyzer's execution model runs, under
+/// the task it binds it to, with the globals the model lists, into a
+/// container suitable for execution by the VM. Only user-defined functions
+/// reachable from the program root are included; unreachable functions are
+/// automatically excluded.
+///
+/// Takes a [`CleanAnalysis`], which can only be made from a semantic context
+/// that holds no diagnostics.
+///
+/// Returns an error if the model asks for more than the VM supports (see
+/// [`crate::execution`]), or if the program contains unsupported constructs.
 pub fn compile(
-    library: &Library,
-    context: &SemanticContext,
+    analysis: CleanAnalysis<'_>,
     options: &CodegenOptions,
     sources: &dyn crate::source_lookup::SourceLookup,
 ) -> Result<Container, Diagnostic> {
-    let program = find_program(library)?;
-    let config = find_configuration(library);
-    if let Some(config) = config {
-        check_single_program_instance(config)?;
-    }
-    let user_globals: &[VarDecl] = config.map(|c| c.global_var.as_slice()).unwrap_or(&[]);
+    compile_with_route_counts(analysis, options, sources).map(|(container, _)| container)
+}
 
-    // Prepend system uptime globals when the feature is enabled.
-    let mut synthetic_globals: Vec<VarDecl> = Vec::new();
-    if options.system_uptime_global {
-        for global in &SYSTEM_UPTIME_GLOBALS {
-            synthetic_globals.push(
-                VarDecl::simple(global.name, global.type_name).with_type(VariableType::Global),
-            );
-        }
-    }
-
-    // Collect top-level VAR_GLOBAL declarations (outside CONFIGURATION blocks).
-    for element in &library.elements {
-        if let LibraryElementKind::GlobalVarDeclarations(decls) = element {
-            synthetic_globals.extend_from_slice(decls);
-        }
-    }
-
-    synthetic_globals.extend_from_slice(user_globals);
-    let global_vars = &synthetic_globals;
+/// Compiles a library into a bytecode container, as [`compile`] does, and
+/// says how many top-level statements took each route.
+pub fn compile_with_route_counts(
+    analysis: CleanAnalysis<'_>,
+    options: &CodegenOptions,
+    sources: &dyn crate::source_lookup::SourceLookup,
+) -> Result<(Container, crate::lowered::RouteCounts), Diagnostic> {
+    // Lowering completes every initializer on a copy, and reads the program
+    // and globals from it; the analyzed library stays as written
+    // (specs/design/initial-values.md).
+    let completed = ironplc_analyzer::xform_resolve_initial_values::apply(
+        analysis.library().clone(),
+        analysis.context(),
+    );
+    let analysis = CleanAnalysis::new(&completed, analysis.context())
+        .map_err(|_| Diagnostic::internal_error())?;
+    let library = analysis.library();
+    let context = analysis.context();
+    let runnable = crate::execution::runnable(&analysis)?;
 
     let reachable = context.reachable();
 
@@ -300,272 +304,35 @@ pub fn compile(
         })
         .collect();
 
-    let enum_map = crate::compile_enum::build_enum_ordinal_map(library);
-
-    let mut container = compile_program_with_functions(
+    let method_owners = MethodOwners::of_library(library, context.types());
+    let parse = crate::lowered::parse_policy(&options.string_to_num);
+    let lowered_route = crate::lowered::LoweredRoute::new(options.route, || {
+        ironplc_lowering::Lowering::new(&analysis, parse)
+    });
+    let (mut container, counts) = compile_program_with_functions(
         ProgramInputs {
-            program,
+            program: runnable.program,
             func_decls: &func_decls,
             fb_decls: &fb_decls,
-            global_vars,
+            system_globals: &runnable.system_globals,
+            global_vars: &runnable.globals,
+            method_owners: &method_owners,
         },
         context.functions(),
         context.types(),
-        enum_map,
         options.string_to_num,
         *context.compiler_options(),
         sources,
+        lowered_route,
     )?;
 
-    if options.system_uptime_global {
+    if runnable.has_system_uptime {
         container.header.flags |= ironplc_container::FLAG_HAS_SYSTEM_UPTIME;
     }
 
-    if let Some(config) = config {
-        apply_task_configuration(&mut container, config, &program.name)?;
-    }
+    crate::execution::apply_task_schedule(&mut container, runnable.schedule);
 
-    Ok(container)
-}
-
-/// Applies the `TASK` that the configuration binds to the compiled program.
-///
-/// `ContainerBuilder` synthesizes a freewheeling task and a single program
-/// instance. The VM is single-instance in v1; [`find_program`] and
-/// [`check_single_program_instance`] reject a second `PROGRAM` or instance
-/// before this runs, so the table keeps that one task and one instance —
-/// only the task entry's scheduling fields change. A program with no
-/// `CONFIGURATION`, or one that no resource instantiates, or an instance
-/// declared without a `WITH` clause, keeps the synthesized freewheeling task.
-fn apply_task_configuration(
-    container: &mut Container,
-    config: &ConfigurationDeclaration,
-    program_name: &Id,
-) -> Result<(), Diagnostic> {
-    let Some(task) = find_bound_task(config, program_name) else {
-        return Ok(());
-    };
-
-    // The VM stubs event-triggered tasks out of `collect_ready_tasks`, so
-    // emitting one would produce a program whose task body never runs. Reject
-    // it rather than compile something that silently does nothing.
-    if task.single.is_some() {
-        return Err(Diagnostic::problem(
-            Problem::TaskSingleNotSupported,
-            Label::span(task.name.span(), "Task declares SINGLE"),
-        ));
-    }
-
-    let priority = u16::try_from(task.priority).map_err(|_| {
-        Diagnostic::problem(
-            Problem::TaskParameterOutOfRange,
-            Label::span(
-                task.name.span(),
-                format!(
-                    "Task declares PRIORITY := {}, which exceeds the maximum of {}",
-                    task.priority,
-                    u16::MAX
-                ),
-            ),
-        )
-    })?;
-
-    let interval_us = task_interval_us(task)?;
-
-    if let Some(entry) = container.task_table.tasks.first_mut() {
-        entry.priority = priority;
-        entry.interval_us = interval_us;
-        // A zero interval means "as fast as possible", which is what a
-        // freewheeling task already does. A cyclic task with `interval_us` of
-        // zero would instead be permanently overdue, inflating `overrun_count`
-        // on every round.
-        entry.task_type = if interval_us > 0 {
-            TaskType::Cyclic
-        } else {
-            TaskType::Freewheeling
-        };
-    }
-
-    Ok(())
-}
-
-/// Converts a task's `INTERVAL` to microseconds, or 0 when it declares none.
-fn task_interval_us(task: &TaskConfiguration) -> Result<u64, Diagnostic> {
-    let Some(interval) = &task.interval else {
-        return Ok(0);
-    };
-
-    let micros = interval.interval.whole_microseconds();
-    u64::try_from(micros).map_err(|_| {
-        Diagnostic::problem(
-            Problem::TaskParameterOutOfRange,
-            Label::span(
-                interval.span.clone(),
-                format!("Task declares an INTERVAL of {micros} microseconds"),
-            ),
-        )
-    })
-}
-
-/// Finds the `TASK` that `config` binds to the program type `program_name`.
-///
-/// `PROGRAM <instance> WITH <task> : <type>` names the program *type*, so the
-/// match is on `type_name`. Returns `None` when no resource instantiates the
-/// program or the instance has no `WITH` clause. A `WITH` naming a task that
-/// does not exist cannot reach here — the analyzer rejects it first (see
-/// `rule_program_task_definition_exists`).
-fn find_bound_task<'a>(
-    config: &'a ConfigurationDeclaration,
-    program_name: &Id,
-) -> Option<&'a TaskConfiguration> {
-    config.resource_decl.iter().find_map(|resource| {
-        let program = resource
-            .programs
-            .iter()
-            .find(|program| &program.type_name == program_name)?;
-        let task_name = program.task_name.as_ref()?;
-        resource.tasks.iter().find(|task| &task.name == task_name)
-    })
-}
-
-/// Finds the one PROGRAM declaration that the container runs.
-///
-/// The VM runs a single program instance, so a library with two or more
-/// `PROGRAM` declarations cannot be compiled faithfully. Keeping one of them
-/// silently is worse than refusing: which one survived depended on the
-/// analyzer's toposort order rather than on the source (issue #1588). Every
-/// declaration beyond the first is therefore reported as not yet implemented.
-fn find_program(library: &Library) -> Result<&ProgramDeclaration, Diagnostic> {
-    let mut programs: Vec<&ProgramDeclaration> = library
-        .elements
-        .iter()
-        .filter_map(|element| match element {
-            LibraryElementKind::ProgramDeclaration(program) => Some(program),
-            _ => None,
-        })
-        .collect();
-    sort_by_source_position(&mut programs, |program| &program.name);
-
-    match programs.as_slice() {
-        [] => Err(Diagnostic::problem(
-            Problem::NoProgramDeclaration,
-            Label::file(
-                FileId::default(),
-                "Source does not contain a PROGRAM declaration",
-            ),
-        )),
-        [program] => Ok(program),
-        _ => Err(multiple_programs_not_implemented(
-            "PROGRAM declaration",
-            &programs
-                .iter()
-                .map(|program| &program.name)
-                .collect::<Vec<_>>(),
-        )),
-    }
-}
-
-/// Rejects a configuration that instantiates more than one program.
-///
-/// `PROGRAM <instance> WITH <task> : <type>` lines are counted across every
-/// `RESOURCE` in the configuration. Two instances of the same program type
-/// are as unsupported as two different types: the VM has one variable table
-/// and one program instance, so the second instance would be dropped.
-fn check_single_program_instance(config: &ConfigurationDeclaration) -> Result<(), Diagnostic> {
-    let mut instances: Vec<&ProgramConfiguration> = config
-        .resource_decl
-        .iter()
-        .flat_map(|resource| resource.programs.iter())
-        .collect();
-    if instances.len() < 2 {
-        return Ok(());
-    }
-    sort_by_source_position(&mut instances, |instance| &instance.name);
-
-    Err(multiple_programs_not_implemented(
-        "program instance",
-        &instances
-            .iter()
-            .map(|instance| &instance.name)
-            .collect::<Vec<_>>(),
-    ))
-}
-
-/// Orders `items` by where their identifier appears in the source.
-///
-/// The analyzer's toposort reorders library elements, and for POUs with no
-/// dependency edges between them the order comes out reversed. Sorting by
-/// file and offset lets a diagnostic call a program "the second" in the sense
-/// the reader expects: the second one in the file.
-fn sort_by_source_position<T>(items: &mut [&T], id: impl Fn(&T) -> &Id) {
-    items.sort_by_key(|item| {
-        let span = &id(item).span;
-        (span.file_id.to_string(), span.start)
-    });
-}
-
-/// Builds the P9999 diagnostic for a second (or later) program.
-///
-/// `names` are in source order. The primary label sits on the second name,
-/// the first one the compiler cannot honour. The first name and any later
-/// ones get secondary labels so the diagnostic points at every program it is
-/// about, not only the one that tipped the count.
-fn multiple_programs_not_implemented(what: &str, names: &[&Id]) -> Diagnostic {
-    let Some(second) = names.get(1) else {
-        // Callers only get here with two or more names, so the first name,
-        // when there is one, is the best location for the violation.
-        return Diagnostic::internal_error_at(Label::span(
-            names.first().map(|name| name.span()).unwrap_or_default(),
-            format!("Fewer than two {what}s reported as too many"),
-        ));
-    };
-    let mut diagnostic = Diagnostic::not_implemented(Label::span(
-        second.span(),
-        format!(
-            "{} {what}; the compiler currently runs only one PROGRAM",
-            ordinal(2)
-        ),
-    ))
-    .with_help(
-        "Compile a single PROGRAM for now. Support for more than one PROGRAM is tracked in \
-         https://github.com/ironplc/ironplc/issues/1613",
-    );
-    for (index, name) in names.iter().enumerate() {
-        if index == 1 {
-            continue;
-        }
-        diagnostic = diagnostic.with_secondary(Label::span(
-            name.span(),
-            format!("{} {what}", ordinal(index + 1)),
-        ));
-    }
-    diagnostic
-}
-
-/// Formats a 1-based position as an English ordinal: `1st`, `2nd`, `3rd`, `11th`.
-fn ordinal(position: usize) -> String {
-    let suffix = if (11..=13).contains(&(position % 100)) {
-        "th"
-    } else {
-        match position % 10 {
-            1 => "st",
-            2 => "nd",
-            3 => "rd",
-            _ => "th",
-        }
-    };
-    format!("{position}{suffix}")
-}
-
-/// Finds the first CONFIGURATION declaration in the library, if any.
-fn find_configuration(library: &Library) -> Option<&ConfigurationDeclaration> {
-    library.elements.iter().find_map(|e| {
-        if let LibraryElementKind::ConfigurationDeclaration(config) = e {
-            Some(config)
-        } else {
-            None
-        }
-    })
+    Ok((container, counts))
 }
 
 /// Idempotently registers a POU's source file with the debug section's
@@ -674,9 +441,9 @@ pub(crate) fn finalize_function(
 ) -> Result<FinalizedFunction, Diagnostic> {
     let raw_line_map = emitter.take_line_map();
     let (optimized, offset_map) =
-        crate::optimize::optimize(emitter.unpatched_code(), &mut ctx.constants);
+        crate::optimize::optimize(emitter.unpatched_code()?, &mut ctx.constants);
     emitter.apply_optimized(optimized, &offset_map);
-    let bytecode = emitter.bytecode().to_vec();
+    let bytecode = emitter.bytecode()?.to_vec();
     let max_stack_depth = emitter.max_stack_depth();
     let max_temp_depth = emitter.max_temp_depth();
     let line_map =
@@ -696,7 +463,13 @@ struct ProgramInputs<'a> {
     program: &'a ProgramDeclaration,
     func_decls: &'a [&'a FunctionDeclaration],
     fb_decls: &'a [&'a FunctionBlockDeclaration],
+    /// The compiler-provided globals, which precede the declared ones.
+    system_globals: &'a [SystemGlobal],
+    /// The declared globals that get storage, in variable-table order.
     global_vars: &'a [VarDecl],
+    /// The block that declares each method callable on each block, as the
+    /// analyzer resolves it.
+    method_owners: &'a MethodOwners,
 }
 
 /// Compiles a PROGRAM and its user-defined functions into a container.
@@ -713,20 +486,27 @@ fn compile_program_with_functions(
     inputs: ProgramInputs<'_>,
     functions: &FunctionEnvironment,
     types: &TypeEnvironment,
-    enum_map: crate::compile_enum::EnumOrdinalMap,
     string_to_num: StringToNumPolicies,
     compiler_options: CompilerOptions,
     sources: &dyn crate::source_lookup::SourceLookup,
-) -> Result<Container, Diagnostic> {
+    lowered_route: Option<crate::lowered::LoweredRoute<'_>>,
+) -> Result<(Container, crate::lowered::RouteCounts), Diagnostic> {
     let ProgramInputs {
         program,
         func_decls,
         fb_decls,
+        system_globals,
         global_vars,
+        method_owners,
     } = inputs;
     let mut ctx = CompileContext::new();
-    ctx.enum_map = enum_map;
-    ctx.named_types = crate::type_info::named_type_infos(types);
+    ctx.lowered_route = lowered_route;
+    ctx.types = crate::type_info::type_representations(types);
+    ctx.block_members = crate::initial_value::block_members(types);
+    ctx.operand_names = crate::type_info::operand_names(types);
+    ctx.standard_blocks = crate::compile_call::standard_blocks_by_name(types);
+    ctx.builtin_functions = crate::compile_call::builtin_functions_by_name(functions);
+    ctx.method_owners = method_owners.clone();
     ctx.string_to_num = string_to_num;
     ctx.compiler_options = compiler_options;
     let mut builder = ContainerBuilder::new();
@@ -747,7 +527,9 @@ fn compile_program_with_functions(
         register_pou_source_file(&mut ctx, &fb.name.name.span.file_id, sources);
     }
 
-    // Assign global variable indices first (indices 0..G).
+    // Assign global variable indices first (indices 0..G), the
+    // compiler-provided globals before any other.
+    assign_system_globals(&mut ctx, system_globals, types)?;
     assign_variables(&mut ctx, &mut builder, global_vars, types)?;
     let num_globals = ctx.variables.len() as u16;
 
@@ -761,7 +543,7 @@ fn compile_program_with_functions(
     for (next_function_id, fb_decl) in (2_u16..).zip(fb_decls.iter()) {
         let fb_name = fb_decl.name.name.to_string().to_uppercase();
         let mut field_indices: HashMap<String, u8> = HashMap::new();
-        let mut field_op_types: HashMap<String, OpType> = HashMap::new();
+        let mut field_types: HashMap<String, VarTypeInfo> = HashMap::new();
         let mut field_decls_tmp: Vec<&VarDecl> = Vec::new();
 
         for decl in &fb_decl.variables {
@@ -783,15 +565,12 @@ fn compile_program_with_functions(
             if let Some(id) = decl.identifier.symbolic_id() {
                 let name = id.to_string().to_lowercase();
                 field_indices.insert(name.clone(), i as u8);
-                if let InitialValueAssignmentKind::Simple(simple) = &decl.initializer {
-                    if let Some(vti) = resolve_type_name(&simple.type_name.name) {
-                        field_op_types.insert(name, (vti.op_width, vti.signedness));
-                    } else {
-                        field_op_types.insert(name, DEFAULT_OP_TYPE);
-                    }
-                } else {
-                    field_op_types.insert(name, DEFAULT_OP_TYPE);
-                }
+                // A field is operated and stored at its declared type,
+                // whatever kind of declaration declares it: a subrange at its
+                // base type.
+                let field_type =
+                    crate::type_info::decl_type_info(&ctx, decl).unwrap_or(DEFAULT_VAR_TYPE_INFO);
+                field_types.insert(name, field_type);
             }
         }
 
@@ -805,7 +584,7 @@ fn compile_program_with_functions(
                 field_indices,
                 function_id: FunctionId::new(next_function_id),
                 var_offset: 0, // updated after program vars are assigned
-                field_op_types,
+                field_types,
                 methods: HashMap::new(),
             },
         );
@@ -824,23 +603,23 @@ fn compile_program_with_functions(
         let fb_name = fb_decl.name.name.to_string().to_uppercase();
         for method in &fb_decl.methods {
             let method_name = method.name.to_string().to_lowercase();
-            let mut param_names_in_order: Vec<String> = Vec::new();
-            let mut param_op_types: Vec<OpType> = Vec::new();
+            let mut params: Vec<UserMethodParam> = Vec::new();
             for decl in &method.variables {
                 if !decl.var_type.is_input_compatible() {
                     continue;
                 }
                 if let Some(id) = decl.identifier.symbolic_id() {
-                    param_names_in_order.push(id.to_string().to_lowercase());
+                    // A string's passing is known once the method is
+                    // compiled, which gives the string its storage.
+                    let passing = match decl.var_type {
+                        VariableType::InOut => ParamPassing::Reference,
+                        _ => ParamPassing::Value,
+                    };
+                    params.push(UserMethodParam {
+                        name: id.clone(),
+                        passing,
+                    });
                 }
-                let op_type = if let InitialValueAssignmentKind::Simple(simple) = &decl.initializer
-                {
-                    resolve_type_name(&simple.type_name.name)
-                        .map_or(DEFAULT_OP_TYPE, |vti| (vti.op_width, vti.signedness))
-                } else {
-                    DEFAULT_OP_TYPE
-                };
-                param_op_types.push(op_type);
             }
 
             let function_id = FunctionId::new(next_method_function_id);
@@ -852,11 +631,12 @@ fn compile_program_with_functions(
                     UserMethodInfo {
                         function_id,
                         param_var_off: 0, // updated once the method is compiled
-                        num_params: param_names_in_order.len() as u16,
-                        param_names_in_order,
-                        param_op_types,
+                        num_params: params.len() as u16,
+                        params,
                         has_return_value: method.return_type.is_some(),
                         max_stack_depth: 0, // updated once the method is compiled
+                        outputs: HashMap::new(), // set once the method is compiled
+                        string_outputs: HashMap::new(), // set once the method is compiled
                     },
                 );
             }
@@ -898,7 +678,6 @@ fn compile_program_with_functions(
             FunctionId::new(next_function_id),
             var_offset,
             &mut ctx,
-            functions,
             &mut builder,
             types,
             num_globals,
@@ -910,13 +689,19 @@ fn compile_program_with_functions(
     let mut compiled_methods: Vec<CompiledFunction> = Vec::new();
     for fb_decl in fb_decls {
         let fb_name = fb_decl.name.name.to_string().to_uppercase();
-        let fb_func_id = ctx.user_fb_types[&fb_name].function_id;
         let field_var_off = var_offset.raw();
 
         // Update the var_offset in the registered type info.
-        ctx.user_fb_types.get_mut(&fb_name).unwrap().var_offset = field_var_off;
+        let fb_type = ctx.user_fb_types.get_mut(&fb_name).ok_or_else(|| {
+            Diagnostic::internal_error_at(Label::span(
+                fb_decl.name.span(),
+                "Function block was not registered before its body was compiled",
+            ))
+        })?;
+        let fb_func_id = fb_type.function_id;
+        fb_type.var_offset = field_var_off;
 
-        let (compiled, saved_scope) = compile_user_function_block(
+        let (compiled, program_scope) = compile_user_function_block(
             fb_decl,
             fb_func_id,
             field_var_off,
@@ -938,19 +723,12 @@ fn compile_program_with_functions(
             field_var_off,
             &mut var_offset,
             &mut ctx,
-            &mut builder,
             types,
         )?;
         compiled_methods.extend(methods);
 
         // Now restore the program-level view for the next FB type.
-        ctx.variables = saved_scope.variables;
-        ctx.var_types = saved_scope.var_types;
-        ctx.string_vars = saved_scope.string_vars;
-        ctx.array_vars = saved_scope.array_vars;
-        ctx.struct_vars = saved_scope.struct_vars;
-        ctx.struct_array_vars = saved_scope.struct_array_vars;
-        ctx.fb_instances = saved_scope.fb_instances;
+        ctx.swap_scope(program_scope);
     }
 
     let total_variables = var_offset;
@@ -966,12 +744,14 @@ fn compile_program_with_functions(
     // emitted from inside the body records a call-graph edge.
     let mut scan_emitter = Emitter::new();
     ctx.current_function_id = Some(FunctionId::SCAN);
+    ctx.current_body = Some(CurrentBody::Pou(program.name.clone()));
     compile_body(
         &mut scan_emitter,
         &mut ctx,
         &program.body,
         &program.name.span(),
     )?;
+    ctx.current_body = None;
     ctx.current_function_id = None;
     scan_emitter.emit_ret_void();
 
@@ -1064,8 +844,12 @@ fn compile_program_with_functions(
         builder = add_line_map_entries(builder, compiled.function_id, &compiled.line_map);
     }
 
-    // Add user FB type descriptors to the container.
-    for fb_info in ctx.user_fb_types.values() {
+    // Add user FB type descriptors to the container, by type id: the map
+    // iterates in an order that differs between runs, and the same source
+    // must compile to the same bytes.
+    let mut user_fb_types: Vec<&UserFbTypeInfo> = ctx.user_fb_types.values().collect();
+    user_fb_types.sort_by_key(|fb_info| fb_info.type_id);
+    for fb_info in user_fb_types {
         builder = builder.add_user_fb_type(UserFbDescriptor {
             type_id: FbTypeId::new(fb_info.type_id),
             function_id: fb_info.function_id,
@@ -1161,11 +945,9 @@ fn compile_program_with_functions(
     for entry in ctx.debug_string_layouts {
         builder = builder.add_string_layout(entry);
     }
-    for (type_name, values) in &ctx.enum_map.definitions {
-        builder = builder.add_enum_def(EnumDefEntry {
-            type_name: type_name.clone(),
-            values: values.clone(),
-        });
+    // By type name, for the same reason as the user FB type descriptors.
+    for entry in crate::compile_enum::enum_definitions(types) {
+        builder = builder.add_enum_def(entry);
     }
 
     // Add constants to the pool.
@@ -1194,7 +976,12 @@ fn compile_program_with_functions(
     // `specs/design/bytecode-verifier-rules.md` for the rules it enforces.
     crate::stack_balance::verify_container(&container)?;
 
-    Ok(container)
+    let counts = ctx
+        .lowered_route
+        .as_ref()
+        .map(|route| route.counts)
+        .unwrap_or_default();
+    Ok((container, counts))
 }
 
 #[derive(Clone)]
@@ -1205,6 +992,24 @@ pub(crate) struct StringParamInfo {
     pub(crate) max_length: u16,
     /// Per-code-unit byte width: `Narrow` for STRING, `Wide` for WSTRING.
     pub(crate) char_width: CharWidth,
+}
+
+/// How a call site passes an argument to one input parameter
+/// (`VAR_INPUT`/`VAR_IN_OUT`) of a user-defined function or method.
+#[derive(Clone)]
+pub(crate) enum ParamPassing {
+    /// The argument's value is pushed onto the operand stack at its own
+    /// type, which the analyzer converted to the parameter's (ADR-0056), and
+    /// `CALL` stores it in the parameter's slot.
+    Value,
+    /// The argument is copied into the parameter's data region space before
+    /// `CALL` or `METHOD_CALL`, and a dummy value is pushed for the slot the
+    /// call pops.
+    String(StringParamInfo),
+    /// A `VAR_IN_OUT` argument: the variable's reference (its
+    /// variable-table index) is pushed, and the function reads and writes
+    /// the caller's variable through it.
+    Reference,
 }
 
 /// Metadata for a STRING/WSTRING return value in a user-defined function.
@@ -1230,11 +1035,8 @@ pub(crate) struct UserFunctionInfo {
     pub(crate) var_offset: VarIndex,
     /// Number of input parameters.
     pub(crate) num_params: u16,
-    /// OpTypes for each input parameter, in declaration order.
-    pub(crate) param_op_types: Vec<OpType>,
-    /// For each input parameter (in order), `Some(info)` if it is a STRING
-    /// parameter that needs copy-in at the call site, `None` for scalar params.
-    pub(crate) param_string_info: Vec<Option<StringParamInfo>>,
+    /// How the call site passes each input parameter, in declaration order.
+    pub(crate) params: Vec<ParamPassing>,
     /// If the function returns STRING/WSTRING, info about the return string
     /// in the data region. Used at call sites to initialize the return string
     /// header before CALL.
@@ -1246,27 +1048,18 @@ pub(crate) struct UserFunctionInfo {
     pub(crate) return_struct_desc_index: Option<u16>,
     /// Maximum stack depth used by this function's body.
     pub(crate) max_stack_depth: u16,
-}
-
-/// Snapshot of the program-level variable-mapping state, captured by
-/// `compile_user_function_block` before it repopulates `CompileContext`
-/// for a single FB type's own body (and, in the same scope, that type's
-/// methods -- OOP extension, ADR-0041 Phase 1). The caller restores from
-/// this once *both* the body and its methods have been compiled, since
-/// method bodies need the type's field mappings to still be visible in
-/// `ctx.variables` after the FB body compile returns.
-pub(crate) struct SavedFbScope {
-    pub(crate) variables: HashMap<Id, VarIndex>,
-    pub(crate) var_types: HashMap<Id, VarTypeInfo>,
-    pub(crate) string_vars: HashMap<Id, StringVarInfo>,
-    pub(crate) array_vars: HashMap<Id, crate::compile_array::ArrayVarInfo>,
-    pub(crate) struct_vars: HashMap<Id, crate::compile_struct::StructVarInfo>,
-    pub(crate) struct_array_vars: HashMap<Id, crate::compile_array_struct::StructArrayVarInfo>,
-    pub(crate) fb_instances: HashMap<Id, FbInstanceInfo>,
+    /// The slot of each `VAR_OUTPUT`, which a call reads its outputs from
+    /// after the function returns.
+    pub(crate) outputs: HashMap<Id, VarIndex>,
+    /// Where in the data region each `STRING` or `WSTRING` `VAR_OUTPUT`
+    /// is, which a call the lowered route compiles reads it from after the
+    /// function returns.
+    pub(crate) string_outputs: HashMap<Id, StringVarInfo>,
 }
 
 /// Tracks state during compilation of a single program.
 /// Metadata for a function block instance variable.
+#[derive(Clone)]
 pub(crate) struct FbInstanceInfo {
     /// Variable table index holding the data region offset.
     pub(crate) var_index: VarIndex,
@@ -1276,6 +1069,10 @@ pub(crate) struct FbInstanceInfo {
     pub(crate) data_offset: u32,
     /// Maps field name (lowercase) to field index.
     pub(crate) field_indices: HashMap<String, u8>,
+    /// Maps field name (lowercase) to its declared type: the operation type
+    /// a value stored in the field or read from it is compiled at, and the
+    /// width a store narrows it to.
+    pub(crate) field_types: HashMap<String, VarTypeInfo>,
 }
 
 /// Metadata for a compiled user-defined function block type.
@@ -1290,11 +1087,12 @@ pub(crate) struct UserFbTypeInfo {
     pub(crate) function_id: FunctionId,
     /// Variable table offset where the FB body's slots start.
     pub(crate) var_offset: u16,
-    /// Maps field name (lowercase) to its op type for codegen at call sites.
-    pub(crate) field_op_types: HashMap<String, OpType>,
+    /// Maps field name (lowercase) to its declared type, as
+    /// [`FbInstanceInfo::field_types`].
+    pub(crate) field_types: HashMap<String, VarTypeInfo>,
     /// Maps method name (lowercase) to compilation metadata (OOP
     /// extension, ADR-0041 Phase 1). Populated in two steps: `function_id`,
-    /// `num_params`, `param_op_types`, and `has_return_value` are known
+    /// `num_params`, `param_names_in_order`, and `has_return_value` are known
     /// from the AST alone and set during the pre-scan registration pass;
     /// `param_var_off` is set once the method body is actually compiled
     /// and its scratch region is known (mirrors `var_offset` above).
@@ -1317,27 +1115,59 @@ pub(crate) struct UserMethodInfo {
     pub(crate) param_var_off: u16,
     /// Number of VAR_INPUT/VAR_IN_OUT parameters, in declaration order.
     pub(crate) num_params: u16,
-    /// Parameter names (lowercase) and op types, in declaration order --
-    /// used to resolve both positional and named call-site arguments.
-    pub(crate) param_names_in_order: Vec<String>,
-    pub(crate) param_op_types: Vec<OpType>,
+    /// The VAR_INPUT/VAR_IN_OUT parameters, in declaration order: the order
+    /// a call's normal form names them in.
+    pub(crate) params: Vec<UserMethodParam>,
     pub(crate) has_return_value: bool,
     /// Max operand-stack depth used by the method body. `0` until the
     /// method is actually compiled; used for the scan function's
     /// worst-case stack accounting, same as `max_fb_body_stack`.
     pub(crate) max_stack_depth: u16,
+    /// The slot of each `VAR_OUTPUT`, which a call reads its outputs from
+    /// after the method returns. Empty until the method is compiled.
+    pub(crate) outputs: HashMap<Id, VarIndex>,
+    /// Where in the data region each `STRING` or `WSTRING` `VAR_OUTPUT`
+    /// is, which a call the lowered route compiles reads it from after the
+    /// method returns. Empty until the method is compiled.
+    pub(crate) string_outputs: HashMap<Id, StringVarInfo>,
 }
 
-pub(crate) struct CompileContext {
+/// A VAR_INPUT or VAR_IN_OUT parameter of a user-defined method.
+pub(crate) struct UserMethodParam {
+    pub(crate) name: Id,
+    /// How a call site passes the argument for it. A string parameter is
+    /// passed by value until the method is compiled, which gives it the run
+    /// of the data region a call copies its argument into.
+    pub(crate) passing: ParamPassing,
+}
+
+/// A body whose statements are being compiled.
+#[derive(Clone, Debug)]
+pub(crate) enum CurrentBody {
+    /// The body of the program, function block or function of this name.
+    Pou(Id),
+    /// The body of the method `method` of the function block `block`.
+    Method { block: Id, method: Id },
+}
+
+pub(crate) struct CompileContext<'a> {
+    /// The lowering asked for each top-level statement, when the route
+    /// compiles statements from the lowered program; `None` when every
+    /// statement is compiled from the AST.
+    pub(crate) lowered_route: Option<crate::lowered::LoweredRoute<'a>>,
+    /// The body being compiled, which lowering finds the statement's names
+    /// in; `None` outside a body.
+    pub(crate) current_body: Option<CurrentBody>,
     /// Maps variable identifiers to their variable table indices.
     pub(crate) variables: HashMap<Id, VarIndex>,
     /// Maps variable identifiers to their type information.
     pub(crate) var_types: HashMap<Id, VarTypeInfo>,
     /// Ordered list of constants added to the constant pool.
     pub(crate) constants: Vec<PoolConstant>,
-    /// Stack of loop exit labels for EXIT statement compilation.
-    /// Each enclosing loop pushes its end label; EXIT jumps to the top.
-    pub(crate) loop_exit_labels: Vec<crate::emit::Label>,
+    /// Stack of the labels of the enclosing loops, for EXIT and CONTINUE
+    /// statement compilation. Each loop pushes its labels; EXIT and CONTINUE
+    /// jump to those of the top.
+    pub(crate) loop_labels: Vec<crate::compile_loop::LoopLabels>,
     /// Maps STRING variable identifiers to their data region metadata.
     pub(crate) string_vars: HashMap<Id, StringVarInfo>,
     /// Maps FB instance variable identifiers to their metadata.
@@ -1349,11 +1179,25 @@ pub(crate) struct CompileContext {
     /// Maps top-level `ARRAY OF <struct>` variable identifiers to their metadata.
     /// Kept apart from `array_vars`, whose elements occupy a single slot each.
     pub(crate) struct_array_vars: HashMap<Id, crate::compile_array_struct::StructArrayVarInfo>,
-    /// Pre-computed ordinal mappings for named enumeration types.
-    pub(crate) enum_map: crate::compile_enum::EnumOrdinalMap,
-    /// Operand types of the user-defined types an expression can resolve
-    /// to by name. See [`crate::type_info::named_type_infos`].
-    pub(crate) named_types: HashMap<TypeName, VarTypeInfo>,
+    /// What every type is, by the id an expression's `expr_type` carries.
+    /// See [`crate::type_info::expr_type_info`].
+    pub(crate) types: HashMap<ironplc_dsl::type_id::TypeId, SemanticType>,
+    /// What an instance's value is read against: see
+    /// [`crate::initial_value::block_members`].
+    pub(crate) block_members: crate::initial_value::BlockMembers,
+    /// The name the arithmetic overloads know a value of each type by.
+    /// See [`crate::type_info::expr_operand_name`].
+    pub(crate) operand_names: HashMap<ironplc_dsl::type_id::TypeId, ironplc_dsl::common::TypeName>,
+    /// The operation each standard function stands for, by name, as the
+    /// analyzer's function environment states it. A call of a name that is
+    /// not here is a call of a user-defined function.
+    /// See [`crate::compile_call::builtin_functions_by_name`].
+    pub(crate) builtin_functions: HashMap<Id, BuiltinFunction>,
+    /// Which block declares the method a call reaches, by the block the
+    /// call's instance is declared as. The analyzer decides it
+    /// ([`MethodOwners`]); a method call asks it rather than looking the
+    /// method up itself.
+    pub(crate) method_owners: MethodOwners,
     /// The behavior policies `STRING_TO_<numeric>` calls select their
     /// builtin by (ADR-0049).
     pub(crate) string_to_num: StringToNumPolicies,
@@ -1380,6 +1224,8 @@ pub(crate) struct CompileContext {
     pub(crate) user_functions: HashMap<String, UserFunctionInfo>,
     /// Maps user-defined FB type name (uppercase) to compilation metadata.
     pub(crate) user_fb_types: HashMap<String, UserFbTypeInfo>,
+    /// Maps standard FB type name (uppercase) to the block it is.
+    pub(crate) standard_blocks: HashMap<String, StandardFunctionBlock>,
     /// Next available type ID for user-defined function blocks.
     next_user_fb_type_id: u16,
     /// When compiling a function body that returns a value, describes how an
@@ -1402,6 +1248,25 @@ pub(crate) struct CompileContext {
     ///
     /// [`record_call_edge`]: CompileContext::record_call_edge
     pub(crate) call_graph: HashMap<FunctionId, HashSet<FunctionId>>,
+    /// The `VAR_IN_OUT` parameters of the function being compiled. Each
+    /// one's slot holds a reference to the caller's variable (a
+    /// variable-table index, as `REF_TO` stores) rather than a value, so it
+    /// is reached through [`in_out_ref_slot`], never [`var_index`].
+    ///
+    /// [`in_out_ref_slot`]: CompileContext::in_out_ref_slot
+    /// [`var_index`]: CompileContext::var_index
+    pub(crate) in_out_params: HashSet<Id>,
+    /// Where the call whose outputs are being stored leaves them, for the
+    /// `CallOutput` each output stores; `None` outside a call's outputs.
+    pub(crate) call_outputs: Option<crate::compile_call_output::CallOutputs>,
+    /// The temporaries of the results the lowered calls with outputs being
+    /// emitted left on the stack, which a read of one takes instead of
+    /// loading it (`lowered/fn_call.rs`).
+    pub(crate) results_on_stack: Vec<ironplc_ir::lowered::VarId>,
+    /// The calls with a string result moved out of the lowered statement
+    /// being emitted, which a read of the temporary each writes its result
+    /// to emits (`lowered/string_result.rs`).
+    pub(crate) string_results: crate::lowered::StringResults,
 }
 
 /// Describes how a `RETURN` statement should yield the function's value.
@@ -1417,18 +1282,21 @@ pub(crate) enum CurrentFunctionReturn {
     String { data_offset: u32 },
 }
 
-impl CompileContext {
+impl CompileContext<'_> {
     pub(crate) fn new() -> Self {
         CompileContext {
+            lowered_route: None,
+            current_body: None,
             variables: HashMap::new(),
             var_types: HashMap::new(),
             constants: Vec::new(),
-            loop_exit_labels: Vec::new(),
+            loop_labels: Vec::new(),
             string_vars: HashMap::new(),
             fb_instances: HashMap::new(),
             array_vars: HashMap::new(),
             struct_vars: HashMap::new(),
             struct_array_vars: HashMap::new(),
+            in_out_params: HashSet::new(),
             data_region_offset: 0,
             max_string_capacity: 0,
             has_wide_string: false,
@@ -1437,20 +1305,36 @@ impl CompileContext {
             debug_source_files: crate::source_lookup::SourceFileRegistry::new(),
             user_functions: HashMap::new(),
             user_fb_types: HashMap::new(),
+            standard_blocks: HashMap::new(),
             next_user_fb_type_id: 0x1000,
-            enum_map: crate::compile_enum::EnumOrdinalMap::default(),
-            named_types: HashMap::new(),
+            types: HashMap::new(),
+            block_members: HashMap::new(),
+            operand_names: HashMap::new(),
+            builtin_functions: HashMap::new(),
+            method_owners: MethodOwners::default(),
             string_to_num: StringToNumPolicies::default(),
             compiler_options: CompilerOptions::default(),
             current_function_return: None,
             current_function_id: None,
             call_graph: HashMap::new(),
+            call_outputs: None,
+            results_on_stack: Vec::new(),
+            string_results: crate::lowered::StringResults::default(),
         }
     }
 
     /// Returns the exit label for the innermost enclosing loop, if any.
     pub(crate) fn current_loop_exit(&self) -> Option<crate::emit::Label> {
-        self.loop_exit_labels.last().copied()
+        self.loop_labels.last().map(|labels| labels.exit)
+    }
+
+    /// Returns the label where the innermost enclosing loop goes on with its
+    /// next iteration, if any, and records that it is used.
+    pub(crate) fn current_loop_next(&mut self) -> Option<crate::emit::Label> {
+        self.loop_labels.last_mut().map(|labels| {
+            labels.next_used = true;
+            labels.next
+        })
     }
 
     /// Records a static call-graph edge from the function whose body is
@@ -1466,14 +1350,42 @@ impl CompileContext {
     }
 
     /// Looks up a variable index by identifier, using the provided span for error reporting.
+    ///
+    /// A `VAR_IN_OUT` parameter's slot holds a reference, not the value, so
+    /// loading or storing it directly would be wrong. Sites that handle one
+    /// ask [`Self::in_out_ref_slot`] first; every other site reaches here
+    /// and is refused.
+    ///
+    /// A name with no slot is not an undeclared variable: analysis reports
+    /// that first (`rule_use_declared_symbolic_var`, P4007). It is one
+    /// analysis accepts and codegen does not yet give storage to, such as a
+    /// variable inherited through `EXTENDS` or a `RESOURCE`'s `VAR_GLOBAL`, so
+    /// it is reported as not implemented rather than as a mistake in the
+    /// program.
     pub(crate) fn var_index(&self, name: &Id) -> Result<VarIndex, Diagnostic> {
+        if self.in_out_params.contains(name) {
+            return Err(Diagnostic::not_implemented(Label::span(
+                name.span(),
+                "VAR_IN_OUT parameter used where only a local or global variable is supported",
+            )));
+        }
         self.variables.get(name).copied().ok_or_else(|| {
-            Diagnostic::problem(
-                Problem::VariableUndefined,
-                Label::span(name.span(), "Variable reference"),
-            )
+            Diagnostic::not_implemented(Label::span(
+                name.span(),
+                "Variable that code generation does not yet give storage to",
+            ))
             .with_context("variable", &name.to_string())
         })
+    }
+
+    /// Returns the slot holding the reference when `name` is a `VAR_IN_OUT`
+    /// parameter of the function being compiled, or `None` for any other
+    /// variable.
+    pub(crate) fn in_out_ref_slot(&self, name: &Id) -> Option<VarIndex> {
+        if !self.in_out_params.contains(name) {
+            return None;
+        }
+        self.variables.get(name).copied()
     }
 
     /// Looks up type information for a variable by identifier.
@@ -1584,6 +1496,7 @@ impl CompileContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironplc_dsl::common::Library;
     use ironplc_dsl::core::FileId;
     use ironplc_parser::options::CompilerOptions;
     use ironplc_parser::parse_program;
@@ -1592,14 +1505,13 @@ mod tests {
 
     /// Helper to parse and analyze an IEC 61131-3 program string into a Library.
     ///
-    /// Runs the analyzer's type resolution pass so that `Expr.resolved_type` is
+    /// Runs the analyzer's type resolution pass so that `Expr.expr_type` is
     /// populated, which codegen requires for control flow and bitwise operations.
     fn parse(source: &str) -> (Library, SemanticContext) {
         let library =
             parse_program(source, &FileId::default(), &CompilerOptions::default()).unwrap();
         let (analyzed, ctx) =
-            ironplc_analyzer::stages::resolve_types(&[&library], &CompilerOptions::default())
-                .unwrap();
+            ironplc_analyzer::stages::analyze(&[&library], &CompilerOptions::default()).unwrap();
         (analyzed, ctx)
     }
 
@@ -1640,8 +1552,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -1673,171 +1584,6 @@ END_PROGRAM
     }
 
     #[test]
-    fn compile_when_no_program_then_p4020_error() {
-        let source = "
-FUNCTION_BLOCK MyBlock
-  VAR
-    x : INT;
-  END_VAR
-END_FUNCTION_BLOCK
-";
-        let (library, context) = parse(source);
-        let result = compile(
-            &library,
-            &context,
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        );
-
-        assert!(result.is_err());
-        let diagnostic = result.unwrap_err();
-        assert_eq!(diagnostic.code, Problem::NoProgramDeclaration.code());
-    }
-
-    /// Builds a program whose CONFIGURATION declares one task with the given
-    /// initialization parameters and binds the program to it.
-    fn program_with_task(task_init: &str) -> String {
-        format!(
-            "
-PROGRAM main
-  VAR
-    x : INT;
-  END_VAR
-  x := 1;
-END_PROGRAM
-
-CONFIGURATION config
-  RESOURCE resource1 ON PLC
-    TASK task1({task_init});
-    PROGRAM instance1 WITH task1 : main;
-  END_RESOURCE
-END_CONFIGURATION
-"
-        )
-    }
-
-    fn compile_source(source: &str) -> Result<Container, Diagnostic> {
-        let (library, context) = parse(source);
-        compile(
-            &library,
-            &context,
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-    }
-
-    #[test]
-    fn compile_when_task_has_interval_then_cyclic_task_with_interval_us() {
-        let source = program_with_task("INTERVAL := T#100ms, PRIORITY := 3");
-        let container = compile_source(&source).unwrap();
-
-        let task = &container.task_table.tasks[0];
-        assert_eq!(task.task_type, TaskType::Cyclic);
-        assert_eq!(task.interval_us, 100_000);
-        assert_eq!(task.priority, 3);
-    }
-
-    #[test]
-    fn compile_when_task_interval_is_sub_millisecond_then_interval_us_keeps_precision() {
-        let source = program_with_task("INTERVAL := T#0.5ms, PRIORITY := 0");
-        let container = compile_source(&source).unwrap();
-
-        assert_eq!(container.task_table.tasks[0].interval_us, 500);
-    }
-
-    #[test]
-    fn compile_when_no_configuration_then_freewheeling_task() {
-        let source = "
-PROGRAM main
-  VAR
-    x : INT;
-  END_VAR
-  x := 1;
-END_PROGRAM
-";
-        let container = compile_source(source).unwrap();
-
-        let task = &container.task_table.tasks[0];
-        assert_eq!(task.task_type, TaskType::Freewheeling);
-        assert_eq!(task.interval_us, 0);
-    }
-
-    #[test]
-    fn compile_when_program_instance_has_no_task_then_freewheeling_task() {
-        let source = "
-PROGRAM main
-  VAR
-    x : INT;
-  END_VAR
-  x := 1;
-END_PROGRAM
-
-CONFIGURATION config
-  RESOURCE resource1 ON PLC
-    TASK task1(INTERVAL := T#100ms, PRIORITY := 1);
-    PROGRAM instance1 : main;
-  END_RESOURCE
-END_CONFIGURATION
-";
-        let container = compile_source(source).unwrap();
-
-        let task = &container.task_table.tasks[0];
-        assert_eq!(task.task_type, TaskType::Freewheeling);
-        assert_eq!(task.interval_us, 0);
-    }
-
-    #[test]
-    fn compile_when_task_interval_is_zero_then_freewheeling_task() {
-        let source = program_with_task("INTERVAL := T#0ms, PRIORITY := 1");
-        let container = compile_source(&source).unwrap();
-
-        let task = &container.task_table.tasks[0];
-        assert_eq!(task.task_type, TaskType::Freewheeling);
-        assert_eq!(task.interval_us, 0);
-    }
-
-    #[test]
-    fn compile_when_task_has_single_then_p4047_error() {
-        let source = "
-PROGRAM main
-  VAR
-    x : INT;
-  END_VAR
-  x := 1;
-END_PROGRAM
-
-CONFIGURATION config
-  VAR_GLOBAL
-    Trigger : BOOL;
-  END_VAR
-  RESOURCE resource1 ON PLC
-    TASK task1(SINGLE := Trigger, PRIORITY := 1);
-    PROGRAM instance1 WITH task1 : main;
-  END_RESOURCE
-END_CONFIGURATION
-";
-        let result = compile_source(source);
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().code,
-            Problem::TaskSingleNotSupported.code()
-        );
-    }
-
-    #[test]
-    fn compile_when_task_priority_exceeds_u16_then_p4048_error() {
-        let source = program_with_task("INTERVAL := T#100ms, PRIORITY := 100000");
-        let result = compile_source(&source);
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().code,
-            Problem::TaskParameterOutOfRange.code()
-        );
-    }
-
-    #[test]
     fn compile_when_empty_program_then_produces_ret_void() {
         let source = "
 PROGRAM main
@@ -1848,8 +1594,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -1883,8 +1628,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -1908,8 +1652,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -1951,8 +1694,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -1988,37 +1730,12 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let result = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         );
 
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn compile_when_exit_outside_loop_then_p4021_error() {
-        let source = "
-PROGRAM main
-  VAR
-    x : DINT;
-  END_VAR
-  x := 1;
-  EXIT;
-END_PROGRAM
-";
-        let (library, context) = parse(source);
-        let result = compile(
-            &library,
-            &context,
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        );
-
-        assert!(result.is_err());
-        let diagnostic = result.unwrap_err();
-        assert_eq!(diagnostic.code, Problem::ExitOutsideLoop.code());
     }
 
     #[test]
@@ -2036,8 +1753,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let result = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         );
@@ -2054,13 +1770,12 @@ PROGRAM main
   VAR
     x : BYTE;
   END_VAR
-  x := 42;
+  x := BYTE#42;
 END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -2088,8 +1803,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )
@@ -2123,8 +1837,7 @@ END_PROGRAM
 ";
         let (library, context) = parse(source);
         let container = compile(
-            &library,
-            &context,
+            CleanAnalysis::new(&library, &context).unwrap(),
             &CodegenOptions::default(),
             &crate::EmptyLookup,
         )

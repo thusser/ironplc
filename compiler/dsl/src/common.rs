@@ -11,7 +11,6 @@ use dsl_macro_derive::{Located, Recurse};
 
 use crate::configuration::{ConfigurationDeclaration, Direction};
 use crate::core::{Id, Located, SourceSpan};
-use crate::extension::LanguageExtension;
 use crate::fold::Fold;
 use crate::scope::ScopeBearing;
 use crate::sfc::{Network, Sfc};
@@ -19,6 +18,8 @@ use crate::textual::*;
 use crate::time::*;
 use crate::type_id::TypeId;
 use crate::visitor::Visitor;
+
+pub use crate::oop::*;
 
 /// Container for elementary constants.
 ///
@@ -119,7 +120,9 @@ impl fmt::Display for ConstantKind {
             ConstantKind::RealLiteral(lit) => write!(f, "{}", lit.value),
             ConstantKind::Boolean(lit) => write!(f, "{}", lit.value),
             ConstantKind::CharacterString(lit) => {
-                write!(f, "'{}'", lit.value.iter().collect::<String>())
+                let delimiter = lit.width.delimiter();
+                let text = crate::string_escape::encode(&lit.value, &lit.width);
+                write!(f, "{delimiter}{text}{delimiter}")
             }
             ConstantKind::Duration(lit) => write!(f, "{:?}", lit),
             ConstantKind::TimeOfDay(lit) => write!(f, "{:?}", lit),
@@ -1407,6 +1410,23 @@ pub enum DataTypeDeclarationKind {
     LateBound(LateBoundDeclaration),
 }
 
+impl DataTypeDeclarationKind {
+    /// The name the declaration declares.
+    pub fn type_name(&self) -> &TypeName {
+        match self {
+            DataTypeDeclarationKind::Enumeration(decl) => &decl.type_name,
+            DataTypeDeclarationKind::Subrange(decl) => &decl.type_name,
+            DataTypeDeclarationKind::Simple(decl) => &decl.type_name,
+            DataTypeDeclarationKind::Array(decl) => &decl.type_name,
+            DataTypeDeclarationKind::Structure(decl) => &decl.type_name,
+            DataTypeDeclarationKind::StructureInitialization(decl) => &decl.type_name,
+            DataTypeDeclarationKind::String(decl) => &decl.type_name,
+            DataTypeDeclarationKind::Reference(decl) => &decl.type_name,
+            DataTypeDeclarationKind::LateBound(decl) => &decl.data_type_name,
+        }
+    }
+}
+
 /// Type declarations that are indistinguishable as parsing time.
 /// These are one of the following without an initial value:
 /// * enumeration
@@ -1506,10 +1526,9 @@ pub struct EnumerationDeclaration {
 pub struct EnumeratedSpecificationInit {
     pub spec: EnumeratedSpecificationKind,
     pub default: Option<EnumeratedValue>,
-    /// Present for the CODESYS/TwinCAT base-type suffix (`(A, B) BYTE;`)
-    /// -- overrides the automatic count/value-based sizing in
-    /// `enumeration.rs`'s `try_from_values`. `None` uses the existing
-    /// automatic sizing.
+    /// Present for the CODESYS/TwinCAT base-type suffix (`(A, B) BYTE;`).
+    /// It is accepted behind `--allow-enum-base-type` and has no other
+    /// effect: every enumeration is stored as a `DINT`.
     #[recurse(ignore)]
     pub underlying_type: Option<ElementaryTypeName>,
 }
@@ -1708,6 +1727,13 @@ pub enum ArrayInitialElementKind {
     Constant(ConstantKind),
     EnumValue(EnumeratedValue),
     Repeated(Repeated),
+    /// The fields of an element that is a structure or function block
+    /// instance. Only the analyzer makes one, when it completes an
+    /// initializer (see `xform_resolve_initial_values`).
+    Structure(Vec<StructureElementInit>),
+    /// An element that is not a literal: `NULL`, or a reference to a
+    /// variable. Only the analyzer makes one.
+    Expression(Expr),
 }
 
 impl ArrayInitialElementKind {
@@ -2055,6 +2081,12 @@ pub struct VarDecl {
     /// derived from `initializer`.
     #[recurse(ignore)]
     pub type_id: Option<TypeId>,
+    /// Whether the variable starts again at its initial value every time
+    /// its POU is called -- a function's or method's `VAR`, `VAR_TEMP` and
+    /// result -- rather than once, when the program starts. Set by the
+    /// analyzer and left out of `PartialEq` like `type_id`.
+    #[recurse(ignore)]
+    pub reset_on_call: bool,
 }
 
 impl PartialEq for VarDecl {
@@ -2079,6 +2111,7 @@ impl VarDecl {
             )),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2095,6 +2128,7 @@ impl VarDecl {
             }),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2113,6 +2147,7 @@ impl VarDecl {
             ),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2131,6 +2166,7 @@ impl VarDecl {
             }),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2153,6 +2189,7 @@ impl VarDecl {
             ),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2171,6 +2208,7 @@ impl VarDecl {
             ),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2188,6 +2226,7 @@ impl VarDecl {
             ),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2206,6 +2245,7 @@ impl VarDecl {
             ),
             block: next_block_id(),
             type_id: None,
+            reset_on_call: false,
         }
     }
 
@@ -2563,7 +2603,7 @@ pub enum InitialValueAssignmentKind {
     /// `init` sets the instance's own member values -- see
     /// [`FunctionBlockCallInitializer`].
     FunctionBlockCall(FunctionBlockCallInitializer),
-    Subrange(SubrangeSpecificationKind),
+    Subrange(SubrangeInitialValueAssignment),
     Structure(StructureInitializationDeclaration),
     Array(ArrayInitialValueAssignment),
     /// Reference type initializer (REF_TO).
@@ -2637,12 +2677,10 @@ impl InitialValueAssignmentKind {
             InitialValueAssignmentKind::FunctionBlockCall(function_block_call_initializer) => {
                 TypeReference::Named(function_block_call_initializer.type_name.clone())
             }
-            InitialValueAssignmentKind::Subrange(subrange_specification_kind) => {
-                match subrange_specification_kind {
-                    SpecificationKind::Inline(_subrange_specification) => TypeReference::Inline,
-                    SpecificationKind::Named(type_name) => TypeReference::Named(type_name.clone()),
-                }
-            }
+            InitialValueAssignmentKind::Subrange(subrange) => match &subrange.spec {
+                SpecificationKind::Inline(_subrange_specification) => TypeReference::Inline,
+                SpecificationKind::Named(type_name) => TypeReference::Named(type_name.clone()),
+            },
             InitialValueAssignmentKind::Structure(structure_initialization_declaration) => {
                 TypeReference::Named(structure_initialization_declaration.type_name.clone())
             }
@@ -2676,10 +2714,10 @@ impl InitialValueAssignmentKind {
             InitialValueAssignmentKind::Array(arr) => !arr.initial_values.is_empty(),
             InitialValueAssignmentKind::Structure(st) => !st.elements_init.is_empty(),
             InitialValueAssignmentKind::Reference(re) => re.initial_value.is_some(),
+            InitialValueAssignmentKind::Subrange(sr) => sr.initial_value.is_some(),
             InitialValueAssignmentKind::None(_)
             | InitialValueAssignmentKind::FunctionBlock(_)
             | InitialValueAssignmentKind::FunctionBlockCall(_)
-            | InitialValueAssignmentKind::Subrange(_)
             | InitialValueAssignmentKind::LateResolvedType(_)
             | InitialValueAssignmentKind::SimpleExpr(_) => false,
         }
@@ -2891,6 +2929,28 @@ pub struct ArrayInitialValueAssignment {
     pub initial_values: Vec<ArrayInitialElementKind>,
 }
 
+/// A variable or field declared with a subrange type, named or inline
+/// (`x : INT (0..15) := 3`).
+///
+/// See section 2.4.3.2 (`subrange_spec_init`).
+#[derive(Clone, PartialEq, Debug, Recurse)]
+pub struct SubrangeInitialValueAssignment {
+    pub spec: SubrangeSpecificationKind,
+    /// The value written after `:=`, if any. Without one, the variable
+    /// starts at the lower bound of the range.
+    pub initial_value: Option<SignedInteger>,
+}
+
+impl SubrangeInitialValueAssignment {
+    /// A subrange initializer with no initial value.
+    pub fn bare(spec: SubrangeSpecificationKind) -> Self {
+        Self {
+            spec,
+            initial_value: None,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Recurse)]
 pub enum VariableSpecificationKind {
     Simple(TypeName),
@@ -2990,6 +3050,33 @@ pub struct FunctionDeclaration {
     pub variables: Vec<VarDecl>,
     pub edge_variables: Vec<EdgeVarDecl>,
     pub body: Vec<StmtKind>,
+    /// The variable that holds the result (see [`ResultVariable`]).
+    #[recurse(ignore)]
+    pub result: ResultVariable,
+}
+
+/// The variable that holds a function's or method's result.
+///
+/// The source declares it only by naming the POU and its return type, so
+/// the parser leaves it empty. The analyzer makes it, with the value it
+/// starts with, so that a back end initializes the result as it does any
+/// other variable. Traversals do not visit it: it is not a declaration the
+/// program wrote. It takes no part in comparing declarations, so
+/// `PartialEq` is always true, as for `VarDecl::type_id`.
+#[derive(Clone, Debug, Default)]
+pub struct ResultVariable(pub Option<Box<VarDecl>>);
+
+impl ResultVariable {
+    /// The result variable, once the analyzer has made it.
+    pub fn variable(&self) -> Option<&VarDecl> {
+        self.0.as_deref()
+    }
+}
+
+impl PartialEq for ResultVariable {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 impl HasVariables for FunctionDeclaration {
@@ -3019,8 +3106,8 @@ pub struct FunctionBlockDeclaration {
     /// `None` for an ordinary function block — the common case — so OOP is
     /// unrepresentable on a plain FB rather than "present but empty."
     /// `Some` only when the source actually uses `EXTENDS`, `IMPLEMENTS`,
-    /// or `ABSTRACT`. See `FunctionBlockOop` for why the facet is its own
-    /// struct and why `base` is an `Option` where
+    /// or a qualifier such as `ABSTRACT`. See `FunctionBlockOop` for why
+    /// the facet is its own struct and why `base` is an `Option` where
     /// `InterfaceDeclaration::extends` is a `Vec`, and the
     /// `LanguageExtension` impl on it for why only the facet, and not the
     /// whole declaration, is an extension.
@@ -3031,136 +3118,15 @@ pub struct FunctionBlockDeclaration {
     /// nesting under `FunctionBlockOop` (a plain FB can declare methods
     /// without using `EXTENDS`/`IMPLEMENTS`/`ABSTRACT`). See ADR-0041.
     pub methods: Vec<MethodDeclaration>,
-}
-
-/// `METHOD name (: return_type)? ... END_METHOD` (OOP extension).
-///
-/// Declared on a `FunctionBlockDeclaration`. Shaped like a
-/// `FunctionDeclaration`, except `return_type` is optional: unlike a
-/// function, a method with no return type is valid IEC 61131-3 and acts
-/// like a procedure (see `FunctionSignature::return_type` in
-/// `ironplc-analyzer` for the same modeling choice on the resolved side).
-///
-/// See ADR-0041 ("Staged Method/Property Dispatch and Interface Values"),
-/// Phase 1: static dispatch. Resolution of calls against this declaration
-/// (own methods first, then the `EXTENDS` chain) is implemented outside
-/// the AST, in `ironplc-analyzer`.
-#[derive(Clone, Debug, PartialEq, Recurse, Located)]
-#[recurse(scope)]
-pub struct MethodDeclaration {
-    pub name: Id,
-    pub return_type: Option<FunctionReturnType>,
-    pub variables: Vec<VarDecl>,
-    /// `R_EDGE`/`F_EDGE`-qualified `VAR` declarations (IEC 61131-3
-    /// §2.4.3). Not a TwinCAT-specific or OOP-specific capability: the
-    /// parser's `method_declaration()` rule reuses the exact same
-    /// standard variable-declaration grammar (`io_var_declarations()`/
-    /// `other_var_declarations()`) that `FunctionDeclaration` and
-    /// `FunctionBlockDeclaration` already use, so edge variables are
-    /// inherited for free, the same way a `VAR` block full stop is.
-    pub edge_variables: Vec<EdgeVarDecl>,
-    pub body: Vec<StmtKind>,
-    #[located(position)]
-    pub span: SourceSpan,
-}
-
-impl HasVariables for MethodDeclaration {
-    fn variables(&self) -> &Vec<VarDecl> {
-        &self.variables
-    }
+    /// `PROPERTY` declarations (OOP extension), kept apart from `methods`:
+    /// their accessors are methods, but they are reached through the
+    /// property, not by a method call. See [`PropertyDeclaration`].
+    pub properties: Vec<PropertyDeclaration>,
 }
 
 impl HasVariables for FunctionBlockDeclaration {
     fn variables(&self) -> &Vec<VarDecl> {
         &self.variables
-    }
-}
-
-/// The object-oriented facet of a function block: the
-/// `EXTENDS`/`IMPLEMENTS`/`ABSTRACT` header. Present only when the function
-/// block participates in OOP, so an ordinary function block cannot carry
-/// any of this data. Single home for OOP metadata and the natural hook for
-/// ADR-0041 Phase 2: "does this FB participate in polymorphism" is
-/// `oop.is_some()`, not a scan of individual fields.
-#[derive(Clone, Debug, PartialEq, Recurse)]
-pub struct FunctionBlockOop {
-    /// `EXTENDS base` — the single base function block, if any.
-    ///
-    /// Function blocks are single-inheritance (IEC 61131-3 and
-    /// CODESYS/TwinCAT alike), so this is `Option`, not a list. Named
-    /// `base` rather than `extends` so the single-base cardinality isn't
-    /// hidden behind a name shared with `InterfaceDeclaration::extends`,
-    /// which *is* a list.
-    pub base: Option<TypeName>,
-    /// `IMPLEMENTS i1, i2, ...` — interfaces this function block
-    /// implements. Multiple allowed; empty `Vec` when the clause is
-    /// absent.
-    pub implements: Vec<TypeName>,
-    /// `ABSTRACT` modifier. An abstract function block cannot be
-    /// instantiated directly (enforced by `rule_abstract_not_instantiated`,
-    /// P4045).
-    #[recurse(ignore)]
-    pub is_abstract: bool,
-    /// Span of the OOP-related tokens, so diagnostics can point at the
-    /// clause rather than the whole function block.
-    pub span: SourceSpan,
-}
-
-/// Only the OOP facet is a dialect/edition extension — the rest of a
-/// function block is standard IEC 61131-3. Implementing `LanguageExtension`
-/// here (rather than on `FunctionBlockDeclaration`) means an ordinary
-/// function block is not, and cannot claim to be, an extension.
-impl LanguageExtension for FunctionBlockOop {
-    fn extension_name(&self) -> &'static str {
-        "EXTENDS/IMPLEMENTS/ABSTRACT clause"
-    }
-
-    fn extension_span(&self) -> SourceSpan {
-        self.span.clone()
-    }
-}
-
-/// `INTERFACE name (EXTENDS base_list)? END_INTERFACE` (OOP
-/// extension).
-///
-/// Only the header is represented — method and property signatures are not
-/// yet parsed (TwinCAT stores each as a separate `<Method>`/`<Property>` XML
-/// element, silently ignored today; see
-/// `specs/design/beckhoff-twincat-dialect.md` §1.3). This
-/// is enough for an interface name to be recognized as a known type, so
-/// that variables declared with an interface type resolve instead of
-/// failing with "type not declared."
-#[derive(Clone, Debug, PartialEq, Recurse)]
-pub struct InterfaceDeclaration {
-    pub name: Id,
-    /// Interfaces this interface extends (an interface may extend more than
-    /// one other interface, unlike a function block).
-    pub extends: Vec<TypeName>,
-}
-
-impl Located for InterfaceDeclaration {
-    /// Derived from the declaration's own located parts rather than stored:
-    /// the name (always present) through the last extended interface, if any.
-    /// This spans the declaration's identifiers rather than the surrounding
-    /// `INTERFACE`/`END_INTERFACE` keywords.
-    fn span(&self) -> SourceSpan {
-        match self.extends.last() {
-            Some(last) => SourceSpan::join(&self.name.span(), &last.span()),
-            None => self.name.span(),
-        }
-    }
-}
-
-/// An `InterfaceDeclaration` is always an extension — unlike
-/// `FunctionBlockDeclaration`, there is no standard-IEC-61131-3 meaning for
-/// it.
-impl LanguageExtension for InterfaceDeclaration {
-    fn extension_name(&self) -> &'static str {
-        "INTERFACE declaration"
-    }
-
-    fn extension_span(&self) -> SourceSpan {
-        self.span()
     }
 }
 
@@ -3266,6 +3232,7 @@ mod tests {
             initializer: InitialValueAssignmentKind::None(SourceSpan::default()),
             block,
             type_id: None,
+            reset_on_call: false,
         }
     }
 

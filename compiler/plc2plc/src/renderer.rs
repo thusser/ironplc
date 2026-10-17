@@ -7,9 +7,12 @@
 use dsl::configuration::LocatedVarInit;
 use ironplc_dsl::common::*;
 use ironplc_dsl::core::Id;
+use ironplc_dsl::member_qualifier::MemberQualifiers;
 use ironplc_dsl::time::*;
 use ironplc_dsl::{diagnostic::Diagnostic, visitor::Visitor};
 use paste::paste;
+
+use crate::type_comment::{self, TypeNamer};
 
 /// Defines a macro for creating a comma separated list of items where
 /// each item in the list is created by visiting the item.
@@ -45,40 +48,51 @@ macro_rules! write_period_separated {
     };
 }
 
-pub fn apply(lib: &Library) -> Result<String, Vec<Diagnostic>> {
-    let mut visitor = LibraryRenderer::new();
+/// Renders `lib`. With `type_name`, each expression is followed by a comment
+/// giving the type the analyzer recorded for it (see `type_comment`).
+pub fn apply(lib: &Library, type_name: Option<TypeNamer>) -> Result<String, Vec<Diagnostic>> {
+    let mut visitor = LibraryRenderer::new(type_name);
     visitor
         .walk(lib)
         .map(|_| visitor.buffer)
         .map_err(|e| vec![e])
 }
 
-struct LibraryRenderer {
+struct LibraryRenderer<'a> {
     buffer: String,
     indents: usize,
+    /// Names a type for the comment after each expression; `None` renders
+    /// no comments.
+    type_name: Option<TypeNamer<'a>>,
 }
 
-/// The spelling of a character string: its characters as written, inside
-/// the delimiter `width` selects. The characters are not re-encoded; see
-/// `visit_character_string_literal` for why.
+/// The spelling of a character string: its characters, `$`-escaped where
+/// they cannot appear as themselves, inside the delimiter `width` selects.
 fn character_string_text(width: &StringType, value: &[char]) -> String {
     let delimiter = width.delimiter();
     let mut val = String::from(delimiter);
-    val.extend(value.iter());
+    val.push_str(&ironplc_dsl::string_escape::encode(value, width));
     val.push(delimiter);
     val
 }
 
-impl LibraryRenderer {
-    fn new() -> Self {
+impl<'a> LibraryRenderer<'a> {
+    fn new(type_name: Option<TypeNamer<'a>>) -> Self {
         Self {
             buffer: String::new(),
             indents: 0,
+            type_name,
         }
     }
 
     fn write(&mut self, val: &str) {
         self.buffer.push_str(val);
+    }
+
+    fn write_qualifiers(&mut self, qualifiers: &MemberQualifiers) {
+        for qualifier in qualifiers.iter() {
+            self.write_ws(qualifier.kind.keyword());
+        }
     }
 
     fn write_ws(&mut self, val: &str) {
@@ -88,6 +102,23 @@ impl LibraryRenderer {
             self.buffer.push(' ');
         }
         self.buffer.push_str(val);
+    }
+
+    /// Writes the members of a structure or function block initializer in
+    /// parentheses.
+    fn write_members(&mut self, members: &[StructureElementInit]) -> Result<(), Diagnostic> {
+        self.write_ws("(");
+        visit_comma_separated!(self, members.iter(), StructureElementInit);
+        self.write_ws(")");
+        Ok(())
+    }
+
+    /// Writes the elements of an array initializer in brackets.
+    fn write_elements(&mut self, elements: &[ArrayInitialElementKind]) -> Result<(), Diagnostic> {
+        self.write_ws("[");
+        visit_comma_separated!(self, elements.iter(), ArrayInitialElementKind);
+        self.write_ws("]");
+        Ok(())
     }
 
     fn newline(&mut self) {
@@ -113,6 +144,14 @@ impl LibraryRenderer {
 
     fn indent(&mut self) {
         self.indents += 1;
+    }
+
+    /// Writes a statement that is a keyword alone, such as `RETURN;`.
+    fn write_keyword_statement(&mut self, keyword: &str) -> Result<(), Diagnostic> {
+        self.write_ws(keyword);
+        self.write_ws(";");
+        self.newline();
+        Ok(())
     }
 
     fn outdent(&mut self) {
@@ -175,10 +214,103 @@ impl LibraryRenderer {
         self.newline();
         Ok(())
     }
+
+    /// Renders the variable blocks and statements of a method or a property
+    /// accessor; the caller writes the header and the closing keyword.
+    fn render_callable_body(
+        &mut self,
+        variables: &[VarDecl],
+        edge_variables: &[EdgeVarDecl],
+        body: &[dsl::textual::StmtKind],
+    ) -> Result<(), Diagnostic> {
+        if !variables.is_empty() {
+            self.indent();
+            for item in variables.iter() {
+                self.visit_var_decl(item)?;
+            }
+            self.outdent();
+            self.newline();
+        }
+
+        if !edge_variables.is_empty() {
+            self.indent();
+            for item in edge_variables.iter() {
+                self.visit_edge_var_decl(item)?;
+            }
+            self.outdent();
+            self.newline();
+        }
+
+        self.indent();
+        for stmt in body.iter() {
+            self.visit_stmt_kind(stmt)?;
+        }
+        self.outdent();
+        Ok(())
+    }
+
+    /// Renders `METHOD qualifiers name (: return_type)?` and ends the line.
+    fn render_method_header(
+        &mut self,
+        qualifiers: &MemberQualifiers,
+        name: &Id,
+        return_type: &Option<FunctionReturnType>,
+    ) -> Result<(), Diagnostic> {
+        self.write_ws("METHOD");
+        self.write_qualifiers(qualifiers);
+        self.visit_id(name)?;
+        if let Some(return_type) = return_type {
+            self.write_ws(":");
+            self.visit_function_return_type(return_type)?;
+        }
+        self.newline();
+        Ok(())
+    }
+
+    /// Renders `PROPERTY name : type` and ends the line.
+    fn render_property_header(
+        &mut self,
+        name: &Id,
+        property_type: &FunctionReturnType,
+    ) -> Result<(), Diagnostic> {
+        self.write_ws("PROPERTY");
+        self.visit_id(name)?;
+        self.write_ws(":");
+        self.visit_function_return_type(property_type)?;
+        self.newline();
+        Ok(())
+    }
 }
 
-impl Visitor<Diagnostic> for LibraryRenderer {
+impl Visitor<Diagnostic> for LibraryRenderer<'_> {
     type Value = ();
+
+    fn visit_expr(&mut self, node: &dsl::textual::Expr) -> Result<Self::Value, Diagnostic> {
+        let Some(type_name) = self.type_name else {
+            return node.recurse_visit(self);
+        };
+        // A conversion is written as its operand, without the operand's own
+        // comment: the conversion's comment names the operand's type too.
+        let written = match &node.kind {
+            dsl::textual::ExprKind::ImplicitConversion(conversion) => &conversion.value,
+            _ => node,
+        };
+        // Parenthesised so the comment on the operand and the comment on the
+        // operation are not written side by side.
+        let parenthesise = matches!(
+            written.kind,
+            dsl::textual::ExprKind::UnaryOp(_) | dsl::textual::ExprKind::Deref(_)
+        );
+        if parenthesise {
+            self.write_ws("(");
+        }
+        self.visit_expr_kind(&written.kind)?;
+        if parenthesise {
+            self.write_ws(")");
+        }
+        self.write_ws(&type_comment::comment(node, type_name));
+        Ok(())
+    }
 
     fn visit_id(&mut self, node: &Id) -> Result<Self::Value, Diagnostic> {
         // TODO this is the wrong case
@@ -238,25 +370,8 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         node: &CharacterStringLiteral,
     ) -> Result<Self::Value, Diagnostic> {
         // Single quotes delimit a STRING, double quotes a WSTRING, per
-        // IEC 61131-3 section 2.2.2.
-        //
-        // The value is written out exactly as it was read in, because
-        // `node.value` holds the source characters *as written* -- the parser
-        // does not decode `$` escapes on the way in. Every re-encoding here is
-        // therefore a corruption:
-        //
-        //   - `$` is already an escape introducer, so escaping it turned the
-        //     one line feed `$L` into the two characters `$` and `L`, and
-        //     compounded on each pass (`$L`, `$$L`, `$$$$L`).
-        //   - a raw tab, which the lexer does admit inside a literal, has no
-        //     `$T` in the source to correspond to, so emitting one turned that
-        //     one tab into the two characters `$` and `T`.
-        //
-        // Both directions changed the value; a raw control character passed
-        // through verbatim merely looks unusual, and re-parses as itself.
-        // Escaping can only become correct once the parser decodes escapes and
-        // `value` holds decoded characters -- see the character-string arm of
-        // the round-trip tests.
+        // IEC 61131-3 section 2.2.2. `node.value` holds the decoded
+        // characters, so they are escaped on the way out.
         self.write_ws(&character_string_text(&node.width, &node.value));
         Ok(())
     }
@@ -285,14 +400,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         &mut self,
         node: &TimeOfDayLiteral,
     ) -> Result<Self::Value, Diagnostic> {
-        let (hr, min, sec, milli) = node.hmsm();
-        self.write_ws(
-            format!(
-                "{}#{hr:0>2}:{min:0>2}:{sec:0>2}.{milli:0>2}",
-                node.type_name()
-            )
-            .as_str(),
-        );
+        self.write_ws(format!("{}#{}", node.type_name(), node.daytime_text()).as_str());
         Ok(())
     }
 
@@ -306,12 +414,12 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         &mut self,
         node: &DateAndTimeLiteral,
     ) -> Result<Self::Value, Diagnostic> {
-        let (hr, min, sec, milli) = node.hmsm();
         let (year, month, day) = node.ymd();
         self.write_ws(
             format!(
-                "{}#{year:0>4}-{month:0>2}-{day:0>2}-{hr:0>2}:{min:0>2}:{sec:0>2}.{milli:0>2}",
-                node.type_name()
+                "{}#{year:0>4}-{month:0>2}-{day:0>2}-{}",
+                node.type_name(),
+                node.daytime_text()
             )
             .as_str(),
         );
@@ -361,6 +469,17 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         self.write_ws(":");
 
         self.visit_type_name(&node.base_type_name)
+    }
+
+    fn visit_simple_declaration(
+        &mut self,
+        node: &SimpleDeclaration,
+    ) -> Result<Self::Value, Diagnostic> {
+        self.visit_type_name(&node.type_name)?;
+
+        self.write_ws(":");
+
+        self.visit_initial_value_assignment_kind(&node.spec_and_init)
     }
 
     fn visit_enumeration_declaration(
@@ -506,11 +625,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
 
         if !node.elements_init.is_empty() {
             self.write_ws(":=");
-            self.write_ws("(");
-
-            visit_comma_separated!(self, node.elements_init.iter(), StructureElementInit);
-
-            self.write_ws(")");
+            self.write_members(&node.elements_init)?;
         }
 
         Ok(())
@@ -526,11 +641,7 @@ impl Visitor<Diagnostic> for LibraryRenderer {
             None => {}
             Some(LateResolvedInitialValue::Members(elements)) => {
                 self.write_ws(":=");
-                self.write_ws("(");
-
-                visit_comma_separated!(self, elements.iter(), StructureElementInit);
-
-                self.write_ws(")");
+                self.write_members(elements)?;
             }
             Some(LateResolvedInitialValue::Value(value)) => {
                 self.write_ws(":=");
@@ -810,6 +921,21 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         Ok(())
     }
 
+    // 2.4.3.2
+    fn visit_subrange_initial_value_assignment(
+        &mut self,
+        node: &SubrangeInitialValueAssignment,
+    ) -> Result<Self::Value, Diagnostic> {
+        self.visit_subrange_specification_kind(&node.spec)?;
+
+        if let Some(iv) = &node.initial_value {
+            self.write_ws(":=");
+            self.visit_signed_integer(iv)?;
+        }
+
+        Ok(())
+    }
+
     // Extension: constant-expression VAR initializer
     // (e.g. `PI/180.0`), not yet folded to a literal.
     fn visit_simple_expr_initializer(
@@ -867,7 +993,14 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         &mut self,
         node: &FunctionBlockInitialValueAssignment,
     ) -> Result<Self::Value, Diagnostic> {
-        self.visit_type_name(&node.type_name)
+        self.visit_type_name(&node.type_name)?;
+
+        if !node.init.is_empty() {
+            self.write_ws(":=");
+            self.write_members(&node.init)?;
+        }
+
+        Ok(())
     }
 
     // CODESYS/TwinCAT call-style FB instance initializer:
@@ -893,13 +1026,31 @@ impl Visitor<Diagnostic> for LibraryRenderer {
 
         if !node.initial_values.is_empty() {
             self.write_ws(":=");
-
-            self.write_ws("[");
-            visit_comma_separated!(self, node.initial_values.iter(), ArrayInitialElementKind);
-            self.write_ws("]");
+            self.write_elements(&node.initial_values)?;
         }
 
         Ok(())
+    }
+
+    fn visit_array_initial_element_kind(
+        &mut self,
+        node: &ArrayInitialElementKind,
+    ) -> Result<Self::Value, Diagnostic> {
+        match node {
+            ArrayInitialElementKind::Structure(elements) => self.write_members(elements),
+            _ => node.recurse_visit(self),
+        }
+    }
+
+    fn visit_struct_initial_value_assignment_kind(
+        &mut self,
+        node: &StructInitialValueAssignmentKind,
+    ) -> Result<Self::Value, Diagnostic> {
+        match node {
+            StructInitialValueAssignmentKind::Array(elements) => self.write_elements(elements),
+            StructInitialValueAssignmentKind::Structure(members) => self.write_members(members),
+            _ => node.recurse_visit(self),
+        }
     }
 
     /// Renders a repeated array element, `count(value)`.
@@ -990,8 +1141,8 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         node: &FunctionBlockDeclaration,
     ) -> Result<Self::Value, Diagnostic> {
         self.write_ws("FUNCTION_BLOCK");
-        if node.oop.as_ref().is_some_and(|oop| oop.is_abstract) {
-            self.write_ws("ABSTRACT");
+        if let Some(oop) = &node.oop {
+            self.write_qualifiers(&oop.qualifiers);
         }
         self.visit_id(&node.name.name)?;
         if let Some(oop) = &node.oop {
@@ -1026,6 +1177,10 @@ impl Visitor<Diagnostic> for LibraryRenderer {
             self.visit_method_declaration(method)?;
         }
 
+        for property in node.properties.iter() {
+            self.visit_property_declaration(property)?;
+        }
+
         self.write_ws("END_FUNCTION_BLOCK");
         self.newline();
         Ok(())
@@ -1036,46 +1191,83 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         &mut self,
         node: &MethodDeclaration,
     ) -> Result<Self::Value, Diagnostic> {
-        self.write_ws("METHOD");
-        self.visit_id(&node.name)?;
-        if let Some(return_type) = &node.return_type {
-            self.write_ws(":");
-            self.visit_function_return_type(return_type)?;
-        }
-        self.newline();
-
-        if !node.variables.is_empty() {
-            self.indent();
-            for item in node.variables.iter() {
-                self.visit_var_decl(item)?;
-            }
-            self.outdent();
-            self.newline();
-        }
-
-        if !node.edge_variables.is_empty() {
-            self.indent();
-            for item in node.edge_variables.iter() {
-                self.visit_edge_var_decl(item)?;
-            }
-            self.outdent();
-            self.newline();
-        }
-
-        self.indent();
-        for stmt in node.body.iter() {
-            self.visit_stmt_kind(stmt)?;
-        }
-        self.outdent();
+        self.render_method_header(&node.qualifiers, &node.name, &node.return_type)?;
+        self.render_callable_body(&node.variables, &node.edge_variables, &node.body)?;
 
         self.write_ws("END_METHOD");
         self.newline();
         Ok(())
     }
 
-    // OOP extension: INTERFACE ... END_INTERFACE. Only the
-    // header renders — method/property signatures are not yet parsed (see
-    // specs/design/beckhoff-twincat-dialect.md §1.3).
+    // OOP extension: PROPERTY ... END_PROPERTY. Each accessor is a
+    // `MethodDeclaration`, but renders as `GET`/`SET` without a method
+    // header. The SET accessor's implicit input that holds the assigned
+    // value is not rendered: it is in `implicit_variables`, not
+    // `variables` (see `PropertyDeclaration`).
+    fn visit_property_declaration(
+        &mut self,
+        node: &PropertyDeclaration,
+    ) -> Result<Self::Value, Diagnostic> {
+        self.render_property_header(&node.name, &node.property_type)?;
+
+        if let Some(get) = &node.get {
+            self.write_ws("GET");
+            self.newline();
+            self.render_callable_body(&get.variables, &get.edge_variables, &get.body)?;
+            self.write_ws("END_GET");
+            self.newline();
+        }
+
+        if let Some(set) = &node.set {
+            self.write_ws("SET");
+            self.newline();
+            self.render_callable_body(&set.variables, &set.edge_variables, &set.body)?;
+            self.write_ws("END_SET");
+            self.newline();
+        }
+
+        self.write_ws("END_PROPERTY");
+        self.newline();
+        Ok(())
+    }
+
+    // OOP extension: a method signature inside an INTERFACE.
+    fn visit_method_prototype(
+        &mut self,
+        node: &MethodPrototype,
+    ) -> Result<Self::Value, Diagnostic> {
+        self.render_method_header(&node.qualifiers, &node.name, &node.return_type)?;
+        self.render_callable_body(&node.variables, &node.edge_variables, &[])?;
+        self.write_ws("END_METHOD");
+        self.newline();
+        Ok(())
+    }
+
+    // OOP extension: a property signature inside an INTERFACE, with an empty
+    // accessor for each one it declares.
+    fn visit_property_prototype(
+        &mut self,
+        node: &PropertyPrototype,
+    ) -> Result<Self::Value, Diagnostic> {
+        self.render_property_header(&node.name, &node.property_type)?;
+        if node.get.is_some() {
+            self.write_ws("GET");
+            self.write_ws("END_GET");
+            self.newline();
+        }
+        if node.set.is_some() {
+            self.write_ws("SET");
+            self.write_ws("END_SET");
+            self.newline();
+        }
+        self.write_ws("END_PROPERTY");
+        self.newline();
+        Ok(())
+    }
+
+    // OOP extension: INTERFACE ... END_INTERFACE. Methods render before
+    // properties, as in a function block; the source order between the two
+    // kinds is not kept.
     fn visit_interface_declaration(
         &mut self,
         node: &InterfaceDeclaration,
@@ -1092,6 +1284,13 @@ impl Visitor<Diagnostic> for LibraryRenderer {
             }
         }
         self.newline();
+
+        for method in node.methods.iter() {
+            self.visit_method_prototype(method)?;
+        }
+        for property in node.properties.iter() {
+            self.visit_property_prototype(property)?;
+        }
 
         self.write_ws("END_INTERFACE");
         self.newline();
@@ -1429,10 +1628,29 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         self.write_ws("(");
         visit_comma_separated!(self, node.params.iter(), ParamAssignmentKind);
         self.write_ws(")");
-        self.write_ws(";");
-        self.newline();
 
         Ok(())
+    }
+
+    // A method call is rendered by `visit_method_call` in both positions;
+    // only the statement form ends with `;`. `RETURN`, `EXIT` and `CONTINUE` have no
+    // node to visit, so they are written here.
+    fn visit_stmt_kind(
+        &mut self,
+        node: &dsl::textual::StmtKind,
+    ) -> Result<Self::Value, Diagnostic> {
+        match node {
+            dsl::textual::StmtKind::MethodCall(call) => {
+                self.visit_method_call(call)?;
+                self.write_ws(";");
+                self.newline();
+                Ok(())
+            }
+            dsl::textual::StmtKind::Return => self.write_keyword_statement("RETURN"),
+            dsl::textual::StmtKind::Exit(_) => self.write_keyword_statement("EXIT"),
+            dsl::textual::StmtKind::Continue(_) => self.write_keyword_statement("CONTINUE"),
+            _ => node.recurse_visit(self),
+        }
     }
 
     // 3.3.2.1
@@ -1648,11 +1866,9 @@ impl Visitor<Diagnostic> for LibraryRenderer {
         &mut self,
         node: &dsl::textual::CaseStatementGroup,
     ) -> Result<Self::Value, Diagnostic> {
-        for selector in node.selectors.iter() {
-            self.visit_case_selection_kind(selector)?;
-            self.write_ws(":");
-            self.newline();
-        }
+        visit_comma_separated!(self, node.selectors.iter(), CaseSelectionKind);
+        self.write_ws(":");
+        self.newline();
 
         self.indent();
 
@@ -1847,6 +2063,11 @@ impl Visitor<Diagnostic> for LibraryRenderer {
             self.write_ws("NOT");
         }
         self.visit_id(&node.src)?;
+        // The value the output stores is written as the output it reads,
+        // followed by its comment: `q (* REAL -> LREAL *) => lr`.
+        if let (Some(type_name), Some(value)) = (self.type_name, &node.value) {
+            self.write_ws(&type_comment::comment(value, type_name));
+        }
         self.write_ws("=>");
         self.visit_variable(&node.tgt)
     }

@@ -330,7 +330,7 @@ END_FUNCTION_BLOCK",
 )]
 // Regression for the `compile_expr.rs#L32` TODO that fired when
 // `struct.field[i, j]` was used in a STRING comparison: the analyzer
-// previously left `resolved_type` unset for array subscripts whose
+// previously left array subscripts untyped when their
 // base was a struct field.
 #[case::struct_field_2d_string_array_subscript(
     "
@@ -403,6 +403,22 @@ END_VAR
     result := timer.IN;
 END_FUNCTION_BLOCK",
     "BOOL"
+)]
+// A repeated structure name keeps its first declaration (P2007): the field
+// has the type that declaration gives it, not the second's.
+#[case::repeated_structure_field(
+    "
+TYPE PAIR : STRUCT f : INT; END_STRUCT; END_TYPE
+TYPE PAIR : STRUCT f : STRING; END_STRUCT; END_TYPE
+
+FUNCTION_BLOCK FB_TEST
+VAR
+    p : PAIR;
+    result : INT;
+END_VAR
+    result := p.f;
+END_FUNCTION_BLOCK",
+    "INT"
 )]
 fn apply_when_single_assignment_then_resolves_expected_type(
     #[case] program: &str,

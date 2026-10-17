@@ -10,6 +10,7 @@ P0008,SfcMissingInitialStep,SFC body does not have an initial step
 P0009,TwinCatMalformed,TwinCAT XML file has invalid structure
 P0010,Std2013Feature,Feature requires IEC 61131-3:2013 (use --dialect iec61131-3-ed3)
 P0011,EmptyVarBlock,Empty variable block requires choosing a dialect or --allow-empty-var-blocks flag
+P0012,InvalidStringEscape,Character string literal contains an escape that is not defined
 P2001,StructureDuplicatedElement,Structure has more than one element with name
 P2002,SubrangeMinStrictlyLessMax,Subrange declaration minimum value is not less than the maximum
 P2003,EnumTypeDeclDuplicateItem,Enumeration type declaration has duplicated value
@@ -28,7 +29,7 @@ P2015,SubrangeBaseTypeNotNumeric,Subrange base type must be numeric
 P2016,SubrangeOutOfBounds,Subrange is outside base type bounds
 P2017,StructFieldMissingType,Structure field missing type specification
 P2019,InvalidSimpleTypeDecl,Invalid simple type declaration
-P2020,EnumerationTooManyValues,Enumeration has too many unique values
+P2020,EnumerationTooManyValues,Enumeration declares more than 65536 members
 P2021,StructFieldTypeNotDeclared,Structure field references undeclared type
 P2022,ArrayDimensionEmpty,Array must have at least one dimension
 P2023,ArraySizeOverflow,Array size calculation overflow
@@ -121,7 +122,29 @@ P4053,CaseSelectorTypeInvalid,CASE selector is not an integer or enumeration typ
 P4054,FunctionBlockInFunction,Function declares or invokes a function block instance
 P4055,EnumExplicitValueNotAllowed,Explicit enumeration member value requires choosing a dialect or --allow-enum-explicit-values flag
 P4056,EnumBaseTypeNotAllowed,Enumeration base-type suffix requires choosing a dialect or --allow-enum-base-type flag
+P4057,MethodCallWithoutReturnValue,Method has no return value and cannot be used in an expression
+P4058,FunctionCallInOutArgNotVariable,Function call passes an expression that is not a variable to a VAR_IN_OUT parameter
+P4059,FunctionCallInOutArgTypeMismatch,Function call VAR_IN_OUT argument type is not the parameter type
+P4060,InOutArgNotWritable,VAR_IN_OUT argument cannot be proved writable
+P4062,MemberQualifierNotAllowed,Function block qualifier requires choosing a dialect or --allow-fb-inheritance flag
+P4063,MemberQualifierInvalid,Member qualifiers are repeated or conflict or are out of order or not allowed here
+P4064,ConstantVariableWritten,Variable declared CONSTANT is written
+P4065,ContinueOutsideLoop,CONTINUE statement is not inside a loop
+P4072,ConditionTypeInvalid,Condition of IF or ELSIF or WHILE or REPEAT is not BOOL
 P2038,DateLiteralOutOfRange,Date literal is outside the range the date type can represent
 P2039,DurationLiteralOutOfRange,Duration literal is outside the range the duration type can represent
 P2040,RealLiteralOutOfRange,Real literal is outside the range the real type can represent
 P2041,StringLengthOutOfRange,String length is more than a string can hold
+P2042,ReturnTypeNotDeclared,Return type is not declared
+P2043,EnumValueAmbiguous,Enumerated value is declared by more than one enumeration and its type cannot be told from where it is used
+P2044,EnumValueOutOfRange,Enumeration value is outside the range of DINT
+P4069,BitAccessTypeInvalid,Bit or partial access requires a bit string or integer variable
+P4077,ArrayInitializerTooManyValues,Array initializer has more values than the array has elements
+P4078,TaskIntervalNegative,Task INTERVAL is negative
+P4079,TaskSingleNotBool,Task SINGLE variable is not BOOL
+P4080,ProgramInstanceTypeNotProgram,Program instance type is not a declared PROGRAM
+P4081,ConfigurationAmbiguous,Source declares more than one CONFIGURATION to compile
+P4082,ExternalMatchesNoGlobal,VAR_EXTERNAL declaration matches no global variable
+P4083,NegatedOutputNotBool,Negated output assignment requires an output of type BOOL
+P4084,FieldNotFound,Field is not declared on the structure or function block or any function block in its EXTENDS chain
+P4085,ArraySubscriptCountMismatch,Number of subscripts does not match the number of array dimensions

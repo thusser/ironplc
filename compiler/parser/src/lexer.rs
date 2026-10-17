@@ -55,21 +55,20 @@ pub fn tokenize(
                         line += 1;
                         col = 0;
                     }
-                    TokenType::Comment => {
-                        // Comments can have new lines embedded
+                    _ => {
+                        // Comments, pragmas and strings can hold line breaks.
+                        // Columns count UTF-16 code units, the unit the
+                        // language server protocol uses by default.
                         for c in lexer.slice().chars() {
                             match c {
                                 '\n' => {
                                     line += 1;
                                     col = 0;
                                 }
-                                _ => {
-                                    col += 1;
-                                }
+                                _ => col += c.len_utf16(),
                             }
                         }
                     }
-                    _ => col += lexer.span().len(),
                 }
             }
             Err(_) => {
@@ -151,6 +150,35 @@ mod test {
     }
 
     #[test]
+    fn tokenize_when_string_spans_lines_then_following_token_on_next_line() {
+        use dsl::core::FileId;
+        let (tokens, diagnostics) = super::tokenize("s := 'a\nbc'; y", &FileId::default(), 0, 0);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let y = tokens.iter().find(|t| t.text == "y").unwrap();
+        assert_eq!((y.line, y.col), (1, 5));
+    }
+
+    #[test]
+    fn tokenize_when_non_ascii_text_then_col_counts_utf16_code_units() {
+        use dsl::core::FileId;
+        // `é` is two bytes and one UTF-16 code unit; `𝄞` is four bytes and
+        // two UTF-16 code units (a surrogate pair).
+        let source = "(* é *) 'é𝄞' y";
+        let (tokens, diagnostics) = super::tokenize(source, &FileId::default(), 0, 0);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let y = tokens.iter().find(|t| t.text == "y").unwrap();
+        assert_eq!((y.line, y.col), (0, 14));
+    }
+
+    #[test]
     fn tokenize_when_line_comment_then_newline_is_its_own_token() {
         use dsl::core::FileId;
         let (tokens, diagnostics) = super::tokenize("// c\nx", &FileId::default(), 0, 0);
@@ -208,5 +236,28 @@ mod test {
         assert_eq!(last.token_type, TokenType::Comment);
         assert_eq!(last.text, "// c");
         assert_eq!((last.line, last.col), (1, 0));
+    }
+
+    // IEC 61131-3 spells the delimiter inside a literal as `$'` (single-byte)
+    // or `$"` (double-byte). A `$` always takes the next character with it,
+    // so `$$` before the closing quote is an escaped dollar, not an escape of
+    // the quote.
+    #[rstest::rstest]
+    #[case::escaped_single_quote("'it$'s'", TokenType::SingleByteString)]
+    #[case::escaped_dollar_before_close("'costs $$'", TokenType::SingleByteString)]
+    #[case::escaped_double_quote("\"say $\"hi$\"\"", TokenType::DoubleByteString)]
+    fn tokenize_when_string_contains_escaped_delimiter_then_one_string_token(
+        #[case] source: &str,
+        #[case] expected: TokenType,
+    ) {
+        use dsl::core::FileId;
+        let (tokens, diagnostics) = super::tokenize(source, &FileId::default(), 0, 0);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(tokens.len(), 1, "tokens: {tokens:?}");
+        assert_eq!(tokens[0].token_type, expected);
+        assert_eq!(tokens[0].text, source);
     }
 }

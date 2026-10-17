@@ -108,10 +108,10 @@ mod tests {
     /// what codegen would have shipped.
     fn container_from(emitter: &mut Emitter, num_params: u16) -> ironplc_container::Container {
         let max_stack_depth = {
-            let _ = emitter.bytecode();
+            emitter.bytecode().unwrap();
             emitter.max_stack_depth()
         };
-        let bytecode = emitter.bytecode().to_vec();
+        let bytecode = emitter.bytecode().unwrap().to_vec();
         ContainerBuilder::new()
             .num_variables(4)
             .max_call_depth(1)
@@ -193,7 +193,7 @@ mod tests {
             let mut emitter = Emitter::new();
             emitter.emit_store_var_i32(VarIndex::new(0));
             emitter.emit_ret_void();
-            let _ = emitter.bytecode();
+            emitter.bytecode().unwrap();
 
             assert_eq!(emitter.max_stack_depth(), 0);
         }
@@ -241,10 +241,7 @@ mod tests {
             // declares for itself.
             container
                 .constant_pool
-                .push(ironplc_container::ConstEntry::primitive_le(
-                    ironplc_container::ConstType::I32,
-                    &7i32.to_le_bytes(),
-                ));
+                .push(ironplc_container::ConstEntry::i32(7));
             container.header.max_stack_depth = 4;
 
             let mut bufs = ironplc_vm::VmBuffers::from_container(&container);
@@ -328,7 +325,7 @@ mod temp_buffer_tests {
         emitter.emit_str_store_var(0);
         emitter.emit_ret_void();
         let max_stack_depth = emitter.max_stack_depth();
-        let bytecode = emitter.bytecode().to_vec();
+        let bytecode = emitter.bytecode().unwrap().to_vec();
 
         ContainerBuilder::new()
             .num_variables(4)

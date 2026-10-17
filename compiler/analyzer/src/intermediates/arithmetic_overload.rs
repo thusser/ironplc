@@ -16,13 +16,32 @@
 //!
 //! See `specs/design/arithmetic-operator-overloads.md`.
 
-use ironplc_dsl::common::{ElementaryTypeName, GenericTypeName, TypeName};
+use ironplc_dsl::common::{ElementaryTypeName, TypeName};
 use ironplc_dsl::textual::Operator;
 use ironplc_parser::options::CompilerOptions;
 
+use super::common_operand::{common_operand, Side};
 use super::operator_function_form::{form_of_operator, FormOf, OperatorFunctionForm};
 use super::stdlib_time_function::short_overload;
 use crate::type_compat::{are_types_compatible, is_checkable_type, same_temporal_family};
+
+/// A typed overload of an arithmetic operator on the time and date types:
+/// the form that applies, by name (`ADD_TIME`, `ADD_LTIME`), and its result
+/// type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedOverload {
+    pub name: &'static str,
+    pub result: TypeName,
+}
+
+impl From<TypedOverload> for Overload {
+    fn from(typed: TypedOverload) -> Self {
+        Overload::Typed {
+            name: typed.name,
+            result: typed.result,
+        }
+    }
+}
 
 /// The overload of an arithmetic operator that applies to a pair of operand
 /// types.
@@ -96,7 +115,8 @@ pub fn resolve_arithmetic_overload(
     if !is_checkable_type(left) || !is_checkable_type(right) {
         return Some(unchecked());
     }
-    numeric_overload(form, op, left, right, options).or_else(|| typed_overload(op, left, right))
+    numeric_overload(form, op, left, right, options)
+        .or_else(|| typed_overload(op, left, right).map(Overload::from))
 }
 
 /// Resolves an extensible call's inputs by folding from the left:
@@ -152,7 +172,7 @@ pub fn resolve_arithmetic_fold(
 /// an untyped literal's category (`ANY_INT`, `ANY_REAL`) in the `ANY_NUM`
 /// slot, as in `t * 2`. The type resolver has already reduced an alias to
 /// its elementary type.
-pub fn typed_overload(op: &Operator, left: &TypeName, right: &TypeName) -> Option<Overload> {
+pub fn typed_overload(op: &Operator, left: &TypeName, right: &TypeName) -> Option<TypedOverload> {
     let form = arithmetic_form(op)?;
     let left = OperandType::of(left);
     let right = OperandType::of(right);
@@ -165,7 +185,7 @@ pub fn typed_overload(op: &Operator, left: &TypeName, right: &TypeName) -> Optio
         .filter_map(|operand| operand.elementary.as_ref())
         .any(is_long_temporal);
     let row = if long { row.long()? } else { *row };
-    Some(Overload::Typed {
+    Some(TypedOverload {
         name: row.name,
         result: TypeName::from(row.result),
     })
@@ -193,25 +213,12 @@ fn numeric_overload(
     {
         return None;
     }
-    // The result is the operand the other is acceptable as: the wider one,
-    // or the concrete one when the other is an untyped literal. A literal's
-    // category accepts any concrete type in it, so the concrete operand is
-    // tried as the expected type first: `1 + d` is `DINT`, not `ANY_INT`.
-    // The result is the operand as written, so a bit string judged as its
-    // unsigned integer stays a bit string: `b + 1` on `BYTE` is `BYTE`.
-    let left = (left, judged_left);
-    let right = (right, judged_right);
-    let (first, second) = if is_generic(&left.1) && !is_generic(&right.1) {
-        (right, left)
-    } else {
-        (left, right)
-    };
-    let result = if are_types_compatible(&first.1, &second.1, options) {
-        first.0
-    } else if are_types_compatible(&second.1, &first.1, options) {
-        second.0
-    } else {
-        return None;
+    // The result is the operand the other is acceptable as, as written, so a
+    // bit string judged as its unsigned integer stays a bit string: `b + 1`
+    // on `BYTE` is `BYTE`.
+    let result = match common_operand(&judged_left, &judged_right, options)? {
+        Side::Left => left,
+        Side::Right => right,
     };
     Some(Overload::Numeric {
         result: result.clone(),
@@ -275,12 +282,6 @@ fn parameter_accepts(param: &str, operand: &OperandType<'_>) -> bool {
         // default options answer the same as any others.
         (Err(_), _) => are_types_compatible(&param, operand.type_name, &CompilerOptions::default()),
     }
-}
-
-/// Returns true if `type_name` is a generic category, the type of an untyped
-/// literal (`ANY_INT`, `ANY_REAL`).
-fn is_generic(type_name: &TypeName) -> bool {
-    GenericTypeName::try_from(&type_name.name).is_ok()
 }
 
 /// Returns true for the long-width temporal types.
@@ -370,14 +371,14 @@ mod tests {
         // A literal fills the ANY_NUM factor: `t * 2`, `t / 1.5`.
         assert_eq!(
             typed_overload(&Operator::Mul, &time, &int_literal),
-            Some(Overload::Typed {
+            Some(TypedOverload {
                 name: "MUL_TIME",
                 result: time.clone()
             })
         );
         assert_eq!(
             typed_overload(&Operator::Div, &time, &real_literal),
-            Some(Overload::Typed {
+            Some(TypedOverload {
                 name: "DIV_TIME",
                 result: time.clone()
             })

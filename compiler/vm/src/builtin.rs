@@ -59,7 +59,7 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             let mx = stack.pop()?.as_i32();
             let in_val = stack.pop()?.as_i32();
             let mn = stack.pop()?.as_i32();
-            stack.push(Slot::from_i32(in_val.clamp(mn, mx)))?;
+            stack.push(Slot::from_i32(limit(in_val, mn, mx)))?;
             Ok(())
         }
         opcode::builtin::SEL_I32 => {
@@ -342,13 +342,27 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             stack.push(Slot::from_f32(a % b))?;
             Ok(())
         }
+        opcode::builtin::EXPT_U32 => {
+            let b = stack.pop()?.as_i32() as u32;
+            let a = stack.pop()?.as_i32() as u32;
+            stack.push(Slot::from_i32(a.wrapping_pow(b) as i32))?;
+            Ok(())
+        }
+        opcode::builtin::EXPT_U64 => {
+            // Two's complement multiplication wraps to the same bits signed
+            // or unsigned, so only the exponent is read differently.
+            let b = stack.pop()?.as_i64() as u64;
+            let a = stack.pop()?.as_i64();
+            stack.push(Slot::from_i64(wrapping_pow_i64(a, b)))?;
+            Ok(())
+        }
         opcode::builtin::EXPT_I64 => {
             let b = stack.pop()?.as_i64();
             let a = stack.pop()?.as_i64();
             if b < 0 {
                 return Err(Trap::NegativeExponent);
             }
-            stack.push(Slot::from_i64(a.wrapping_pow(b as u32)))?;
+            stack.push(Slot::from_i64(wrapping_pow_i64(a, b as u64)))?;
             Ok(())
         }
         opcode::builtin::ABS_I64 => {
@@ -372,7 +386,7 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             let mx = stack.pop()?.as_i64();
             let in_val = stack.pop()?.as_i64();
             let mn = stack.pop()?.as_i64();
-            stack.push(Slot::from_i64(in_val.clamp(mn, mx)))?;
+            stack.push(Slot::from_i64(limit(in_val, mn, mx)))?;
             Ok(())
         }
         opcode::builtin::SEL_I64 => {
@@ -398,7 +412,7 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             let mx = stack.pop()?.as_i32() as u32;
             let in_val = stack.pop()?.as_i32() as u32;
             let mn = stack.pop()?.as_i32() as u32;
-            stack.push(Slot::from_i32(in_val.clamp(mn, mx) as i32))?;
+            stack.push(Slot::from_i32(limit(in_val, mn, mx) as i32))?;
             Ok(())
         }
         opcode::builtin::MIN_U64 => {
@@ -417,7 +431,7 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             let mx = stack.pop()?.as_i64() as u64;
             let in_val = stack.pop()?.as_i64() as u64;
             let mn = stack.pop()?.as_i64() as u64;
-            stack.push(Slot::from_i64(in_val.clamp(mn, mx) as i64))?;
+            stack.push(Slot::from_i64(limit(in_val, mn, mx) as i64))?;
             Ok(())
         }
         // --- Type conversion opcodes ---
@@ -511,6 +525,18 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             stack.push(Slot::from_f32(a as f32))?;
             Ok(())
         }
+        opcode::builtin::CHECK_SUBSCRIPT_I64 => {
+            let value = stack.pop()?.as_i64();
+            push_subscript(stack, value.into())
+        }
+        opcode::builtin::CHECK_SUBSCRIPT_U64 => {
+            let value = stack.pop()?.as_i64() as u64;
+            push_subscript(stack, value.into())
+        }
+        opcode::builtin::CHECK_SUBSCRIPT_U32 => {
+            let value = stack.pop()?.as_i32() as u32;
+            push_subscript(stack, value.into())
+        }
         opcode::builtin::CONV_U32_TO_I64 => {
             let a = stack.pop()?.as_i32() as u32;
             stack.push(Slot::from_i64(a as u64 as i64))?;
@@ -568,20 +594,15 @@ pub fn dispatch(func_id: u16, stack: &mut OperandStack) -> Result<(), Trap> {
             stack.push(Slot::from_i64(int_to_bcd_u64(a) as i64))?;
             Ok(())
         }
-        // MUX (multiplexer) for all type widths
-        id if opcode::builtin::is_mux(id) => {
-            let n = opcode::builtin::mux_info(id).unwrap() as usize;
-            if id >= opcode::builtin::MUX_F64_BASE {
-                dispatch_mux_f64(n, stack)
-            } else if id >= opcode::builtin::MUX_F32_BASE {
-                dispatch_mux_f32(n, stack)
-            } else if id >= opcode::builtin::MUX_I64_BASE {
-                dispatch_mux_i64(n, stack)
-            } else {
-                dispatch_mux_i32(n, stack)
-            }
-        }
-        _ => Err(Trap::InvalidBuiltinFunction(FunctionId::new(func_id))),
+        // MUX (multiplexer) for all type widths. Its IDs are a range per
+        // type, so they cannot be match arms: `mux_info` recognises them.
+        id => match opcode::builtin::mux_info(id) {
+            Some(n) if id >= opcode::builtin::MUX_F64_BASE => dispatch_mux_f64(n as usize, stack),
+            Some(n) if id >= opcode::builtin::MUX_F32_BASE => dispatch_mux_f32(n as usize, stack),
+            Some(n) if id >= opcode::builtin::MUX_I64_BASE => dispatch_mux_i64(n as usize, stack),
+            Some(n) => dispatch_mux_i32(n as usize, stack),
+            None => Err(Trap::InvalidBuiltinFunction(FunctionId::new(func_id))),
+        },
     }
 }
 
@@ -630,6 +651,37 @@ fn dispatch_mux_f64(n: usize, stack: &mut OperandStack) -> Result<(), Trap> {
     Ok(())
 }
 
+/// `LIMIT` as IEC 61131-3 defines it, `MIN(MAX(IN, MN), MX)`. Unlike
+/// `Ord::clamp`, it does not panic when `MN > MX`; the result is then `MX`.
+/// Pushes the array subscript `value` as a `DINT`, or traps when it is
+/// outside the range of `DINT`.
+fn push_subscript(stack: &mut OperandStack, value: i128) -> Result<(), Trap> {
+    let subscript = i32::try_from(value).map_err(|_| Trap::SubscriptOutOfRange { value })?;
+    stack.push(Slot::from_i32(subscript))?;
+    Ok(())
+}
+
+fn limit<T: Ord>(val: T, mn: T, mx: T) -> T {
+    val.max(mn).min(mx)
+}
+
+/// `base` raised to `exp`, wrapping on overflow, for any 64-bit exponent.
+/// `i64::wrapping_pow` takes a `u32` exponent, so a larger one would have to
+/// be truncated first.
+fn wrapping_pow_i64(base: i64, exp: u64) -> i64 {
+    let mut result: i64 = 1;
+    let mut base = base;
+    let mut exp = exp;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exp >>= 1;
+    }
+    result
+}
+
 /// IEEE 754-safe clamp for f32. Unlike `f32::clamp`, this does not panic
 /// when `mn`, `mx`, or `val` is NaN. NaN propagates: if any input is NaN
 /// the result is NaN.
@@ -638,12 +690,12 @@ fn float_clamp_f32(val: f32, mn: f32, mx: f32) -> f32 {
     if val.is_nan() || mn.is_nan() || mx.is_nan() {
         return f32::NAN;
     }
-    if val < mn {
-        mn
-    } else if val > mx {
+    // MIN(MAX(IN, MN), MX), as for the integer handlers.
+    let at_least_mn = if val < mn { mn } else { val };
+    if at_least_mn > mx {
         mx
     } else {
-        val
+        at_least_mn
     }
 }
 
@@ -759,11 +811,45 @@ fn float_clamp_f64(val: f64, mn: f64, mx: f64) -> f64 {
     if val.is_nan() || mn.is_nan() || mx.is_nan() {
         return f64::NAN;
     }
-    if val < mn {
-        mn
-    } else if val > mx {
+    // MIN(MAX(IN, MN), MX), as for the integer handlers.
+    let at_least_mn = if val < mn { mn } else { val };
+    if at_least_mn > mx {
         mx
     } else {
-        val
+        at_least_mn
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_when_mux_id_then_selects_input_k() {
+        let mut backing = [Slot::from_i32(0); 4];
+        let mut stack = OperandStack::new(&mut backing);
+        // K = 1, IN0 = 10, IN1 = 20.
+        stack.push(Slot::from_i32(1)).unwrap();
+        stack.push(Slot::from_i32(10)).unwrap();
+        stack.push(Slot::from_i32(20)).unwrap();
+
+        dispatch(opcode::builtin::MUX_I32_BASE + 2, &mut stack).unwrap();
+
+        assert_eq!(stack.pop().unwrap().as_i32(), 20);
+        assert_eq!(stack.len(), 0);
+    }
+
+    #[test]
+    fn dispatch_when_mux_id_below_two_inputs_then_invalid_builtin_function() {
+        let mut backing = [Slot::from_i32(0); 4];
+        let mut stack = OperandStack::new(&mut backing);
+        let id = opcode::builtin::MUX_I32_BASE + 1;
+
+        let result = dispatch(id, &mut stack);
+
+        assert_eq!(
+            result,
+            Err(Trap::InvalidBuiltinFunction(FunctionId::new(id)))
+        );
     }
 }

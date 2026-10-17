@@ -101,6 +101,21 @@ impl Visitor<Infallible> for RuleFunctionCallDeclared<'_> {
                     .filter(|p| matches!(p, ParamAssignmentKind::NamedInput(_)))
                     .count();
 
+                // A call is either formal or non-formal. With both, the
+                // count below would be checked against a misreading of the
+                // arguments, so the mix is the one diagnostic, as for a
+                // function block invocation.
+                if call_input_count > 0 && call_named_count > 0 {
+                    self.diagnostics.push(
+                        Diagnostic::problem(
+                            Problem::FunctionCallMixedArgTypes,
+                            Label::span(node.name.span(), "Function call"),
+                        )
+                        .with_context("function", &node.name.original().to_string()),
+                    );
+                    return node.recurse_visit(self);
+                }
+
                 // Total input arguments provided
                 let total_inputs = call_input_count + call_named_count;
 
@@ -137,8 +152,11 @@ impl Visitor<Infallible> for RuleFunctionCallDeclared<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::rule_diagnostics;
+    use rstest::rstest;
+    use spec_test_macro::spec_test;
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_stdlib_function_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -150,7 +168,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_user_function_called_then_ok,
         "
 FUNCTION ADD_INTS : INT
@@ -169,7 +187,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_err1!(
+    rule_err!(
         apply_when_function_not_declared_then_error,
         "
 FUNCTION_BLOCK CALLER
@@ -178,10 +196,10 @@ VAR
 END_VAR
     result := NONEXISTENT_FUNC(1);
 END_FUNCTION_BLOCK",
-        Problem::FunctionCallUndeclared
+        [Problem::FunctionCallUndeclared]
     );
 
-    rule_ctx_err1!(
+    rule_err_at!(
         apply_when_function_calls_undeclared_function_then_error,
         "
 FUNCTION MY_FUNC : INT
@@ -190,10 +208,11 @@ VAR_INPUT
 END_VAR
     MY_FUNC := UNDEFINED_HELPER(x);
 END_FUNCTION",
-        Problem::FunctionCallUndeclared
+        Problem::FunctionCallUndeclared,
+        "UNDEFINED_HELPER"
     );
 
-    rule_ctx_err1!(
+    rule_err!(
         apply_when_wrong_arg_count_then_error,
         "
 FUNCTION_BLOCK CALLER
@@ -203,10 +222,33 @@ VAR
 END_VAR
     result := INT_TO_REAL(value, value);
 END_FUNCTION_BLOCK",
-        Problem::FunctionCallWrongArgCount
+        [Problem::FunctionCallWrongArgCount]
     );
 
-    rule_ctx_ok!(
+    rule_err!(
+        /// The binding pass writes the call in normal form, which leaves the
+        /// omitted input out, so the call has one input too few.
+        #[spec_test(REQ_CB_analyzer_052)]
+        apply_when_named_input_omitted_then_wrong_arg_count,
+        "
+FUNCTION ADD_INTS : INT
+VAR_INPUT
+    A : INT;
+    B : INT := 2;
+END_VAR
+    ADD_INTS := A + B;
+END_FUNCTION
+
+FUNCTION_BLOCK CALLER
+VAR
+    result : INT;
+END_VAR
+    result := ADD_INTS(A := 1);
+END_FUNCTION_BLOCK",
+        [Problem::FunctionCallWrongArgCount]
+    );
+
+    rule_ok!(
         apply_when_abs_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -218,7 +260,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_sqrt_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -230,7 +272,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_min_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -243,7 +285,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_max_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -256,7 +298,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_limit_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -270,7 +312,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_err1!(
+    rule_err!(
         apply_when_limit_called_with_wrong_arg_count_then_error,
         "
 FUNCTION_BLOCK CALLER
@@ -281,10 +323,10 @@ VAR
 END_VAR
     result := LIMIT(a, b);
 END_FUNCTION_BLOCK",
-        Problem::FunctionCallWrongArgCount
+        [Problem::FunctionCallWrongArgCount]
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_expt_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -297,7 +339,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_mux_called_with_3_args_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -310,7 +352,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_mux_called_with_5_args_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -325,7 +367,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_err1!(
+    rule_err!(
         apply_when_mux_called_with_too_few_args_then_error,
         "
 FUNCTION_BLOCK CALLER
@@ -335,10 +377,10 @@ VAR
 END_VAR
     result := MUX(0, a);
 END_FUNCTION_BLOCK",
-        Problem::FunctionCallWrongArgCount
+        [Problem::FunctionCallWrongArgCount]
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_mux_called_with_17_args_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -365,7 +407,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_err1!(
+    rule_err!(
         apply_when_mux_called_with_18_args_then_error,
         "
 FUNCTION_BLOCK CALLER
@@ -391,10 +433,10 @@ VAR
 END_VAR
     result := MUX(0, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q);
 END_FUNCTION_BLOCK",
-        Problem::FunctionCallWrongArgCount
+        [Problem::FunctionCallWrongArgCount]
     );
 
-    rule_ctx_err1!(
+    rule_err!(
         apply_when_too_few_args_then_error,
         "
 FUNCTION ADD_INTS : INT
@@ -411,12 +453,12 @@ VAR
 END_VAR
     result := ADD_INTS(1);
 END_FUNCTION_BLOCK",
-        Problem::FunctionCallWrongArgCount
+        [Problem::FunctionCallWrongArgCount]
     );
 
     // Note: MOD is excluded because the parser treats it as a keyword (the MOD operator).
     // MOD(a, b) requires parser changes to allow keywords in function call position.
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_arithmetic_function_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -432,7 +474,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_comparison_function_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -450,7 +492,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_bit_string_conversion_called_then_ok,
         "
 FUNCTION_BLOCK CALLER
@@ -475,7 +517,7 @@ END_VAR
 END_FUNCTION_BLOCK"
     );
 
-    rule_ctx_ok!(
+    rule_ok!(
         apply_when_shl_with_byte_to_word_conversion_then_ok,
         "
 FUNCTION MY_SHIFT : WORD
@@ -491,5 +533,112 @@ VAR
 END_VAR
     result := MY_SHIFT(B := BYTE#16#AB);
 END_PROGRAM"
+    );
+
+    // A call is either formal or non-formal; with a mix, the arity check
+    // below it would count a misreading of the arguments, so P4001 is the
+    // only diagnostic (#1816).
+    rule_err!(
+        apply_when_function_call_mixes_positional_and_named_then_error,
+        "
+FUNCTION F : INT
+VAR_INPUT
+    a : INT;
+    b : INT;
+END_VAR
+    F := a - b;
+END_FUNCTION
+
+PROGRAM main
+VAR
+    x : INT;
+END_VAR
+    x := F(1, b := 2);
+END_PROGRAM",
+        [Problem::FunctionCallMixedArgTypes]
+    );
+
+    rule_ok!(
+        apply_when_function_call_named_with_output_then_ok,
+        "
+FUNCTION F : INT
+VAR_INPUT
+    a : INT;
+END_VAR
+VAR_OUTPUT
+    q : INT;
+END_VAR
+    q := a;
+    F := a;
+END_FUNCTION
+
+PROGRAM main
+VAR
+    x : INT;
+    y : INT;
+END_VAR
+    x := F(a := 1, q => y);
+END_PROGRAM"
+    );
+
+    // A VAR_IN_OUT parameter takes an argument like a VAR_INPUT does, in
+    // either declaration order and with either call form (#1658).
+    #[rstest]
+    #[case::in_out_last_named(
+        "VAR_INPUT n : DINT; END_VAR VAR_IN_OUT data : DINT; END_VAR",
+        "ADD_N(n := 42, data := x)"
+    )]
+    #[case::in_out_last_positional(
+        "VAR_INPUT n : DINT; END_VAR VAR_IN_OUT data : DINT; END_VAR",
+        "ADD_N(42, x)"
+    )]
+    #[case::in_out_first_named(
+        "VAR_IN_OUT data : DINT; END_VAR VAR_INPUT n : DINT; END_VAR",
+        "ADD_N(n := 42, data := x)"
+    )]
+    #[case::in_out_first_positional(
+        "VAR_IN_OUT data : DINT; END_VAR VAR_INPUT n : DINT; END_VAR",
+        "ADD_N(x, 42)"
+    )]
+    fn apply_when_function_has_in_out_then_counts_in_out_argument(
+        #[case] params: &str,
+        #[case] call: &str,
+    ) {
+        let program = format!(
+            "
+FUNCTION ADD_N : DINT
+{params}
+    data := data + n;
+    ADD_N := data;
+END_FUNCTION
+
+PROGRAM main
+VAR
+    x : DINT := 100;
+    result : DINT;
+END_VAR
+    result := {call};
+END_PROGRAM"
+        );
+        let diagnostics = rule_diagnostics(apply, &program, &CompilerOptions::default());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    rule_err!(
+        apply_when_in_out_argument_missing_then_error,
+        "
+FUNCTION ADD_N : DINT
+VAR_INPUT n : DINT; END_VAR
+VAR_IN_OUT data : DINT; END_VAR
+    ADD_N := data + n;
+END_FUNCTION
+
+PROGRAM main
+VAR
+    result : DINT;
+END_VAR
+    result := ADD_N(42);
+END_PROGRAM",
+        [Problem::FunctionCallWrongArgCount]
     );
 }

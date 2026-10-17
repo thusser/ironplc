@@ -14,8 +14,10 @@
 //!
 //! ## Scope
 //!
-//! Fires only when the assignment *target* is a whole array or structure
-//! variable. Two neighbouring cases belong elsewhere:
+//! Fires when the assignment *target* is an array or a structure: a whole
+//! variable, an element of an array of arrays or of structures
+//! (`rows[1] := row`), a field (`s.inner := p`), or what a reference refers
+//! to (`p^ := q`). Two neighbouring cases belong elsewhere:
 //!
 //! * Scalar assignment is deliberately untouched — checking it is the right
 //!   end state but interacts with implicit widening (ADR-0029, ADR-0031) and
@@ -25,10 +27,17 @@
 //!   destination. Reporting here as well would produce two diagnostics for
 //!   one mistake.
 //!
+//! The source may be a variable, an element (`row := rows[1]`), a field of a
+//! structure or of a function block instance (`r := f.p`), what a reference
+//! refers to, or the output an output assignment stores
+//! (`f(p => q)`), which is checked as `q := f.p` after the call is
+//! (`specs/design/call-binding.md`). A negated output is not an aggregate,
+//! and `rule_function_call_type_check` reports it (P4083).
+//!
 //! Everything else reaching an aggregate target is rejected, including a
-//! source whose type does not resolve at all. Codegen relies on that: having
-//! reached `COPY_REGION` emission with an aggregate destination, an
-//! unresolvable source is a compiler defect rather than a bad program.
+//! source whose type does not resolve at all. Code generation relies on
+//! that: a copy between places of different types breaks an invariant of the
+//! lowered program, so it is a compiler defect rather than a bad program.
 //!
 //! ## Examples
 //!
@@ -41,10 +50,24 @@
 //!     a := b;   (* ok *)
 //!     a := c;   (* P2037: different extents *)
 //! ```
+//!
+//! An element of an array of arrays is an array, and is checked as one:
+//!
+//! ```ignore
+//! TYPE Row : ARRAY[1..2] OF DINT; END_TYPE
+//! VAR
+//!     rows : ARRAY[1..3] OF Row;
+//!     row : Row;
+//!     c : ARRAY[1..5] OF DINT;
+//! END_VAR
+//!     rows[1] := row;      (* ok *)
+//!     row := rows[2];      (* ok *)
+//!     rows[1] := c;        (* P2037: different extents *)
+//! ```
 
 use ironplc_dsl::{
     common::*,
-    core::{Id, Located},
+    core::Located,
     diagnostic::{Diagnostic, Label},
     scope::ScopeNode,
     textual::*,
@@ -55,13 +78,12 @@ use ironplc_problems::Problem;
 use std::convert::Infallible;
 
 use crate::{
-    intermediate_type::IntermediateType,
-    intermediates,
     result::SemanticResult,
     rule_support::{run_rule, DiagnosticVisitor},
     semantic_context::SemanticContext,
-    type_environment::TypeEnvironment,
-    variable_type::{Declarations, Declared},
+    semantic_type::SemanticType,
+    symbol_environment::ScopeTracker,
+    variable_type,
 };
 
 pub fn apply(
@@ -71,13 +93,8 @@ pub fn apply(
 ) -> SemanticResult {
     run_rule(
         RuleAggregateAssignment {
-            type_environment: context.types(),
-            // `Declarations::new` opens the base scope. That is where
-            // declarations made outside any POU land -- a CONFIGURATION's
-            // VAR_GLOBAL block, most importantly -- so a POU scope's lookups
-            // fall through to them. Opening another here would leave the
-            // stack unbalanced when the table drops.
-            declarations: Declarations::new(),
+            context,
+            scope: ScopeTracker::default(),
             diagnostics: Vec::new(),
         },
         lib,
@@ -85,9 +102,10 @@ pub fn apply(
 }
 
 struct RuleAggregateAssignment<'a> {
-    type_environment: &'a TypeEnvironment,
-    /// Declared type of every variable in scope.
-    declarations: Declarations<'a>,
+    context: &'a SemanticContext,
+    /// Where the traversal is, to look variables up in the symbol
+    /// environment.
+    scope: ScopeTracker,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -97,64 +115,39 @@ impl DiagnosticVisitor for RuleAggregateAssignment<'_> {
     }
 }
 
-impl RuleAggregateAssignment<'_> {
-    /// Resolves a declared variable to its [`IntermediateType`].
-    ///
-    /// Handles both spellings a variable's type can take: a named type
-    /// (`p : Point`) resolved through the type environment, and an inline
-    /// specification (`a : ARRAY[1..2] OF DINT`) built from the declaration.
-    fn declared_type(&mut self, id: &Id) -> Option<IntermediateType> {
-        let type_environment = self.type_environment;
-        let Declared::Variable { init: declared, .. } = self.declarations.find(id)? else {
-            // This rule binds only declared variables.
-            return None;
+impl<'a> RuleAggregateAssignment<'a> {
+    /// The [`SemanticType`] of the value the reference `kind` names: a
+    /// variable, an element, a field or what a reference refers to, by the
+    /// walk [`variable_type::type_id`] makes, so a named type (`p : Point`)
+    /// and one spelled out in place (`a : ARRAY[1..2] OF DINT`) both state
+    /// their shape. With `deref`, what the reference `kind` names refers to,
+    /// as the target of `p^ := v`.
+    fn selected_type(&self, kind: &SymbolicVariableKind, deref: bool) -> Option<&'a SemanticType> {
+        let types = self.context.types();
+        let id =
+            variable_type::type_id(kind, self.context.symbols(), types, &self.scope.current())?;
+        let id = if deref {
+            types.referenced_type(id)?
+        } else {
+            id
         };
-        match declared.as_ref() {
-            InitialValueAssignmentKind::Array(array) => {
-                // An inline array specification. The name passed here only
-                // feeds diagnostics inside the helper, which are discarded:
-                // a malformed declaration is already reported by the
-                // declaration rules, and this rule stays silent on it.
-                let name = TypeName::from_id(id);
-                match intermediates::array::try_from(&name, &array.spec, type_environment) {
-                    Ok(intermediates::array::IntermediateResult::Type(attrs)) => {
-                        Some(attrs.representation)
-                    }
-                    Ok(intermediates::array::IntermediateResult::Alias(alias)) => type_environment
-                        .get(&alias)
-                        .map(|attrs| attrs.representation.clone()),
-                    Err(_) => None,
-                }
-            }
-            InitialValueAssignmentKind::Simple(simple) => type_environment
-                .get(&simple.type_name)
-                .map(|attrs| attrs.representation.clone()),
-            InitialValueAssignmentKind::Structure(structure) => type_environment
-                .get(&structure.type_name)
-                .map(|attrs| attrs.representation.clone()),
-            InitialValueAssignmentKind::LateResolvedType(LateResolvedInitializer {
-                type_name,
-                ..
-            }) => type_environment
-                .get(type_name)
-                .map(|attrs| attrs.representation.clone()),
-            _ => None,
-        }
+        Some(&types.get_by_id(id)?.representation)
     }
 
-    /// P2037: whole-array and whole-structure assignment requires identical
-    /// declared types.
-    fn check_aggregate_assignment(&mut self, target: &Variable, value: &Expr) {
-        let Variable::Symbolic(SymbolicVariableKind::Named(named)) = target else {
-            // An element or field write is not a whole-aggregate assignment.
+    /// P2037: assignment of a whole array or structure requires identical
+    /// types. `deref` is set for `p^ := value`, which assigns what `target`
+    /// refers to.
+    fn check_aggregate_assignment(&mut self, target: &Variable, deref: bool, value: &Expr) {
+        // A directly represented variable is never an array or a structure.
+        let Variable::Symbolic(target) = target else {
             return;
         };
-        let Some(target_type) = self.declared_type(&named.name) else {
+        let Some(target_type) = self.selected_type(target, deref) else {
             return;
         };
         if !matches!(
             target_type,
-            IntermediateType::Array { .. } | IntermediateType::Structure { .. }
+            SemanticType::Array { .. } | SemanticType::Structure { .. }
         ) {
             return;
         }
@@ -164,14 +157,18 @@ impl RuleAggregateAssignment<'_> {
         }
 
         let value_type = match &value.kind {
-            ExprKind::Variable(Variable::Symbolic(SymbolicVariableKind::Named(source))) => {
-                self.declared_type(&source.name)
+            ExprKind::Variable(Variable::Symbolic(source)) => self.selected_type(source, false),
+            // What a reference refers to (`p^`), and the output a call
+            // stores, have the type the analyzer recorded for them: the
+            // referenced type, and the type the output is declared with.
+            ExprKind::Deref(_) | ExprKind::CallOutput(_) => {
+                self.context.types().representation_of_expr(value)
             }
             _ => None,
         };
         // An unresolvable source is a mismatch too: nothing other than a
         // same-typed aggregate may be assigned to an aggregate.
-        if value_type.as_ref() != Some(&target_type) {
+        if value_type != Some(target_type) {
             self.diagnostics.push(Diagnostic::problem(
                 Problem::AggregateAssignmentTypeMismatch,
                 Label::span(
@@ -186,114 +183,235 @@ impl RuleAggregateAssignment<'_> {
 impl Visitor<Infallible> for RuleAggregateAssignment<'_> {
     type Value = ();
 
-    /// Opens a declaration's scope.
-    ///
-    /// Every kind contributes the same thing -- a frame its own
-    /// declarations go into -- but the match stays exhaustive so that a
-    /// new kind of scope has to say so rather than silently sharing the
-    /// enclosing declaration's frame.
     fn enter_scope(&mut self, node: ScopeNode<'_>) -> Result<(), Infallible> {
-        match node {
-            ScopeNode::Function(_)
-            | ScopeNode::FunctionBlock(_)
-            | ScopeNode::Program(_)
-            | ScopeNode::Method(_) => self.declarations.enter(),
-        }
+        self.scope.enter(&node);
         Ok(())
     }
 
     fn exit_scope(&mut self) {
-        self.declarations.exit();
+        self.scope.exit();
     }
 
     fn visit_var_decl(&mut self, node: &VarDecl) -> Result<Self::Value, Infallible> {
-        self.declarations
-            .add_if(node.identifier.symbolic_id(), Declared::of(node));
         node.recurse_visit(self)
     }
 
     fn visit_assignment(&mut self, node: &Assignment) -> Result<(), Infallible> {
-        self.check_aggregate_assignment(&node.target, &node.value);
+        self.check_aggregate_assignment(&node.target, node.deref, &node.value);
+        node.recurse_visit(self)
+    }
+
+    /// An output assignment stores the value the binding pass recorded for
+    /// it, the output the call leaves, so it is checked as `q := f.p` after
+    /// the call is.
+    fn visit_output(&mut self, node: &Output) -> Result<(), Infallible> {
+        if let (Some(value), false) = (&node.value, node.not) {
+            self.check_aggregate_assignment(&node.tgt, false, value);
+        }
         node.recurse_visit(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::stages::analyze;
-    use ironplc_dsl::core::FileId;
-    use ironplc_parser::{options::CompilerOptions, parse_program};
+    use super::apply;
+    use crate::test_helpers::{codes, edition3_options, fb_inheritance_options, rule_codes};
     use ironplc_problems::Problem;
+    use rstest::rstest;
+    use spec_test_macro::spec_test;
 
-    /// Analyzes `program`, returning the problem codes it reported.
-    fn problem_codes(program: &str) -> Vec<String> {
-        let options = CompilerOptions::default();
-        let library = parse_program(program, &FileId::default(), &options).unwrap();
-        match analyze(&[&library], &options) {
-            Ok((_, context)) => context
-                .diagnostics()
-                .iter()
-                .map(|d| d.code.clone())
-                .collect(),
-            Err(diagnostics) => diagnostics.iter().map(|d| d.code.clone()).collect(),
-        }
+    /// No problems: both sides have identical types.
+    const OK: &[Problem] = &[];
+    /// The one problem an assignment between different types reports.
+    const MISMATCH: &[Problem] = &[Problem::AggregateAssignmentTypeMismatch];
+
+    /// A program with an array of arrays `rows` of `Row`, an array of
+    /// structures `ps` of `P`, a structure `o` with a field of `P`, a
+    /// reference `rp` to a `Row`, and a variable of each of those element
+    /// types and of others, whose body is `body`.
+    fn elements_and_fields(body: &str) -> String {
+        format!(
+            "
+TYPE
+  Row : ARRAY[1..3] OF DINT;
+  P : STRUCT a : DINT; END_STRUCT;
+  Wide : STRUCT a : DINT; b : DINT; END_STRUCT;
+  Outer : STRUCT inner : P; END_STRUCT;
+END_TYPE
+
+PROGRAM main
+VAR
+  rows : ARRAY[1..2] OF Row;
+  row : Row;
+  c : ARRAY[1..5] OF DINT;
+  ps : ARRAY[1..2] OF P;
+  q : P;
+  w : Wide;
+  o : Outer;
+  rp : REF_TO Row;
+END_VAR
+  {body}
+END_PROGRAM
+"
+        )
+    }
+
+    #[rstest]
+    #[case::element_target("rows[1] := row;", OK)]
+    #[case::element_source("row := rows[2];", OK)]
+    #[case::element_target_and_source("rows[1] := rows[2];", OK)]
+    #[case::structure_element_source("q := ps[2];", OK)]
+    #[case::structure_element_target("ps[1] := q;", OK)]
+    #[case::field_target("o.inner := ps[1];", OK)]
+    #[case::dereference_target("rp^ := row;", OK)]
+    #[case::dereference_source("rows[1] := rp^;", OK)]
+    #[case::element_target_other_extent("rows[1] := c;", MISMATCH)]
+    #[case::element_source_other_extent("c := rows[1];", MISMATCH)]
+    #[case::element_target_constant("rows[1] := 5;", MISMATCH)]
+    #[case::element_target_scalar_element("rows[1] := rows[1][2];", MISMATCH)]
+    #[case::element_target_structure("rows[1] := q;", MISMATCH)]
+    #[case::structure_element_target_other_type("ps[1] := w;", MISMATCH)]
+    #[case::structure_element_source_other_type("w := ps[1];", MISMATCH)]
+    #[case::field_target_other_type("o.inner := w;", MISMATCH)]
+    #[case::dereference_target_other_extent("rp^ := c;", MISMATCH)]
+    #[case::dereference_source_other_extent("c := rp^;", MISMATCH)]
+    fn apply_when_element_field_or_dereference_assigned_then_types_compared(
+        #[case] body: &str,
+        #[case] expected: &[Problem],
+    ) {
+        assert_eq!(
+            rule_codes(apply, &elements_and_fields(body), &edition3_options()),
+            codes(expected)
+        );
+    }
+
+    rule_err!(
+        /// The example of an array of arrays in
+        /// `docs/reference/compiler/problems/P2037.rst`.
+        apply_when_documented_array_of_arrays_example_then_reports_only_other_extent,
+        "
+TYPE
+    Row : ARRAY[1..3] OF DINT;
+END_TYPE
+
+PROGRAM Main
+    VAR
+        rows : ARRAY[1..2] OF Row;
+        row : Row;
+        wide : ARRAY[1..5] OF DINT;
+    END_VAR
+
+    rows[1] := row;
+    row := rows[2];
+    rows[1] := wide;
+END_PROGRAM",
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
+
+    rule_err!(
+        /// An output stored in an element of an array of structures is
+        /// checked as the element assigned from the output.
+        apply_when_structure_output_stored_in_element_of_other_type_then_reports_mismatch,
+        &block_with_structure_output("f(x := 1, p => ws[1]);").replace(
+            "w : Wide;",
+            "w : Wide;\n  ws : ARRAY[1..2] OF Wide;"
+        ),
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
+
+    /// A function block with a structure output `p`, called as `f`, and two
+    /// structures: `r` and `q` of the output's type, and `w` of another.
+    fn block_with_structure_output(body: &str) -> String {
+        format!(
+            "
+TYPE
+  P : STRUCT
+    a : DINT;
+    b : REAL;
+  END_STRUCT;
+  Wide : STRUCT
+    a : DINT;
+    b : REAL;
+    c : DINT;
+  END_STRUCT;
+END_TYPE
+
+FUNCTION_BLOCK FB
+VAR_INPUT
+  x : DINT;
+END_VAR
+VAR_OUTPUT
+  p : P;
+END_VAR
+  p.a := x;
+END_FUNCTION_BLOCK
+
+PROGRAM main
+VAR
+  f : FB;
+  r : P;
+  q : P;
+  w : Wide;
+END_VAR
+  {body}
+END_PROGRAM
+"
+        )
     }
 
     fn program_with(declarations: &str, body: &str) -> String {
         format!("PROGRAM main\nVAR\n{declarations}END_VAR\n{body}END_PROGRAM\n")
     }
 
-    #[test]
-    fn apply_when_array_types_identical_then_accepted() {
-        let codes = problem_codes(&program_with(
+    rule_ok!(
+        apply_when_array_types_identical_then_accepted,
+        &program_with(
             "a : ARRAY[1..2] OF DINT;\nb : ARRAY[1..2] OF DINT;\n",
             "a := b;\n",
-        ));
-        assert!(codes.is_empty(), "expected no diagnostics, got {codes:?}");
-    }
+        )
+    );
 
-    #[test]
-    fn apply_when_array_extents_differ_then_reports_mismatch() {
-        let codes = problem_codes(&program_with(
+    rule_err!(
+        apply_when_array_extents_differ_then_reports_mismatch,
+        &program_with(
             "a : ARRAY[1..2] OF DINT;\nb : ARRAY[1..5] OF DINT;\n",
             "a := b;\n",
-        ));
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        ),
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    #[test]
-    fn apply_when_array_element_types_differ_then_reports_mismatch() {
-        let codes = problem_codes(&program_with(
+    rule_err!(
+        apply_when_array_element_types_differ_then_reports_mismatch,
+        &program_with(
             "a : ARRAY[1..2] OF DINT;\nb : ARRAY[1..2] OF INT;\n",
             "a := b;\n",
-        ));
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        ),
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    /// The pair the VM cannot distinguish: same element count and element
-    /// type, different dimensions. Only the static check rejects it.
-    #[test]
-    fn apply_when_array_dimensions_differ_but_element_count_matches_then_reports_mismatch() {
-        let codes = problem_codes(&program_with(
+    rule_err!(
+        /// The pair the VM cannot distinguish: same element count and element
+        /// type, different dimensions. Only the static check rejects it.
+        apply_when_array_dimensions_differ_but_element_count_matches_then_reports_mismatch,
+        &program_with(
             "a : ARRAY[1..6] OF DINT;\nb : ARRAY[1..2, 1..3] OF DINT;\n",
             "a := b;\n",
-        ));
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        ),
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    #[test]
-    fn apply_when_string_array_max_lengths_differ_then_reports_mismatch() {
-        let codes = problem_codes(&program_with(
+    rule_err!(
+        apply_when_string_array_max_lengths_differ_then_reports_mismatch,
+        &program_with(
             "a : ARRAY[1..2] OF STRING[8];\nb : ARRAY[1..2] OF STRING[16];\n",
             "a := b;\n",
-        ));
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        ),
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    #[test]
-    fn apply_when_struct_types_identical_then_accepted() {
-        let codes = problem_codes(
-            "
+    rule_ok!(
+        apply_when_struct_types_identical_then_accepted,
+        "
 TYPE
   Point : STRUCT
     x : DINT;
@@ -308,15 +426,12 @@ VAR
 END_VAR
   a := b;
 END_PROGRAM
-",
-        );
-        assert!(codes.is_empty(), "expected no diagnostics, got {codes:?}");
-    }
+"
+    );
 
-    #[test]
-    fn apply_when_struct_types_differ_then_reports_mismatch() {
-        let codes = problem_codes(
-            "
+    rule_err!(
+        apply_when_struct_types_differ_then_reports_mismatch,
+        "
 TYPE
   Point : STRUCT
     x : DINT;
@@ -337,14 +452,12 @@ END_VAR
   a := b;
 END_PROGRAM
 ",
-        );
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    #[test]
-    fn apply_when_array_assigned_to_struct_then_reports_mismatch() {
-        let codes = problem_codes(
-            "
+    rule_err!(
+        apply_when_array_assigned_to_struct_then_reports_mismatch,
+        "
 TYPE
   Point : STRUCT
     x : DINT;
@@ -360,28 +473,22 @@ END_VAR
   a := b;
 END_PROGRAM
 ",
-        );
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    /// Scalar assignment is out of this rule's scope: a narrowing store that
-    /// compiles today must keep compiling.
-    #[test]
-    fn apply_when_scalar_widths_differ_then_no_diagnostic() {
-        let codes = problem_codes(&program_with("a : DINT;\nb : INT;\n", "a := b;\n"));
-        assert!(
-            !codes.contains(&"P2037".to_string()),
-            "scalars are out of scope, got {codes:?}"
-        );
-    }
+    rule_ok!(
+        /// Scalar assignment is out of this rule's scope: a narrowing store that
+        /// compiles today must keep compiling.
+        apply_when_scalar_widths_differ_then_no_diagnostic,
+        &program_with("a : DINT;\nb : INT;\n", "a := b;\n")
+    );
 
-    /// A global is reached through a `VAR_EXTERNAL` redeclaration, which is
-    /// what carries the type inside the POU. The outer scope still matters:
-    /// the `VAR_GLOBAL` block itself is visited outside any POU.
-    #[test]
-    fn apply_when_global_array_extent_differs_then_reports_mismatch() {
-        let codes = problem_codes(
-            "
+    rule_err!(
+        /// A global is reached through a `VAR_EXTERNAL` redeclaration, which is
+        /// what carries the type inside the POU. The outer scope still matters:
+        /// the `VAR_GLOBAL` block itself is visited outside any POU.
+        apply_when_global_array_extent_differs_then_reports_mismatch,
+        "
 CONFIGURATION config
   VAR_GLOBAL
     g : ARRAY[1..5] OF DINT;
@@ -402,14 +509,12 @@ END_VAR
   a := g;
 END_PROGRAM
 ",
-        );
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    #[test]
-    fn apply_when_global_array_type_matches_then_accepted() {
-        let codes = problem_codes(
-            "
+    rule_ok!(
+        apply_when_global_array_type_matches_then_accepted,
+        "
 CONFIGURATION config
   VAR_GLOBAL
     g : ARRAY[1..2] OF DINT;
@@ -429,18 +534,15 @@ VAR
 END_VAR
   a := g;
 END_PROGRAM
-",
-        );
-        assert!(codes.is_empty(), "expected no diagnostics, got {codes:?}");
-    }
+"
+    );
 
-    /// A function block's own declaration hides an outer one of the same
-    /// name, so the inner type is what gets compared. (A program may not
-    /// reuse a global's name at all; that is `rule_program_var_hides_global`.)
-    #[test]
-    fn apply_when_local_hides_global_then_local_type_is_compared() {
-        let codes = problem_codes(
-            "
+    rule_ok!(
+        /// A function block's own declaration hides an outer one of the same
+        /// name, so the inner type is what gets compared. (A program may not
+        /// reuse a global's name at all; that is `rule_program_var_hides_global`.)
+        apply_when_local_hides_global_then_local_type_is_compared,
+        "
 CONFIGURATION config
   VAR_GLOBAL
     g : ARRAY[1..5] OF DINT;
@@ -465,15 +567,12 @@ VAR
 END_VAR
   fb();
 END_PROGRAM
-",
-        );
-        assert!(codes.is_empty(), "expected no diagnostics, got {codes:?}");
-    }
+"
+    );
 
-    #[test]
-    fn apply_when_array_assigned_inside_function_then_reports_mismatch() {
-        let codes = problem_codes(
-            "
+    rule_err!(
+        apply_when_array_assigned_inside_function_then_reports_mismatch,
+        "
 FUNCTION Copy : DINT
 VAR
   a : ARRAY[1..2] OF DINT;
@@ -490,14 +589,12 @@ END_VAR
   r := Copy();
 END_PROGRAM
 ",
-        );
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    #[test]
-    fn apply_when_array_assigned_inside_function_block_then_reports_mismatch() {
-        let codes = problem_codes(
-            "
+    rule_err!(
+        apply_when_array_assigned_inside_function_block_then_reports_mismatch,
+        "
 FUNCTION_BLOCK Holder
 VAR
   a : ARRAY[1..2] OF DINT;
@@ -513,15 +610,13 @@ END_VAR
   h();
 END_PROGRAM
 ",
-        );
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
 
-    /// A function block's locals must not leak into a later POU's scope.
-    #[test]
-    fn apply_when_pou_ends_then_its_declarations_leave_scope() {
-        let codes = problem_codes(
-            "
+    rule_ok!(
+        /// A function block's locals must not leak into a later POU's scope.
+        apply_when_pou_ends_then_its_declarations_leave_scope,
+        "
 FUNCTION_BLOCK Holder
 VAR
   a : ARRAY[1..2] OF DINT;
@@ -536,20 +631,14 @@ VAR
 END_VAR
   a := b;
 END_PROGRAM
-",
-        );
-        assert!(
-            codes.is_empty(),
-            "main's own `a` is ARRAY[1..5], not the FB's ARRAY[1..2]; got {codes:?}"
-        );
-    }
+"
+    );
 
-    /// A function result is P4027's business; reporting here too would give
-    /// two diagnostics for one mistake.
-    #[test]
-    fn apply_when_function_result_assigned_then_defers_to_return_type_rule() {
-        let codes = problem_codes(
-            "
+    rule_ok!(
+        /// A function result is P4027's business; reporting here too would give
+        /// two diagnostics for one mistake.
+        apply_when_function_result_assigned_then_defers_to_return_type_rule,
+        "
 TYPE
   Point : STRUCT
     x : DINT;
@@ -570,19 +659,12 @@ VAR
 END_VAR
   a := MakePoint();
 END_PROGRAM
-",
-        );
-        assert!(
-            !codes.contains(&"P2037".to_string()),
-            "P4027 owns this case; got {codes:?}"
-        );
-        assert!(codes.contains(&"P4027".to_string()), "got {codes:?}");
-    }
+"
+    );
 
-    #[test]
-    fn apply_when_matching_struct_returning_function_then_accepted() {
-        let codes = problem_codes(
-            "
+    rule_ok!(
+        apply_when_matching_struct_returning_function_then_accepted,
+        "
 TYPE
   Point : STRUCT
     x : DINT;
@@ -599,60 +681,35 @@ VAR
 END_VAR
   a := MakePoint();
 END_PROGRAM
-",
-        );
-        assert!(codes.is_empty(), "expected no diagnostics, got {codes:?}");
-    }
+"
+    );
 
-    /// Nothing but a same-typed aggregate may be assigned to an aggregate.
-    /// Codegen depends on this: it treats an unresolvable source at
-    /// COPY_REGION emission as a compiler defect.
-    #[test]
-    fn apply_when_constant_assigned_to_array_then_reports_mismatch() {
-        let codes = problem_codes(&program_with("a : ARRAY[1..2] OF DINT;\n", "a := 5;\n"));
-        assert!(codes.contains(&"P2037".to_string()), "got {codes:?}");
-    }
+    rule_err_at!(
+        /// Nothing but a same-typed aggregate may be assigned to an aggregate.
+        /// Codegen depends on this: it treats an unresolvable source at
+        /// COPY_REGION emission as a compiler defect.
+        apply_when_constant_assigned_to_array_then_reports_mismatch,
+        &program_with("a : ARRAY[1..2] OF DINT;\n", "a := 5;\n"),
+        Problem::AggregateAssignmentTypeMismatch,
+        "5");
 
-    /// An element write is not a whole-aggregate assignment.
-    #[test]
-    fn apply_when_array_element_assigned_then_no_diagnostic() {
-        let codes = problem_codes(&program_with(
+    rule_ok!(
+        /// An element of an elementary type is not an aggregate.
+        apply_when_array_element_assigned_then_no_diagnostic,
+        &program_with(
             "a : ARRAY[1..2] OF DINT;\nb : ARRAY[1..5] OF DINT;\n",
             "a[1] := b[1];\n",
-        ));
-        assert!(
-            !codes.contains(&"P2037".to_string()),
-            "element writes are out of scope, got {codes:?}"
-        );
-    }
+        )
+    );
 
-    /// Analyzes `program` with methods enabled, returning the problem
-    /// codes it reported.
-    fn problem_codes_with_methods(program: &str) -> Vec<String> {
-        let options = CompilerOptions {
-            allow_fb_inheritance: true,
-            ..CompilerOptions::default()
-        };
-        let library = parse_program(program, &FileId::default(), &options).unwrap();
-        match analyze(&[&library], &options) {
-            Ok((_, context)) => context
-                .diagnostics()
-                .iter()
-                .map(|d| d.code.clone())
-                .collect(),
-            Err(diagnostics) => diagnostics.iter().map(|d| d.code.clone()).collect(),
-        }
-    }
-
-    /// A method's local belongs to the method. Before the traversal
-    /// opened a scope for a method, every method's declarations landed in
-    /// the enclosing function block's frame, so a method local overwrote
-    /// a field of the same name for every method compiled after it --
-    /// and the mismatch it hid was accepted.
-    #[test]
-    fn apply_when_method_local_shadows_field_then_sibling_method_uses_field_type() {
-        let codes = problem_codes_with_methods(
-            "
+    rule_err!(
+        /// A method's local belongs to the method. Before the traversal
+        /// opened a scope for a method, every method's declarations landed in
+        /// the enclosing function block's frame, so a method local overwrote
+        /// a field of the same name for every method compiled after it --
+        /// and the mismatch it hid was accepted.
+        apply_when_method_local_shadows_field_then_sibling_method_uses_field_type,
+        "
 TYPE
     Pt : STRUCT
         x : INT;
@@ -678,13 +735,42 @@ METHOD B
 END_METHOD
 END_FUNCTION_BLOCK
 ",
-        );
+        [Problem::AggregateAssignmentTypeMismatch],
+        fb_inheritance_options()
+    );
 
-        assert!(
-            codes
-                .iter()
-                .any(|c| c == Problem::AggregateAssignmentTypeMismatch.code()),
-            "expected an aggregate assignment mismatch on the function block's field, got {codes:?}"
-        );
-    }
+    rule_ok!(
+        /// A field of a function block instance has the type the block
+        /// declares it with, a structure included.
+        #[spec_test(REQ_VB_analyzer_051)]
+        apply_when_structure_field_of_block_read_into_same_type_then_accepted,
+        &block_with_structure_output("f(x := 1);\n  r := f.p;")
+    );
+
+    rule_err_at!(
+        apply_when_structure_field_of_block_read_into_other_type_then_reports_mismatch,
+        &block_with_structure_output("f(x := 1);\n  w := f.p;"),
+        Problem::AggregateAssignmentTypeMismatch,
+        "f.p"
+    );
+
+    rule_ok!(
+        #[spec_test(REQ_CB_analyzer_038)]
+        apply_when_structure_output_stored_in_same_type_then_accepted,
+        &block_with_structure_output("f(x := 1, p => q);")
+    );
+
+    rule_err!(
+        #[spec_test(REQ_CB_analyzer_038)]
+        apply_when_structure_output_stored_in_other_type_then_reports_mismatch,
+        &block_with_structure_output("f(x := 1, p => w);"),
+        [Problem::AggregateAssignmentTypeMismatch]
+    );
+
+    rule_ok!(
+        /// A negated output is not an aggregate; `NOT p` of a structure is
+        /// P4083, which another rule reports.
+        apply_when_structure_output_negated_then_left_to_negated_output_rule,
+        &block_with_structure_output("f(x := 1, NOT p => q);")
+    );
 }

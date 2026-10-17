@@ -3,6 +3,7 @@
 //! The compiler as individual stages (to enable testing).
 
 use ironplc_dsl::{
+    common::TypeName,
     core::{FileId, Id, SourceSpan},
     diagnostic::{Diagnostic, Label},
 };
@@ -11,34 +12,41 @@ use ironplc_problems::Problem;
 use log::debug;
 
 use crate::{
+    execution_model,
     function_environment::FunctionEnvironmentBuilder,
     ironplc_dsl::common::Library,
     result::SemanticResult,
-    rule_abstract_not_instantiated, rule_assignment_aggregate_type_compat,
+    rule_abstract_not_instantiated, rule_array_index_range, rule_array_initializer_length,
+    rule_array_subscript_count, rule_assignment_aggregate_type_compat,
     rule_bit_and_partial_access_range, rule_case_bit_string_label, rule_case_selector_type,
-    rule_constant_range, rule_decl_struct_element_unique_names, rule_enum_base_type_allowed,
+    rule_condition_type, rule_constant_not_written, rule_constant_range,
+    rule_decl_struct_element_unique_names, rule_enum_base_type_allowed,
     rule_enum_explicit_value_allowed, rule_enumeration_values_unique,
     rule_extends_field_duplicated, rule_function_block_call_unsupported,
-    rule_function_block_invocation, rule_function_call_declared, rule_function_call_type_check,
+    rule_function_block_invocation, rule_function_call_declared,
+    rule_function_call_in_out_argument, rule_function_call_type_check,
+    rule_loop_control_inside_loop, rule_member_qualifier_allowed, rule_member_qualifier_invalid,
     rule_method_call_declared, rule_mixed_located_var_declarations, rule_no_top_level_var_global,
     rule_operator_operand_type_check, rule_pou_hierarchy, rule_program_task_definition_exists,
     rule_program_var_hides_global, rule_range_limits, rule_real_literal_range, rule_ref_to,
-    rule_stdlib_type_redefinition, rule_string_encoding_compat, rule_string_length_range,
-    rule_string_literal_char_range, rule_struct_initializer_expression_allowed,
-    rule_task_names_unique, rule_temporal_literal_range, rule_unsupported_extension,
-    rule_use_declared_enumerated_value, rule_use_declared_symbolic_var,
-    rule_var_decl_const_initialized, rule_var_decl_const_not_fb,
-    rule_var_decl_global_const_requires_external_const, rule_var_decl_initializer_type_compat,
+    rule_return_type_declared, rule_stdlib_type_redefinition, rule_string_encoding_compat,
+    rule_string_length_range, rule_string_literal_char_range,
+    rule_struct_initializer_expression_allowed, rule_task_configuration, rule_task_names_unique,
+    rule_temporal_literal_range, rule_unsupported_extension, rule_use_declared_enumerated_value,
+    rule_use_declared_field, rule_use_declared_symbolic_var, rule_var_decl_const_initialized,
+    rule_var_decl_const_not_fb, rule_var_decl_global_const_requires_external_const,
+    rule_var_decl_initializer_type_compat, rule_var_external_matches_global,
     semantic_context::SemanticContext,
     symbol_environment::{ScopeKind, SymbolEnvironment, SymbolKind},
     system_globals::SYSTEM_UPTIME_GLOBALS,
     type_environment::{TypeEnvironment, TypeEnvironmentBuilder},
-    type_table, xform_fold_constant_expressions, xform_fold_initializer_expressions,
-    xform_insert_implicit_deref, xform_int_to_bool_initializer, xform_mark_unwritten_constants,
-    xform_named_to_positional_args, xform_resolve_adr, xform_resolve_constant_expressions,
-    xform_resolve_decl_types, xform_resolve_expr_types, xform_resolve_late_bound_expr_kind,
+    xform_bind_call_arguments, xform_fold_constant_expressions, xform_fold_initializer_expressions,
+    xform_insert_implicit_conversions, xform_insert_implicit_deref, xform_int_to_bool_initializer,
+    xform_mark_unwritten_constants, xform_remove_unsigned_abs, xform_resolve_adr,
+    xform_resolve_constant_expressions, xform_resolve_decl_types, xform_resolve_expr_types,
+    xform_resolve_initial_values, xform_resolve_late_bound_expr_kind,
     xform_resolve_late_bound_type_initializer, xform_resolve_symbol_and_function_environment,
-    xform_resolve_type_aliases, xform_resolve_type_decl_environment, xform_toposort_declarations,
+    xform_resolve_type_decl_environment, xform_toposort_declarations,
 };
 
 /// Analyze runs semantic analysis on the set of files as a self-contained and complete unit.
@@ -66,16 +74,16 @@ pub fn analyze(
         context.add_diagnostics(diagnostics);
     }
 
-    // TODO this is currently in progress. It isn't clear to me yet how this will influence
-    // semantic analysis, but it should because the type table should influence rule checking.
-    // For now, this is just after the rules as they were originally written.
-    match type_table::apply(&library) {
-        Ok(type_table_result) => {
-            debug!("{type_table_result:?}");
-        }
-        Err(diagnostics) => {
-            context.add_diagnostics(diagnostics);
-        }
+    // Record the implicit conversions the backends compile and the language
+    // server shows. After the rules, so that a rule checks the operands the
+    // program wrote rather than their conversions. See ADR-0056.
+    let library = xform_insert_implicit_conversions::apply(library, &context, options);
+
+    // A rule that reads the type the pass records on each literal, so it
+    // runs on the library the pass returns. It reads an operand as the
+    // program wrote it through the conversion that wraps it.
+    if let Err(diagnostics) = rule_constant_range::apply(&library, &context, options) {
+        context.add_diagnostics(diagnostics);
     }
 
     Ok((library, context))
@@ -137,6 +145,11 @@ fn run_best_effort(
     }
 }
 
+/// Resolves every declaration's and expression's type (stage 2).
+///
+/// The library this returns does not yet record implicit conversions: those
+/// are inserted by [`analyze`] after the semantic rules, so a backend compiles
+/// what [`analyze`] returns.
 pub fn resolve_types(
     sources: &[&Library],
     options: &CompilerOptions,
@@ -169,7 +182,8 @@ pub fn resolve_types(
             .expect("SIZEOF should not conflict with stdlib");
     }
 
-    let mut symbol_environment = SymbolEnvironment::new();
+    let mut symbol_environment =
+        SymbolEnvironment::new().with_bare_globals(options.allow_top_level_var_global);
 
     // Register implicit system globals when the uptime feature is enabled.
     if options.allow_system_uptime_global {
@@ -179,6 +193,7 @@ pub fn resolve_types(
                     &Id::from(global.name),
                     SymbolKind::Variable,
                     &ScopeKind::Global,
+                    type_environment.id_of(&TypeName::from(global.type_name)),
                 )
                 .map_err(|e| vec![e])?;
         }
@@ -258,6 +273,18 @@ pub fn resolve_types(
         xform_int_to_bool_initializer::apply(lib, &mut type_environment, options)
     });
 
+    // Record the type id each declaration declares, entering types spelled
+    // out in place as anonymous types. Runs before the symbol environment
+    // is built so that each variable symbol records its declared type id.
+    library = run_reverting_on_error(library, &mut diagnostics, |lib| {
+        xform_resolve_decl_types::apply(lib, &mut type_environment)
+    });
+
+    // Resolve the default of every declared type while the declarations
+    // still name the types they were written with: resolving expression
+    // types rewrites an alias in an initializer to the type it aliases.
+    let type_defaults = xform_resolve_initial_values::TypeDefaults::of(&type_environment, &library);
+
     // Best effort: a repeated declaration name is diagnosed here, by the
     // environments, and the first declaration is kept, so the rest of the
     // library still resolves instead of reverting on the first repeat.
@@ -266,25 +293,35 @@ pub fn resolve_types(
             lib,
             &mut symbol_environment,
             &mut function_environment,
+            &mut type_environment,
         )
     });
 
-    // Convert named function call arguments to positional.
-    // Best effort: a diagnosed call keeps its named arguments, which is the
-    // state reverting would leave every call in -- including the valid ones.
+    // Write every call's arguments in normal form: named, in the order the
+    // callee declares its parameters, which is the order they are evaluated
+    // in (specs/design/call-binding.md). Best effort: a call that does not
+    // bind keeps its arguments, and the problem is reported, here for a
+    // function call and by the rules for the others.
+    let (bound, binding_diagnostics) = xform_bind_call_arguments::apply(
+        library,
+        &symbol_environment,
+        &type_environment,
+        &function_environment,
+    );
+    library = bound;
+    diagnostics.extend(binding_diagnostics);
+
+    // Resolve expression types using the function environment. Best effort:
+    // an unqualified enumerated value whose type is ambiguous is diagnosed
+    // and left without a type, and the rest of the library keeps its types.
     library = run_best_effort(library, &mut diagnostics, |lib| {
-        xform_named_to_positional_args::apply(lib, &function_environment)
-    });
-
-    // Record the type id each declaration declares, entering types spelled
-    // out in place as anonymous types.
-    library = run_reverting_on_error(library, &mut diagnostics, |lib| {
-        xform_resolve_decl_types::apply(lib, &mut type_environment)
-    });
-
-    // Resolve expression types using the function environment.
-    library = run_reverting_on_error(library, &mut diagnostics, |lib| {
-        xform_resolve_expr_types::apply(lib, &mut type_environment, &function_environment, options)
+        xform_resolve_expr_types::apply(
+            lib,
+            &symbol_environment,
+            &mut type_environment,
+            &function_environment,
+            options,
+        )
     });
 
     // Fold constant binary and unary expressions.
@@ -292,8 +329,9 @@ pub fn resolve_types(
         xform_fold_constant_expressions::apply(lib)
     });
 
+    // ABS of an unsigned value is the value itself; no back end sees it.
     library = run_reverting_on_error(library, &mut diagnostics, |lib| {
-        xform_resolve_type_aliases::apply(lib, &type_environment, &mut symbol_environment)
+        xform_remove_unsigned_abs::apply(lib, &type_environment)
     });
 
     // Mark every variable the program never writes as CONSTANT, so the
@@ -316,13 +354,19 @@ pub fn resolve_types(
     debug!("Symbol Environment:");
     debug!("{symbol_environment:?}");
 
+    // What runs, and when, resolved once next to `reachable`, so that a
+    // backend builds from it rather than deciding it again.
+    let model = execution_model::resolve(&library, options);
+
     let mut context = SemanticContext::new(
         type_environment,
         function_environment,
         symbol_environment,
         reachable,
         *options,
-    );
+    )
+    .with_execution_model(model)
+    .with_type_defaults(type_defaults);
     context.add_diagnostics(diagnostics);
 
     Ok((library, context))
@@ -339,6 +383,7 @@ pub(crate) fn semantic(
 ) -> SemanticResult {
     let functions: Vec<fn(&Library, &SemanticContext, &CompilerOptions) -> SemanticResult> = vec![
         rule_abstract_not_instantiated::apply,
+        rule_array_initializer_length::apply,
         rule_assignment_aggregate_type_compat::apply,
         rule_decl_struct_element_unique_names::apply,
         rule_range_limits::apply,
@@ -346,16 +391,21 @@ pub(crate) fn semantic(
         rule_enum_base_type_allowed::apply,
         rule_enum_explicit_value_allowed::apply,
         rule_enumeration_values_unique::apply,
+        rule_loop_control_inside_loop::apply,
         rule_extends_field_duplicated::apply,
         rule_function_block_call_unsupported::apply,
         rule_function_block_invocation::apply,
         rule_function_call_declared::apply,
+        rule_function_call_in_out_argument::apply,
         rule_function_call_type_check::apply,
+        rule_member_qualifier_allowed::apply,
+        rule_member_qualifier_invalid::apply,
         rule_method_call_declared::apply,
         rule_program_task_definition_exists::apply,
         rule_program_var_hides_global::apply,
         rule_no_top_level_var_global::apply,
         rule_operator_operand_type_check::apply,
+        rule_task_configuration::apply,
         rule_task_names_unique::apply,
         rule_stdlib_type_redefinition::apply,
         rule_string_encoding_compat::apply,
@@ -364,18 +414,24 @@ pub(crate) fn semantic(
         rule_temporal_literal_range::apply,
         rule_struct_initializer_expression_allowed::apply,
         rule_use_declared_enumerated_value::apply,
+        rule_use_declared_field::apply,
         rule_use_declared_symbolic_var::apply,
+        rule_return_type_declared::apply,
         rule_unsupported_extension::apply,
         rule_var_decl_const_initialized::apply,
         rule_var_decl_const_not_fb::apply,
         rule_var_decl_initializer_type_compat::apply,
         rule_var_decl_global_const_requires_external_const::apply,
+        rule_var_external_matches_global::apply,
         rule_mixed_located_var_declarations::apply,
         rule_pou_hierarchy::apply,
         rule_bit_and_partial_access_range::apply,
+        rule_array_index_range::apply,
+        rule_array_subscript_count::apply,
         rule_case_bit_string_label::apply,
         rule_case_selector_type::apply,
-        rule_constant_range::apply,
+        rule_condition_type::apply,
+        rule_constant_not_written::apply,
         rule_ref_to::apply,
     ];
 
@@ -847,5 +903,88 @@ END_RESOURCE
 END_CONFIGURATION",
         );
         assert!(codes.is_empty(), "expected no diagnostics, got: {codes:?}");
+    }
+
+    fn variable_type_id(
+        context: &crate::semantic_context::SemanticContext,
+        name: &str,
+        scope: &crate::symbol_environment::ScopeKind,
+    ) -> Option<ironplc_dsl::type_id::TypeId> {
+        context
+            .symbols()
+            .find(&ironplc_dsl::core::Id::from(name), scope)
+            .expect("variable symbol")
+            .type_id
+    }
+
+    #[test]
+    fn resolve_types_when_variables_declared_then_symbols_record_type_id() {
+        use crate::symbol_environment::{ScopeKind, ScopePath};
+        use crate::test_helpers::parse_and_resolve_types_with_context;
+        use ironplc_dsl::common::TypeName;
+        use ironplc_dsl::core::Id;
+
+        let (_library, context) = parse_and_resolve_types_with_context(
+            "
+TYPE Point : STRUCT x : INT; END_STRUCT; END_TYPE
+PROGRAM main
+  VAR
+    count : INT;
+    p : Point;
+    arr : ARRAY[1..2] OF DINT;
+  END_VAR
+END_PROGRAM
+CONFIGURATION config
+  VAR_GLOBAL
+    flag : BOOL;
+  END_VAR
+  RESOURCE res ON PLC
+    TASK t(INTERVAL := T#100ms, PRIORITY := 1);
+    PROGRAM inst WITH t : main;
+  END_RESOURCE
+END_CONFIGURATION
+",
+        );
+        let types = context.types();
+        let main = ScopeKind::Named(ScopePath::new(vec![Id::from("main")]));
+
+        assert_eq!(
+            variable_type_id(&context, "count", &main),
+            types.id_of(&TypeName::from("INT"))
+        );
+        assert_eq!(
+            variable_type_id(&context, "p", &main),
+            types.id_of(&TypeName::from("Point"))
+        );
+        let arr = variable_type_id(&context, "arr", &main).expect("anonymous array type id");
+        assert!(types.get_by_id(arr).unwrap().representation.is_array());
+        assert_eq!(
+            variable_type_id(&context, "flag", &ScopeKind::Global),
+            types.id_of(&TypeName::from("BOOL"))
+        );
+    }
+
+    #[test]
+    fn resolve_types_when_system_uptime_global_then_symbol_records_type_id() {
+        use crate::symbol_environment::ScopeKind;
+        use crate::test_helpers::parse_and_resolve_types_with_options;
+        use ironplc_dsl::common::TypeName;
+
+        let options = CompilerOptions {
+            allow_system_uptime_global: true,
+            ..CompilerOptions::default()
+        };
+        let (_library, context) = parse_and_resolve_types_with_options(
+            "
+PROGRAM main
+END_PROGRAM
+",
+            &options,
+        );
+
+        assert_eq!(
+            variable_type_id(&context, "__SYSTEM_UP_LTIME", &ScopeKind::Global),
+            context.types().id_of(&TypeName::from("LTIME"))
+        );
     }
 }

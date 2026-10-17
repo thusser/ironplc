@@ -13,8 +13,8 @@ use ironplc_dsl::visitor::Visitor;
 use ironplc_problems::Problem;
 use log::trace;
 
-use crate::intermediate_type::IntermediateType;
 use crate::scoped_table::{ScopedTable, Value};
+use crate::semantic_type::SemanticType;
 use crate::type_environment::TypeEnvironment;
 
 /// Derived data types declared.
@@ -151,9 +151,9 @@ impl TypeResolver<'_> {
     fn classify(&self, name: &TypeName) -> Option<ResolvedKind> {
         if let Some(attrs) = self.type_environment.get(name) {
             return Some(match &attrs.representation {
-                IntermediateType::FunctionBlock { .. } => ResolvedKind::FunctionBlock,
-                IntermediateType::Structure { .. } => ResolvedKind::Structure,
-                IntermediateType::Enumeration { .. } => ResolvedKind::Enumeration,
+                SemanticType::FunctionBlock { .. } => ResolvedKind::FunctionBlock,
+                SemanticType::Structure { .. } => ResolvedKind::Structure,
+                SemanticType::Enumeration { .. } => ResolvedKind::Enumeration,
                 _ => ResolvedKind::Other,
             });
         }
@@ -268,7 +268,7 @@ impl Fold<Diagnostic> for TypeResolver<'_> {
                     // Subrange types (e.g., MY_RANGE : INT (1..100))
                     if ty.representation.is_subrange() {
                         return Ok(InitialValueAssignmentKind::Subrange(
-                            SpecificationKind::Named(name),
+                            SubrangeInitialValueAssignment::bare(SpecificationKind::Named(name)),
                         ));
                     }
                 }
@@ -327,7 +327,7 @@ impl Fold<Diagnostic> for TypeResolver<'_> {
                             }),
                         ),
                         TypeDefinitionKind::Subrange => Ok(InitialValueAssignmentKind::Subrange(
-                            SpecificationKind::Named(name),
+                            SubrangeInitialValueAssignment::bare(SpecificationKind::Named(name)),
                         )),
                         _ => Err(Diagnostic::todo_with_type(&name)),
                     },
@@ -393,6 +393,7 @@ END_FUNCTION_BLOCK
                     span: SourceSpan::default(),
                     oop: None,
                     methods: vec![],
+                    properties: vec![],
                 }),
                 LibraryElementKind::FunctionBlockDeclaration(FunctionBlockDeclaration {
                     name: TypeName::from("caller"),
@@ -402,6 +403,7 @@ END_FUNCTION_BLOCK
                     span: SourceSpan::default(),
                     oop: None,
                     methods: vec![],
+                    properties: vec![],
                 }),
             ],
         };
@@ -452,6 +454,7 @@ END_FUNCTION_BLOCK
                     span: SourceSpan::default(),
                     oop: None,
                     methods: vec![],
+                    properties: vec![],
                 }),
             ],
         };
@@ -501,6 +504,7 @@ END_FUNCTION_BLOCK
                     span: SourceSpan::default(),
                     oop: None,
                     methods: vec![],
+                    properties: vec![],
                 }),
             ],
         };
@@ -538,7 +542,10 @@ END_FUNCTION_BLOCK
             assert_eq!(fb.variables.len(), 1);
             assert!(matches!(
                 &fb.variables[0].initializer,
-                InitialValueAssignmentKind::Subrange(SpecificationKind::Named(tn))
+                InitialValueAssignmentKind::Subrange(SubrangeInitialValueAssignment {
+                    spec: SpecificationKind::Named(tn),
+                    initial_value: None,
+                })
                 if *tn == TypeName::from("my_range")
             ));
         }
@@ -851,5 +858,73 @@ END_PROGRAM",
                 ..
             })
         ));
+    }
+
+    fn interface_options() -> CompilerOptions {
+        CompilerOptions {
+            allow_fb_inheritance: true,
+            ..CompilerOptions::default()
+        }
+    }
+
+    fn only_prototype_variable(library: &Library) -> &VarDecl {
+        let itf = library
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                LibraryElementKind::InterfaceDeclaration(itf) => Some(itf),
+                _ => None,
+            })
+            .unwrap();
+        &itf.methods[0].variables[0]
+    }
+
+    #[test]
+    fn apply_when_method_prototype_parameter_has_enum_type_then_resolves_type() {
+        let program = "
+TYPE
+    E_Mode : (idle, busy);
+END_TYPE
+
+INTERFACE I_Axis
+METHOD Move : BOOL
+VAR_INPUT
+    mode : E_Mode;
+END_VAR
+END_METHOD
+END_INTERFACE
+        ";
+        let input =
+            ironplc_parser::parse_program(program, &FileId::default(), &interface_options())
+                .unwrap();
+        let mut type_environment = TypeEnvironment::new();
+        let (result, diagnostics) = apply(input, &mut type_environment).unwrap();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(matches!(
+            only_prototype_variable(&result).initializer,
+            InitialValueAssignmentKind::EnumeratedType(_)
+        ));
+    }
+
+    #[test]
+    fn apply_when_method_prototype_parameter_has_undeclared_type_then_p2008() {
+        let program = "
+INTERFACE I_Axis
+METHOD Move : BOOL
+VAR_INPUT
+    mode : E_Missing;
+END_VAR
+END_METHOD
+END_INTERFACE
+        ";
+        let input =
+            ironplc_parser::parse_program(program, &FileId::default(), &interface_options())
+                .unwrap();
+        let mut type_environment = TypeEnvironment::new();
+        let (_, diagnostics) = apply(input, &mut type_environment).unwrap();
+
+        assert_eq!(1, diagnostics.len());
+        assert_eq!(Problem::UndeclaredUnknownType.code(), diagnostics[0].code);
     }
 }

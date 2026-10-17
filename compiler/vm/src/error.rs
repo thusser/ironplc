@@ -25,8 +25,19 @@ pub enum Trap {
         index: i32,
         total_elements: u32,
     },
+    /// An array subscript of a type wider than `DINT` held a value outside
+    /// the range of `DINT`, so it names no element.
+    SubscriptOutOfRange {
+        value: i128,
+    },
     UnexpectedEndOfBytecode,
     CallStackOverflow,
+    /// The dispatch loop needed the topmost call frame -- to store the
+    /// program counter back into it, or to pop it on a return -- and the
+    /// frame stack was empty. The loop only runs while a frame is live, so
+    /// this is a VM defect; it is a trap rather than a panic so that a
+    /// broken invariant halts the VM through the fault path.
+    CallStackUnderflow,
     InvalidCmpOp(u8),
     /// A string opcode encountered an operand whose `char_width` did not
     /// match the expected encoding. Per ADR-0034 the analyzer rejects
@@ -58,6 +69,18 @@ pub enum Trap {
     /// computed (a hand-built or legacy container). `Vm::load` rejects it
     /// before any code runs.
     ZeroCallDepth,
+    /// The variable table has fewer slots than the container requires.
+    /// `Vm::load` rejects the container before any code runs.
+    ///
+    /// `required` is the number of slots the container needs; `available` is
+    /// the smaller of the variable count the container declares and the size
+    /// of the embedder's variable buffer. For example, a container that sets
+    /// `FLAG_HAS_SYSTEM_UPTIME` requires two slots, because every scan writes
+    /// `__SYSTEM_UP_TIME` and `__SYSTEM_UP_LTIME` to slots 0 and 1.
+    VariableTableTooSmall {
+        required: u16,
+        available: u16,
+    },
     /// A `COPY_REGION` named a destination and a source whose array
     /// descriptors describe spans of different byte sizes.
     ///
@@ -189,8 +212,12 @@ impl fmt::Display for Trap {
                     "array index out of bounds: index {index} for array variable {var_index} with {total_elements} elements"
                 )
             }
+            Trap::SubscriptOutOfRange { value } => {
+                write!(f, "array subscript {value} is outside the range of DINT")
+            }
             Trap::UnexpectedEndOfBytecode => write!(f, "bytecode ended mid-instruction"),
             Trap::CallStackOverflow => write!(f, "call stack overflow"),
+            Trap::CallStackUnderflow => write!(f, "call stack underflow"),
             Trap::InvalidCmpOp(code) => write!(f, "invalid comparison operator code: 0x{code:02X}"),
             Trap::EncodingMismatch { expected, actual } => write!(
                 f,
@@ -207,6 +234,15 @@ impl fmt::Display for Trap {
             }
             Trap::ZeroCallDepth => {
                 write!(f, "container declares a maximum call depth of zero")
+            }
+            Trap::VariableTableTooSmall {
+                required,
+                available,
+            } => {
+                write!(
+                    f,
+                    "variable table too small: container requires {required} slots but {available} are available"
+                )
             }
             Trap::RegionSizeMismatch {
                 dst_bytes,
@@ -237,6 +273,7 @@ mod tests {
     #[case(Trap::DivideByZero, "divide by zero")]
     #[case(Trap::StackOverflow, "stack overflow")]
     #[case(Trap::StackUnderflow, "stack underflow")]
+    #[case(Trap::CallStackUnderflow, "call stack underflow")]
     #[case(Trap::InvalidInstruction(0xAB), "invalid instruction: 0xAB")]
     #[case(
         Trap::InvalidConstantIndex(ConstantIndex::new(5)),
@@ -270,6 +307,10 @@ mod tests {
             total_elements: 5,
         },
         "array index out of bounds: index 10 for array variable 2 with 5 elements"
+    )]
+    #[case(
+        Trap::SubscriptOutOfRange { value: 4294967295 },
+        "array subscript 4294967295 is outside the range of DINT"
     )]
     #[case(Trap::UnexpectedEndOfBytecode, "bytecode ended mid-instruction")]
     #[case(Trap::CallStackOverflow, "call stack overflow")]
@@ -364,6 +405,10 @@ mod tests {
         "program declares call depth 64 but VM frame buffer holds at most 32"
     )]
     #[case(Trap::ZeroCallDepth, "container declares a maximum call depth of zero")]
+    #[case(
+        Trap::VariableTableTooSmall { required: 2, available: 1 },
+        "variable table too small: container requires 2 slots but 1 are available"
+    )]
     fn trap_display_when_variant_then_expected(#[case] trap: Trap, #[case] expected: &str) {
         assert_eq!(format!("{trap}"), expected);
     }
@@ -388,6 +433,7 @@ mod tests {
         },
         "V4006"
     )]
+    #[case(Trap::SubscriptOutOfRange { value: -2147483649 }, "V4007")]
     #[case(Trap::StackOverflow, "V9001")]
     #[case(Trap::StackUnderflow, "V9002")]
     #[case(Trap::InvalidInstruction(0xFF), "V9003")]
@@ -405,6 +451,8 @@ mod tests {
         "V9016"
     )]
     #[case(Trap::ZeroCallDepth, "V9017")]
+    #[case(Trap::VariableTableTooSmall { required: 2, available: 1 }, "V9019")]
+    #[case(Trap::CallStackUnderflow, "V9020")]
     fn v_code_when_variant_then_expected(#[case] trap: Trap, #[case] expected: &str) {
         assert_eq!(trap.v_code(), expected);
     }
@@ -424,6 +472,7 @@ mod tests {
             .exit_code(),
             1
         );
+        assert_eq!(Trap::SubscriptOutOfRange { value: 0 }.exit_code(), 1);
     }
 
     #[test]
@@ -462,5 +511,14 @@ mod tests {
             3
         );
         assert_eq!(Trap::ZeroCallDepth.exit_code(), 3);
+        assert_eq!(
+            Trap::VariableTableTooSmall {
+                required: 2,
+                available: 1,
+            }
+            .exit_code(),
+            3
+        );
+        assert_eq!(Trap::CallStackUnderflow.exit_code(), 3);
     }
 }

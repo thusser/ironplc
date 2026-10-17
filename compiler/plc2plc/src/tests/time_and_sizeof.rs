@@ -48,3 +48,47 @@ fn write_to_string_when_temporal_literal_then_keeps_its_own_prefix(
         "expected {expected_prefix} in the rendering:\n{rendered}"
     );
 }
+
+#[rstest::rstest]
+#[case::two_units("T#1m30s")]
+#[case::underscore("T#1h_30m")]
+#[case::fractional_last("T#1m1.5s")]
+fn write_to_string_when_compound_duration_then_round_trips(#[case] literal: &str) {
+    // A compound duration renders as its total in milliseconds, which
+    // re-parses to the same interval.
+    let source = format!("PROGRAM main\nVAR\n    t : TIME := {literal};\nEND_VAR\nEND_PROGRAM\n");
+    assert_round_trips(&source, &CompilerOptions::default());
+}
+
+/// The fraction of a daytime's seconds survives the round trip, written with
+/// its trailing zeros removed. It used to be written as a microsecond count
+/// padded to two digits, so 5 ms (5,000 us) came back as `.5000`, half a
+/// second (issue #1921).
+#[rstest::rstest]
+#[case::tod("t : TIME_OF_DAY := TOD#10:00:00.250;", "TIME_OF_DAY#10:00:00.25;")]
+#[case::tod_milliseconds("t : TIME_OF_DAY := TOD#10:00:00.005;", "TIME_OF_DAY#10:00:00.005;")]
+#[case::tod_nanoseconds(
+    "t : TIME_OF_DAY := TOD#10:00:00.000000001;",
+    "TIME_OF_DAY#10:00:00.000000001;"
+)]
+#[case::tod_whole("t : TIME_OF_DAY := TOD#10:00:00;", "TIME_OF_DAY#10:00:00;")]
+#[case::ltod("t : LTIME_OF_DAY := LTOD#10:00:00.250;", "LTIME_OF_DAY#10:00:00.25;")]
+#[case::dt(
+    "d : DT := DT#2024-01-02-10:00:00.75;",
+    "DATE_AND_TIME#2024-01-02-10:00:00.75;"
+)]
+#[case::ldt(
+    "d : LDT := LDT#2024-01-02-10:00:00.005;",
+    "LDATE_AND_TIME#2024-01-02-10:00:00.005;"
+)]
+fn write_to_string_when_daytime_literal_has_fraction_then_round_trips(
+    #[case] declaration: &str,
+    #[case] expected: &str,
+) {
+    let source = format!("PROGRAM main\nVAR\n  {declaration}\nEND_VAR\nEND_PROGRAM");
+    let rendered = assert_round_trips(&source, &edition3());
+    assert!(
+        rendered.contains(expected),
+        "expected {expected} in the rendering:\n{rendered}"
+    );
+}

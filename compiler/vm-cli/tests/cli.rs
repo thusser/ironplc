@@ -802,11 +802,9 @@ fn write_compiled_container(path: &Path, source: &str) {
     let library =
         ironplc_parser::parse_program(source, &ironplc_dsl::core::FileId::default(), &options)
             .unwrap();
-    let (analyzed, context) =
-        ironplc_analyzer::stages::resolve_types(&[&library], &options).unwrap();
+    let (analyzed, context) = ironplc_analyzer::stages::analyze(&[&library], &options).unwrap();
     let container = ironplc_codegen::compile(
-        &analyzed,
-        &context,
+        ironplc_analyzer::CleanAnalysis::new(&analyzed, &context).unwrap(),
         &ironplc_codegen::CodegenOptions::default(),
         &ironplc_codegen::EmptyLookup,
     )
@@ -815,6 +813,40 @@ fn write_compiled_container(path: &Path, source: &str) {
     let mut buf = Vec::new();
     container.write_to(&mut buf).unwrap();
     std::fs::write(path, &buf).unwrap();
+}
+
+/// A `UDINT` subscript whose value is outside the range of `DINT` halts the
+/// program with V4007, rather than selecting the element its bits would name
+/// as a `DINT`.
+#[test]
+fn run_when_subscript_outside_dint_then_exit_1_and_v4007() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = TempDir::new()?;
+    let container_path = dir.path().join("subscript.iplc");
+    write_compiled_container(
+        &container_path,
+        "
+PROGRAM main
+  VAR
+    values : ARRAY[-3..5] OF INT;
+    i : UDINT := 4294967295;
+    result : INT;
+  END_VAR
+  result := values[i];
+END_PROGRAM
+",
+    );
+
+    let mut cmd = Command::new(cargo::cargo_bin!("ironplcvm"));
+    cmd.arg("run").arg(&container_path).arg("--scans").arg("1");
+    cmd.assert()
+        .code(1)
+        .stderr(predicate::str::contains("V4007"))
+        .stderr(predicate::str::contains(
+            "array subscript 4294967295 is outside the range of DINT",
+        ));
+
+    Ok(())
 }
 
 /// A `STRING_TO_UDINT` compiled under the strict default (reject, trap)
@@ -871,6 +903,7 @@ PROGRAM main
     span  : TIME := T#1500ms;
     day   : DATE := D#2024-01-15;
     clock : TIME_OF_DAY := TOD#14:30:00;
+    tick  : TIME_OF_DAY := TOD#14:30:00.250;
     stamp : DATE_AND_TIME := DT#2024-01-15-14:30:00;
   END_VAR
   flag := flag;
@@ -895,6 +928,10 @@ END_PROGRAM
     assert!(dump.contains("span: T#1500ms\n"), "dump was:\n{dump}");
     assert!(dump.contains("day: D#2024-01-15\n"), "dump was:\n{dump}");
     assert!(dump.contains("clock: TOD#14:30:00\n"), "dump was:\n{dump}");
+    assert!(
+        dump.contains("tick: TOD#14:30:00.250\n"),
+        "dump was:\n{dump}"
+    );
     assert!(
         dump.contains("stamp: DT#2024-01-15-14:30:00\n"),
         "dump was:\n{dump}"
@@ -1022,21 +1059,33 @@ END_PROGRAM
     Ok(())
 }
 
-/// A named subrange also reaches the renderer without an elementary type tag,
-/// but its slot *does* hold its value. It must keep showing it.
+/// A named subrange's slot holds its value at its base type's width and
+/// signedness, so it renders as its base type. Rendering it as a 32-bit
+/// signed integer showed a `LINT` subrange as its low word and an unsigned
+/// one above 2^31 as negative.
 #[spec_test(REQ_VC_vm_cli_009)]
-fn run_when_dump_vars_and_named_subrange_then_shows_value() -> Result<(), Box<dyn std::error::Error>>
-{
+fn run_when_dump_vars_and_named_subrange_then_shows_value_at_base_type_width(
+) -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new()?;
     let container_path = dir.path().join("sub.iplc");
     write_compiled_container(
         &container_path,
         "
-TYPE Level : INT (0..100); END_TYPE
+TYPE
+    Level : INT (0..100);
+    Big : LINT (0..10000000000);
+    BigAlias : Big;
+    Huge : ULINT (0..18446744073709551615);
+    Wide : UDINT (0..4294967295);
+END_TYPE
 
 PROGRAM main
 VAR
     lvl : Level := 75;
+    big : Big := 4294967297;
+    alias : BigAlias := 4294967298;
+    huge : Huge := 18446744073709551615;
+    wide : Wide := 4294967295;
 END_VAR
 END_PROGRAM
 ",
@@ -1052,6 +1101,13 @@ END_PROGRAM
     let dump = String::from_utf8(out.get_output().stdout.clone())?;
 
     assert!(dump.contains("lvl: 75\n"), "dump was:\n{dump}");
+    assert!(dump.contains("big: 4294967297\n"), "dump was:\n{dump}");
+    assert!(dump.contains("alias: 4294967298\n"), "dump was:\n{dump}");
+    assert!(
+        dump.contains("huge: 18446744073709551615\n"),
+        "dump was:\n{dump}"
+    );
+    assert!(dump.contains("wide: 4294967295\n"), "dump was:\n{dump}");
 
     Ok(())
 }

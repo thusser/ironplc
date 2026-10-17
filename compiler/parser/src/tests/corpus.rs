@@ -49,6 +49,7 @@ fn parse_when_first_steps_function_block_counter_fbd_then_builds_structure() {
                     }),
                     block: next_block_id(),
                     type_id: None,
+                    reset_on_call: false,
                 },
                 VarDecl::simple("_TMP_ADD4_OUT", "INT"),
                 VarDecl::simple("_TMP_SEL7_OUT", "INT"),
@@ -61,6 +62,7 @@ fn parse_when_first_steps_function_block_counter_fbd_then_builds_structure() {
             span: SourceSpan::default(),
             oop: None,
             methods: vec![],
+            properties: vec![],
         },
     ));
     assert_eq!(actual, expected);
@@ -93,6 +95,7 @@ fn parse_when_first_steps_func_avg_val_then_builds_structure() {
                     }),
                     block: next_block_id(),
                     type_id: None,
+                    reset_on_call: false,
                 },
             ],
             edge_variables: vec![],
@@ -123,6 +126,7 @@ fn parse_when_first_steps_func_avg_val_then_builds_structure() {
                     ExprKind::late_bound("InputsNumber"),
                 ),
             )],
+            result: Default::default(),
         },
     ));
     assert_eq!(actual, expected)
@@ -187,6 +191,7 @@ fn parse_when_first_steps_configuration_then_builds_structure() {
                 }),
                 block: next_block_id(),
                 type_id: None,
+                reset_on_call: false,
             }],
             resource_decl: vec![ResourceDeclaration {
                 name: Id::from("resource1"),
@@ -250,6 +255,7 @@ fn parse_when_first_steps_function_block_logger_then_test_apply_when_names_corre
             span: SourceSpan::default(),
             oop: None,
             methods: vec![],
+            properties: vec![],
         },
     ));
 
@@ -276,6 +282,7 @@ fn parse_when_first_steps_function_block_counter_sfc_then_builds_structure() {
                     }),
                     block: next_block_id(),
                     type_id: None,
+                    reset_on_call: false,
                 },
             ],
             edge_variables: vec![],
@@ -345,6 +352,7 @@ fn parse_when_first_steps_function_block_counter_sfc_then_builds_structure() {
             span: SourceSpan::default(),
             oop: None,
             methods: vec![],
+            properties: vec![],
         },
     ));
     assert_eq!(actual, expected);

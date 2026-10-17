@@ -1,7 +1,10 @@
 use indexmap::IndexMap;
-use ironplc_dsl::common::{TypeName, VariableType};
+use ironplc_dsl::common::{Accessor, DeclarationQualifier, TypeName, VariableType};
 use ironplc_dsl::core::{Id, Located};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
+use ironplc_dsl::scope::ScopeNode;
+use ironplc_dsl::textual::SelfRefKind;
+use ironplc_dsl::type_id::TypeId;
 use ironplc_problems::Problem;
 
 /// A scope's position in the nesting tree: the chain of declaration
@@ -37,6 +40,72 @@ impl From<Id> for ScopePath {
     }
 }
 
+/// Tracks the scope a traversal is in, from the `enter_scope` and
+/// `exit_scope` hooks, so that a pass can look names up in the
+/// [`SymbolEnvironment`] from where it is.
+#[derive(Debug, Default)]
+pub(crate) struct ScopeTracker {
+    /// The chain of declaration names the traversal is inside, outermost
+    /// first.
+    path: Vec<Id>,
+}
+
+impl ScopeTracker {
+    /// The name `node`'s scope is known by in a [`ScopePath`]. Every pass
+    /// that keys symbols by scope tracks scopes with this type, so they all
+    /// name a scope the same way.
+    fn name_of(node: &ScopeNode<'_>) -> Id {
+        match node {
+            ScopeNode::Function(node) => node.name.clone(),
+            ScopeNode::FunctionBlock(node) => node.name.name.clone(),
+            ScopeNode::Program(node) => node.name.clone(),
+            // An accessor is named after its property, so GET and SET would
+            // share a scope; the accessor keeps them apart. `.` cannot
+            // appear in an identifier, so this never names a method.
+            ScopeNode::Method(node) => match node.accessor {
+                None => node.name.clone(),
+                Some(accessor) => {
+                    let suffix = match accessor {
+                        Accessor::Get => "GET",
+                        Accessor::Set => "SET",
+                    };
+                    Id::from(&format!("{}.{suffix}", node.name.original()))
+                        .with_position(node.name.span.clone())
+                }
+            },
+            ScopeNode::MethodPrototype(node) => node.name.clone(),
+            ScopeNode::Interface(node) => node.name.clone(),
+        }
+    }
+
+    /// Enters the scope `node` opens.
+    pub(crate) fn enter(&mut self, node: &ScopeNode<'_>) {
+        self.path.push(Self::name_of(node));
+    }
+
+    /// Leaves the innermost scope.
+    pub(crate) fn exit(&mut self) {
+        self.path.pop();
+    }
+
+    /// The scope the traversal is in.
+    pub(crate) fn current(&self) -> ScopeKind {
+        if self.path.is_empty() {
+            ScopeKind::Global
+        } else {
+            ScopeKind::Named(ScopePath::new(self.path.clone()))
+        }
+    }
+
+    /// The scope `node` opens when the traversal enters it from the
+    /// current scope, for a pass that declares into it before entering.
+    pub(crate) fn scope_of(&self, node: &ScopeNode<'_>) -> ScopeKind {
+        let mut path = self.path.clone();
+        path.push(Self::name_of(node));
+        ScopeKind::Named(ScopePath::new(path))
+    }
+}
+
 /// Represents the kind of scope a symbol belongs to
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScopeKind {
@@ -68,12 +137,18 @@ pub enum SymbolKind {
     /// Constant declaration
     #[allow(unused)]
     Constant,
-    /// Enumeration value
-    EnumerationValue,
     /// Structure element
     StructureElement,
     /// Edge variable (rising/falling edge)
     EdgeVariable,
+    /// The implicit result variable of a function, or of a method that
+    /// declares a return type: the declaration's own name, assigned by its
+    /// body (`F := ...` inside `FUNCTION F`). A declared variable of the
+    /// same name replaces it.
+    ResultVariable,
+    /// A `PROPERTY` of a function block, recorded in the block's scope.
+    /// Reading or writing it by name is not implemented yet.
+    Property,
 }
 
 /// Metadata associated with a symbol
@@ -87,17 +162,16 @@ pub struct SymbolInfo {
     pub visibility_scope: ScopeKind,
     /// Whether this symbol is a reference to an external declaration
     pub is_external: bool,
-    /// The data type of the symbol (if applicable)
-    pub data_type: Option<String>,
-    /// For enumeration values, the type name of the enumeration
-    /// TODO this should probably be a new struct that is a TypeRef
-    /// so that we can distinguish between the actual place of the declaration
-    /// and a reference to the declaration.
-    pub enum_type: Option<TypeName>,
-    /// For structure fields, the type name of the structure
-    pub struct_type: Option<TypeName>,
+    /// For variables, the id of the declared type in the type
+    /// environment. `None` for symbols that are not variables and for a
+    /// variable whose type the analyzer could not resolve.
+    pub type_id: Option<TypeId>,
     /// The variable type qualifier (VAR, VAR_INPUT, VAR_OUTPUT, etc.)
     pub variable_type: Option<VariableType>,
+    /// The qualifier the declaration was written with (CONSTANT, RETAIN,
+    /// etc.). Recorded before the compiler infers constants, so a variable
+    /// that is never written but not declared `CONSTANT` is not constant here.
+    pub qualifier: Option<DeclarationQualifier>,
     /// Formatted hardware address (e.g. "%IX0.0") for direct variables
     pub address: Option<String>,
     /// Source location information
@@ -106,6 +180,12 @@ pub struct SymbolInfo {
     /// uptime globals. There is no source location to point at, and a user
     /// declaration of the name is reported as reserved.
     pub compiler_provided: bool,
+    /// For a function block, whether it is declared `ABSTRACT`: it exists
+    /// only to be extended and cannot be instantiated.
+    pub is_abstract: bool,
+    /// For a function block, the function block it `EXTENDS`, whose
+    /// fields its own scope sees as well.
+    pub extends: Option<TypeName>,
 }
 
 impl SymbolInfo {
@@ -115,13 +195,14 @@ impl SymbolInfo {
             scope: scope.clone(),
             visibility_scope: scope,
             is_external: false,
-            data_type: None,
-            enum_type: None,
-            struct_type: None,
+            type_id: None,
             variable_type: None,
+            qualifier: None,
             address: None,
             span,
             compiler_provided: false,
+            is_abstract: false,
+            extends: None,
         }
     }
 
@@ -130,20 +211,26 @@ impl SymbolInfo {
         self
     }
 
+    /// Set the function block a function block `EXTENDS`
+    pub fn with_extends(mut self, extends: Option<TypeName>) -> Self {
+        self.extends = extends;
+        self
+    }
+
+    /// Set whether a function block is declared `ABSTRACT`
+    pub fn with_abstract(mut self, is_abstract: bool) -> Self {
+        self.is_abstract = is_abstract;
+        self
+    }
+
     pub fn with_external(mut self, is_external: bool) -> Self {
         self.is_external = is_external;
         self
     }
 
-    /// Set the enumeration type for enumeration value symbols
-    pub fn with_enum_type(mut self, enum_type: TypeName) -> Self {
-        self.enum_type = Some(enum_type);
-        self
-    }
-
-    /// Set the structure type for structure field symbols
-    pub fn with_struct_type(mut self, struct_type: TypeName) -> Self {
-        self.struct_type = Some(struct_type);
+    /// Set the id of the variable's declared type
+    pub fn with_type_id(mut self, type_id: Option<TypeId>) -> Self {
+        self.type_id = type_id;
         self
     }
 
@@ -155,6 +242,73 @@ impl SymbolInfo {
     pub fn with_address(mut self, addr: String) -> Self {
         self.address = Some(addr);
         self
+    }
+
+    pub fn with_qualifier(mut self, qualifier: DeclarationQualifier) -> Self {
+        self.qualifier = Some(qualifier);
+        self
+    }
+
+    /// Whether the variable was declared `CONSTANT`.
+    pub fn is_constant(&self) -> bool {
+        self.qualifier == Some(DeclarationQualifier::Constant)
+    }
+}
+
+/// A variable declaration, named by the scope it is declared in and its
+/// name.
+///
+/// This is not an id the analyzer allocates. It is how the program itself
+/// names a declaration: a name is declared at most once in a scope
+/// (`P4014`), so the pair is unique in a library that analysis accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeclRef {
+    /// The scope the declaration is in. For a field a function block
+    /// inherits through `EXTENDS`, this is the scope of the block that
+    /// declares it, not of the block that uses it.
+    pub scope: ScopeKind,
+    /// The name, as the declaration spells it.
+    pub name: Id,
+}
+
+/// What a name refers to when a body uses it as a variable. See
+/// [`SymbolEnvironment::resolve_variable`].
+///
+/// `decl` names the variable, and `info` describes the declaration the name
+/// reaches from where it is used. They are the same declaration except
+/// through a `VAR_EXTERNAL`: `decl` is then the global the external names,
+/// which is the variable a read or a write reaches, and `info` is the
+/// `VAR_EXTERNAL` declaration itself, whose qualifier is the one the body
+/// sees.
+#[derive(Debug, Clone)]
+pub enum Resolution<'a> {
+    /// A variable the reference may use.
+    Variable { decl: DeclRef, info: &'a SymbolInfo },
+    /// A global the scope does not reach: the name is a `VAR_GLOBAL`, and
+    /// nothing nearer (such as a `VAR_EXTERNAL`) declares it.
+    GlobalNotVisible { decl: DeclRef, info: &'a SymbolInfo },
+    /// The name is declared, but not as a variable (a type, a program, a
+    /// function block, ...).
+    NotAVariable,
+    /// Nothing visible declares the name.
+    Undeclared,
+}
+
+impl<'a> Resolution<'a> {
+    /// The variable the name refers to, whether or not the scope reaches
+    /// it.
+    ///
+    /// For a caller that types or checks a variable. A global the scope
+    /// does not reach is still answered for: reporting it is the job of
+    /// the rule that reports an undefined variable, and a second pass
+    /// that refused it would only lose what is known about the variable.
+    pub fn declared(self) -> Option<&'a SymbolInfo> {
+        match self {
+            Resolution::Variable { info, .. } | Resolution::GlobalNotVisible { info, .. } => {
+                Some(info)
+            }
+            Resolution::NotAVariable | Resolution::Undeclared => None,
+        }
     }
 }
 
@@ -171,11 +325,23 @@ fn is_variable(kind: &SymbolKind) -> bool {
     )
 }
 
+/// Whether a body can name `kind` as a variable: the kinds a `VAR*` block
+/// declares, and the result variable of a function or method.
+fn is_named_as_variable(kind: &SymbolKind) -> bool {
+    is_variable(kind) || *kind == SymbolKind::ResultVariable
+}
+
+/// Whether `kind` is a member of a function block: a variable, or a
+/// property, which shares its block's scope with the block's variables.
+fn is_member(kind: &SymbolKind) -> bool {
+    is_variable(kind) || *kind == SymbolKind::Property
+}
+
 /// The problem a second declaration of a name in one scope is: `P4014` for
-/// a variable repeating a variable, otherwise whatever a repeated global
-/// declaration is.
+/// a variable or property repeating a variable or property, otherwise
+/// whatever a repeated global declaration is.
 fn repeated_symbol(existing: &SymbolKind, repeat: &SymbolKind) -> Option<Problem> {
-    if is_variable(existing) && is_variable(repeat) {
+    if is_member(existing) && is_member(repeat) {
         return Some(Problem::SymbolDeclDuplicated);
     }
     repeated_declaration(existing, repeat)
@@ -200,9 +366,9 @@ fn reserved_name(name: &Id) -> Diagnostic {
 /// The problem a second global declaration of a name is, when `existing`
 /// and `repeat` are both declarations and at least one is a program or a
 /// configuration. A pair of types or function blocks is the type
-/// environment's to report. The global scope also holds enumeration values,
-/// structure elements and global variables, whose uniqueness other rules
-/// own, so a pair involving one of those is `None`.
+/// environment's to report. The global scope also holds global variables.
+/// A variable repeating a variable is [`repeated_symbol`]'s to report, so a
+/// pair involving a variable is `None` here.
 fn repeated_declaration(existing: &SymbolKind, repeat: &SymbolKind) -> Option<Problem> {
     let is_declaration = |kind: &SymbolKind| {
         matches!(
@@ -249,6 +415,11 @@ pub struct SymbolEnvironment {
     global_symbols: IndexMap<Id, SymbolInfo>,
     /// Scoped symbols (variables within functions, function blocks, etc.)
     scoped_symbols: IndexMap<ScopeKind, IndexMap<Id, SymbolInfo>>,
+    /// Whether a body may use a `VAR_GLOBAL` directly, without a
+    /// `VAR_EXTERNAL` naming it. The vendor dialects that declare globals
+    /// in top-level lists (`--allow-top-level-var-global`) allow it; IEC
+    /// 61131-3 reaches a global only through `VAR_EXTERNAL`.
+    bare_globals: bool,
 }
 
 impl SymbolEnvironment {
@@ -256,7 +427,19 @@ impl SymbolEnvironment {
         Self {
             global_symbols: IndexMap::new(),
             scoped_symbols: IndexMap::new(),
+            bare_globals: false,
         }
+    }
+
+    /// Set whether a body may use a `VAR_GLOBAL` directly, without a
+    /// `VAR_EXTERNAL` naming it.
+    ///
+    /// The environment holds this, rather than each lookup being told, so
+    /// that every caller of [`Self::resolve_variable`] gets the same
+    /// answer for the same name.
+    pub fn with_bare_globals(mut self, bare_globals: bool) -> Self {
+        self.bare_globals = bare_globals;
+        self
     }
 
     /// Insert a symbol into the environment.
@@ -287,27 +470,41 @@ impl SymbolEnvironment {
         name: &Id,
         kind: SymbolKind,
         scope: &ScopeKind,
+        type_id: Option<TypeId>,
     ) -> Result<(), Diagnostic> {
         self.insert_symbol(
             name,
-            SymbolInfo::new(kind, scope.clone(), name.span()).with_compiler_provided(),
+            SymbolInfo::new(kind, scope.clone(), name.span())
+                .with_type_id(type_id)
+                .with_compiler_provided(),
         )
     }
 
-    /// Insert a variable with direction and optional hardware address.
+    /// Insert a variable with direction, declaration qualifier, the id of
+    /// its declared type and optional hardware address. The symbol's kind
+    /// follows from the section the variable is declared in.
     ///
     /// A name already declared in the scope is returned as `P4014`, as for
     /// [`Self::insert`].
     pub fn insert_variable(
         &mut self,
         name: &Id,
-        kind: SymbolKind,
         scope: &ScopeKind,
         variable_type: VariableType,
+        qualifier: DeclarationQualifier,
+        type_id: Option<TypeId>,
         address: Option<String>,
     ) -> Result<(), Diagnostic> {
+        let kind = match variable_type {
+            VariableType::Input => SymbolKind::Parameter,
+            VariableType::Output => SymbolKind::OutputParameter,
+            VariableType::InOut => SymbolKind::InOutParameter,
+            _ => SymbolKind::Variable,
+        };
         let mut symbol_info = SymbolInfo::new(kind, scope.clone(), name.span())
-            .with_variable_type(variable_type.clone());
+            .with_variable_type(variable_type.clone())
+            .with_qualifier(qualifier)
+            .with_type_id(type_id);
         if let Some(addr) = address {
             symbol_info = symbol_info.with_address(addr);
         }
@@ -317,8 +514,18 @@ impl SymbolEnvironment {
         self.insert_symbol(name, symbol_info)
     }
 
+    /// Insert a symbol described by `info`, in `info`'s scope.
+    ///
+    /// A repeated name is reported as for [`Self::insert`].
+    pub fn insert_info(&mut self, name: &Id, info: SymbolInfo) -> Result<(), Diagnostic> {
+        self.insert_symbol(name, info)
+    }
+
     /// The one insertion path: checks the scope for a repeated name, then
     /// records the symbol in that scope.
+    ///
+    /// The global scope has its own map; [`Self::symbols_in`] is the read
+    /// side of this choice.
     fn insert_symbol(&mut self, name: &Id, info: SymbolInfo) -> Result<(), Diagnostic> {
         let symbols = match &info.scope {
             ScopeKind::Global => &mut self.global_symbols,
@@ -336,137 +543,203 @@ impl SymbolEnvironment {
         Ok(())
     }
 
-    /// Insert an enumeration value with its type information
-    pub fn insert_enumeration_value(
-        &mut self,
-        name: &Id,
-        enum_type: &TypeName,
-        scope: &ScopeKind,
-    ) -> Result<(), Diagnostic> {
-        let symbol_info = SymbolInfo::new(SymbolKind::EnumerationValue, scope.clone(), name.span())
-            .with_enum_type(enum_type.clone());
-
-        match scope {
-            ScopeKind::Global => {
-                self.global_symbols.insert(name.clone(), symbol_info);
-            }
-            ScopeKind::Named(_) => {
-                let scope_symbols = self.scoped_symbols.entry(scope.clone()).or_default();
-
-                scope_symbols.insert(name.clone(), symbol_info);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Insert a structure field with its type information
-    pub fn insert_structure_field(
-        &mut self,
-        name: &Id,
-        struct_type: &TypeName,
-        scope: &ScopeKind,
-    ) -> Result<(), Diagnostic> {
-        let symbol_info = SymbolInfo::new(SymbolKind::StructureElement, scope.clone(), name.span())
-            .with_struct_type(struct_type.clone());
-
-        match scope {
-            ScopeKind::Global => {
-                self.global_symbols.insert(name.clone(), symbol_info);
-            }
-            ScopeKind::Named(_) => {
-                let scope_symbols = self.scoped_symbols.entry(scope.clone()).or_default();
-
-                scope_symbols.insert(name.clone(), symbol_info);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Duplicate enumeration values from one type to another (for aliases)
-    pub fn duplicate_enumeration_values_for_alias(
-        &mut self,
-        source_type: &TypeName,
-        alias_type: &TypeName,
-    ) -> Result<(), Diagnostic> {
-        // Find all enumeration values for the source type and collect them
-        let source_values: Vec<Id> = self
-            .get_enumeration_values_for_type(source_type)
-            .iter()
-            .map(|id| (*id).clone())
-            .collect();
-
-        // Duplicate each value with the alias type
-        for value_name in source_values {
-            self.insert_enumeration_value(&value_name, alias_type, &ScopeKind::Global)?;
-        }
-
-        Ok(())
-    }
-
-    /// Duplicate structure field symbols from one type to another (for aliases)
-    pub fn duplicate_structure_fields_for_alias(
-        &mut self,
-        source_type: &TypeName,
-        alias_type: &TypeName,
-    ) -> Result<(), Diagnostic> {
-        // Find all structure field symbols for the source type and collect them
-        let source_fields: Vec<Id> = self
-            .get_structure_fields_for_type(source_type)
-            .iter()
-            .map(|id| (*id).clone())
-            .collect();
-
-        // Duplicate each field with the alias type
-        for field_name in source_fields {
-            self.insert_structure_field(&field_name, alias_type, &ScopeKind::Global)?;
-        }
-
-        Ok(())
-    }
-
-    /// Duplicate array element type information from one type to another (for aliases)
-    pub fn duplicate_array_elements_for_alias(
-        &mut self,
-        _source_type: &TypeName,
-        _alias_type: &TypeName,
-    ) -> Result<(), Diagnostic> {
-        // For arrays, we don't need to duplicate symbols like we do for enumerations
-        // and structures, since arrays don't have named elements that need to be
-        // accessible through the alias. The array type itself is what gets aliased.
-        // Array elements are accessed by index, not by name.
-        Ok(())
-    }
-
     /// Finds a symbol visible from the given scope.
     ///
     /// Walks outward through the enclosing scopes and then the global
     /// scope, so a method body sees its function block's fields and an
-    /// inner declaration shadows an outer one of the same name.
+    /// inner declaration shadows an outer one of the same name. A
+    /// function block's scope is followed by those of the function blocks
+    /// it `EXTENDS`, nearest first, so a derived block and its methods see
+    /// the fields it inherits.
     pub fn find(&self, name: &Id, scope: &ScopeKind) -> Option<&SymbolInfo> {
+        self.find_declaration(name, scope).map(|(_, info)| info)
+    }
+
+    /// As [`Self::find`], with the name as the declaration spells it.
+    fn find_declaration(&self, name: &Id, scope: &ScopeKind) -> Option<(&Id, &SymbolInfo)> {
+        self.visible_scopes(scope)
+            .iter()
+            .find_map(|scope| self.symbols_in(scope)?.get_key_value(name))
+    }
+
+    /// The declaration `name` refers to as a variable from the scope
+    /// `from`, by the language's scope rules.
+    ///
+    /// This is the one place that decides which declaration a variable
+    /// reference names. It applies, in order:
+    ///
+    /// 1. **Lookup order.** The nearest declaration of the name is the one
+    ///    [`Self::find`] returns: the enclosing scopes innermost first,
+    ///    then the `EXTENDS` chain, then the global scope. A nearer
+    ///    declaration that is not a variable still hides a farther one
+    ///    that is.
+    /// 2. **Global visibility.** A `VAR_GLOBAL` is reached through a
+    ///    `VAR_EXTERNAL`, which is a variable of the scope that declares
+    ///    it, unless the dialect lets a body use globals directly
+    ///    ([`Self::with_bare_globals`]). A global the compiler provides is
+    ///    always usable.
+    /// 3. **A `VAR_EXTERNAL` is its global.** A name that reaches a
+    ///    `VAR_EXTERNAL` declaration resolves to the global variable of
+    ///    that name, which the declaration gives the body access to. The
+    ///    external is not a variable of its own, so every unit that names
+    ///    one global through an external resolves to one [`DeclRef`].
+    ///
+    /// An external that names no global variable is an error, which
+    /// `rule_var_external_matches_global` reports. It resolves to its own
+    /// declaration, so that the rest of the body is still checked.
+    pub fn resolve_variable(&self, name: &Id, from: &ScopeKind) -> Resolution<'_> {
+        let Some((declared, info)) = self.find_declaration(name, from) else {
+            return Resolution::Undeclared;
+        };
+        if !is_named_as_variable(&info.kind) {
+            return Resolution::NotAVariable;
+        }
+        let global = info
+            .is_external
+            .then(|| self.global_variable(name))
+            .flatten();
+        let decl = match global {
+            Some((global_name, _)) => DeclRef {
+                scope: ScopeKind::Global,
+                name: global_name.clone(),
+            },
+            None => DeclRef {
+                scope: info.scope.clone(),
+                name: declared.clone(),
+            },
+        };
+        if self.is_usable(info) {
+            Resolution::Variable { decl, info }
+        } else {
+            Resolution::GlobalNotVisible { decl, info }
+        }
+    }
+
+    /// The global variable named `name`, with the name as its declaration
+    /// spells it: one a `VAR_GLOBAL` block declares, or one the compiler
+    /// provides. `None` when the global scope declares no variable of that
+    /// name, whatever else it declares under it.
+    ///
+    /// This is the variable a `VAR_EXTERNAL` declaration of `name` names.
+    pub fn global_variable(&self, name: &Id) -> Option<(&Id, &SymbolInfo)> {
+        self.global_symbols
+            .get_key_value(name)
+            .filter(|(_, info)| is_variable(&info.kind))
+    }
+
+    /// Whether a body may use the variable `info` describes by name: every
+    /// variable but a `VAR_GLOBAL` the body has to reach through a
+    /// `VAR_EXTERNAL`.
+    fn is_usable(&self, info: &SymbolInfo) -> bool {
+        let is_declared_global =
+            info.scope == ScopeKind::Global && info.variable_type == Some(VariableType::Global);
+        !is_declared_global || info.compiler_provided || self.bare_globals
+    }
+
+    /// The function block `THIS^` or `SUPER^` names from `scope`.
+    ///
+    /// Inside a function block's body, its methods and its property
+    /// accessors, `THIS^` names that block and `SUPER^` the block it
+    /// `EXTENDS`. `None` outside a function block (in a program or a
+    /// function), and for `SUPER^` in a block that extends nothing.
+    pub fn self_type(&self, scope: &ScopeKind, kind: SelfRefKind) -> Option<TypeName> {
+        let ScopeKind::Named(path) = scope else {
+            return None;
+        };
+        let unit = &path.segments()[0];
+        let block = self.function_block(unit)?;
+        match kind {
+            SelfRefKind::This => Some(TypeName::from_id(unit)),
+            SelfRefKind::Super => block.extends.clone(),
+        }
+    }
+
+    /// The symbol of the function block named `name`, or `None` when
+    /// `name` is not a function block.
+    fn function_block(&self, name: &Id) -> Option<&SymbolInfo> {
+        self.global_symbols
+            .get(name)
+            .filter(|info| info.kind == SymbolKind::FunctionBlock)
+    }
+
+    /// The scopes a name is looked up in from `scope`, innermost first:
+    /// each enclosing scope, the scopes of the function blocks the
+    /// outermost one `EXTENDS`, then the global scope.
+    fn visible_scopes(&self, scope: &ScopeKind) -> Vec<ScopeKind> {
+        let mut scopes = Vec::new();
         if let ScopeKind::Named(path) = scope {
             let segments = path.segments();
             for depth in (1..=segments.len()).rev() {
-                let enclosing = ScopeKind::Named(ScopePath::new(segments[..depth].to_vec()));
-                if let Some(symbol) = self
-                    .scoped_symbols
-                    .get(&enclosing)
-                    .and_then(|symbols| symbols.get(name))
-                {
-                    return Some(symbol);
+                scopes.push(ScopeKind::Named(ScopePath::new(segments[..depth].to_vec())));
+            }
+            scopes.extend(self.base_scopes(&segments[0]));
+        }
+        scopes.push(ScopeKind::Global);
+        scopes
+    }
+
+    /// The scopes of the function blocks `unit` `EXTENDS`, nearest first.
+    /// Empty when `unit` is not a function block or extends nothing.
+    fn base_scopes(&self, unit: &Id) -> Vec<ScopeKind> {
+        let mut scopes = Vec::new();
+        // The analyzer rejects a cycle in the chain, but a name seen twice
+        // still ends the walk rather than looping.
+        let mut seen = vec![unit.clone()];
+        let mut unit = unit;
+        while let Some(base) = self
+            .function_block(unit)
+            .and_then(|info| info.extends.as_ref())
+        {
+            if seen.contains(&base.name) {
+                break;
+            }
+            seen.push(base.name.clone());
+            scopes.push(ScopeKind::Named(ScopePath::new(vec![base.name.clone()])));
+            unit = &base.name;
+        }
+        scopes
+    }
+
+    /// The member named `name` that the function block `block` inherits:
+    /// the nearest variable or property of that name that a block it
+    /// `EXTENDS` declares, with the name as that declaration spells it.
+    /// `None` when no block in the chain declares one, whatever `block`
+    /// itself declares.
+    pub fn inherited_member(&self, name: &Id, block: &Id) -> Option<(&Id, &SymbolInfo)> {
+        self.base_scopes(block).iter().find_map(|scope| {
+            self.symbols_in(scope)?
+                .get_key_value(name)
+                .filter(|(_, info)| is_member(&info.kind))
+        })
+    }
+
+    /// The variables visible from `scope`, as [`Self::find`] would see
+    /// them: innermost scope first, each name listed once at its nearest
+    /// declaration. Result variables count as variables.
+    pub fn visible_variables(&self, scope: &ScopeKind) -> Vec<(&Id, &SymbolInfo)> {
+        let mut visible: IndexMap<&Id, &SymbolInfo> = IndexMap::new();
+        for scope in self.visible_scopes(scope) {
+            let Some(symbols) = self.symbols_in(&scope) else {
+                continue;
+            };
+            for (name, info) in symbols {
+                if is_named_as_variable(&info.kind) {
+                    visible.entry(name).or_insert(info);
                 }
             }
         }
-
-        // Fall back to global scope
-        self.global_symbols.get(name)
+        visible.into_iter().collect()
     }
 
-    /// Get a symbol by name and scope (alias for find)
-    #[allow(dead_code)]
-    pub fn get(&self, name: &Id, scope: &ScopeKind) -> Option<&SymbolInfo> {
-        self.find(name, scope)
+    /// The variables of [`Self::visible_variables`] that a body in `scope`
+    /// may use by name: all of them but the globals
+    /// [`Self::resolve_variable`] answers [`Resolution::GlobalNotVisible`]
+    /// for. These are the names worth suggesting for a misspelled one.
+    pub fn usable_variables(&self, scope: &ScopeKind) -> Vec<(&Id, &SymbolInfo)> {
+        self.visible_variables(scope)
+            .into_iter()
+            .filter(|(_, info)| self.is_usable(info))
+            .collect()
     }
 
     /// Returns all program declarations from the global scope.
@@ -485,10 +758,23 @@ impl SymbolEnvironment {
             .collect()
     }
 
+    /// The symbols declared directly in `scope`, or `None` when nothing is.
+    ///
+    /// The global scope lives in its own map, as [`Self::insert_symbol`]
+    /// stores it; every other scope is keyed in `scoped_symbols`.
+    fn symbols_in(&self, scope: &ScopeKind) -> Option<&IndexMap<Id, SymbolInfo>> {
+        match scope {
+            ScopeKind::Global => Some(&self.global_symbols),
+            ScopeKind::Named(_) => self.scoped_symbols.get(scope),
+        }
+    }
+
     /// Returns all variable-like symbols in the given scope (variables,
-    /// parameters, output parameters, and in-out parameters).
+    /// parameters, output parameters, and in-out parameters). For
+    /// [`ScopeKind::Global`] these are the global variables, including the
+    /// ones the compiler provides.
     pub fn get_variables_in_scope(&self, scope: &ScopeKind) -> Vec<(&Id, &SymbolInfo)> {
-        let Some(scope_symbols) = self.scoped_symbols.get(scope) else {
+        let Some(scope_symbols) = self.symbols_in(scope) else {
             return vec![];
         };
         scope_symbols
@@ -507,35 +793,11 @@ impl SymbolEnvironment {
 
     /// Iterate over every symbol in the environment: the global symbols
     /// first, followed by every scoped symbol across all named scopes.
-    ///
-    /// This is the shared traversal used by the read-only lookups that need
-    /// to consider both global and scoped declarations.
-    fn all_symbols(&self) -> impl Iterator<Item = (&Id, &SymbolInfo)> {
+    #[cfg(test)]
+    pub(crate) fn all_symbols(&self) -> impl Iterator<Item = (&Id, &SymbolInfo)> {
         self.global_symbols
             .iter()
             .chain(self.scoped_symbols.values().flat_map(|scope| scope.iter()))
-    }
-
-    /// Get all enumeration values for a specific enumeration type
-    pub fn get_enumeration_values_for_type(&self, enum_type: &TypeName) -> Vec<&Id> {
-        self.all_symbols()
-            .filter(|(_, symbol)| {
-                matches!(symbol.kind, SymbolKind::EnumerationValue)
-                    && symbol.enum_type.as_ref() == Some(enum_type)
-            })
-            .map(|(name, _)| name)
-            .collect()
-    }
-
-    /// Get all structure fields for a specific structure type
-    pub fn get_structure_fields_for_type(&self, struct_type: &TypeName) -> Vec<&Id> {
-        self.all_symbols()
-            .filter(|(_, symbol)| {
-                matches!(symbol.kind, SymbolKind::StructureElement)
-                    && symbol.struct_type.as_ref() == Some(struct_type)
-            })
-            .map(|(name, _)| name)
-            .collect()
     }
 }
 
@@ -555,565 +817,6 @@ impl std::fmt::Debug for SymbolEnvironment {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ironplc_dsl::core::Id;
-
-    #[test]
-    fn symbol_environment_basic_operations_when_inserting_and_finding_symbols_then_works_correctly()
-    {
-        let mut env = SymbolEnvironment::new();
-
-        // Test inserting global symbols
-        let id1 = Id::from("GLOBAL_VAR");
-        let id2 = Id::from("FUNCTION_NAME");
-
-        env.insert(&id1, SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-        env.insert(&id2, SymbolKind::Program, &ScopeKind::Global)
-            .unwrap();
-
-        // Test finding symbols
-        let symbol1 = env.find(&id1, &ScopeKind::Global).unwrap();
-        assert_eq!(symbol1.kind, SymbolKind::Variable);
-
-        let symbol2 = env.find(&id2, &ScopeKind::Global).unwrap();
-        assert_eq!(symbol2.kind, SymbolKind::Program);
-
-        // Test scoped symbols
-        let scope = ScopeKind::Named(Id::from("FUNCTION_BLOCK").into());
-        let id3 = Id::from("LOCAL_VAR");
-
-        env.insert(&id3, SymbolKind::Variable, &scope).unwrap();
-
-        let symbol3 = env.find(&id3, &scope).unwrap();
-        assert_eq!(symbol3.kind, SymbolKind::Variable);
-
-        // Test scope hierarchy (local scope should find global symbols)
-        let symbol1_in_scope = env.find(&id1, &scope).unwrap();
-        assert_eq!(symbol1_in_scope.kind, SymbolKind::Variable);
-    }
-
-    #[test]
-    fn symbol_environment_scope_management_when_managing_scopes_then_symbols_are_in_correct_scopes()
-    {
-        let mut env = SymbolEnvironment::new();
-
-        let global_id = Id::from("GLOBAL");
-        let function_id = Id::from("FUNCTION");
-        let local_id = Id::from("LOCAL");
-
-        // Insert global symbol
-        env.insert(&global_id, SymbolKind::Program, &ScopeKind::Global)
-            .unwrap();
-
-        // Insert function symbol
-        env.insert(&function_id, SymbolKind::Program, &ScopeKind::Global)
-            .unwrap();
-
-        // Insert local symbol in function scope
-        let function_scope = ScopeKind::Named(function_id.clone().into());
-        env.insert(&local_id, SymbolKind::Variable, &function_scope)
-            .unwrap();
-
-        // Verify symbols are in correct scopes
-        assert!(env.find(&global_id, &ScopeKind::Global).is_some());
-        assert!(env.find(&function_id, &ScopeKind::Global).is_some());
-        assert!(env.find(&local_id, &function_scope).is_some());
-
-        // Verify local symbol is not visible globally
-        assert!(env.find(&local_id, &ScopeKind::Global).is_none());
-
-        // Verify global symbols are visible from local scope
-        assert!(env.find(&global_id, &function_scope).is_some());
-    }
-
-    #[test]
-    fn get_when_checking_symbol_existence_then_returns_correct_results() {
-        let mut env = SymbolEnvironment::new();
-
-        let id1 = Id::from("GLOBAL_VAR");
-        let id2 = Id::from("LOCAL_VAR");
-
-        // Insert global symbol
-        env.insert(&id1, SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        // Test get method (alias for find)
-        let symbol1 = env.get(&id1, &ScopeKind::Global).unwrap();
-        assert_eq!(symbol1.kind, SymbolKind::Variable);
-
-        let symbol2 = env.get(&id2, &ScopeKind::Global);
-        assert!(symbol2.is_none());
-    }
-
-    #[test]
-    fn default_implementation_when_creating_default_then_creates_empty_environment() {
-        let env = SymbolEnvironment::default();
-
-        // Default should create an empty environment
-        assert_eq!(env.all_symbols().count(), 0);
-
-        // Should be equivalent to new()
-        let env2 = SymbolEnvironment::new();
-        assert_eq!(env.all_symbols().count(), env2.all_symbols().count());
-    }
-
-    #[test]
-    fn debug_implementation_when_debugging_then_formats_correctly() {
-        let mut env = SymbolEnvironment::new();
-
-        // Test debug output for empty environment
-        let debug_output = format!("{env:?}");
-        assert!(debug_output.contains("SymbolEnvironment"));
-        assert!(debug_output.contains("global_symbols"));
-        assert!(debug_output.contains("scoped_symbols"));
-
-        // Test debug output with symbols
-        let id = Id::from("TEST_VAR");
-        env.insert(&id, SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        let debug_output = format!("{env:?}");
-        assert!(debug_output.contains("SymbolEnvironment"));
-        assert!(debug_output.contains("global_symbols"));
-        assert!(debug_output.contains("scoped_symbols"));
-    }
-
-    #[test]
-    fn scope_kind_variants_when_creating_scope_kinds_then_creates_correct_variants() {
-        // Test Global scope
-        let global_scope = ScopeKind::Global;
-        assert_eq!(global_scope, ScopeKind::Global);
-
-        // Test Named scope
-        let function_id = Id::from("TEST_FUNCTION");
-        let named_scope = ScopeKind::Named(function_id.clone().into());
-        assert_eq!(named_scope, ScopeKind::Named(function_id.into()));
-
-        // Test scope comparison
-        assert_ne!(global_scope, named_scope);
-
-        // Test scope cloning
-        let cloned_scope = named_scope.clone();
-        assert_eq!(named_scope, cloned_scope);
-    }
-
-    #[test]
-    fn edge_cases_and_error_conditions_when_handling_edge_cases_then_handles_correctly() {
-        let mut env = SymbolEnvironment::new();
-
-        // A name declared twice in one scope is reported rather than
-        // silently overwriting the first declaration.
-        let id = Id::from("DUPLICATE_VAR");
-        env.insert(&id, SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-        assert!(env
-            .insert(&id, SymbolKind::Variable, &ScopeKind::Global)
-            .is_err());
-
-        // Test finding symbol in wrong scope
-        let global_id = Id::from("GLOBAL_ONLY");
-        env.insert(&global_id, SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        let wrong_scope = ScopeKind::Named(Id::from("WRONG_FUNCTION").into());
-        let found = env.find(&global_id, &wrong_scope);
-        // Global symbols are accessible from any scope, so this should find the symbol
-        assert!(found.is_some());
-
-        // Test scope hierarchy with non-existent scope
-        let non_existent_scope = ScopeKind::Named(Id::from("NON_EXISTENT").into());
-        let found = env.find(&global_id, &non_existent_scope);
-        assert!(found.is_some()); // Should find in global scope
-    }
-
-    #[test]
-    fn get_enumeration_values_for_type_when_values_in_global_and_scoped_then_returns_matching_only()
-    {
-        let mut env = SymbolEnvironment::new();
-        let enum_type = TypeName::from("COLOR");
-        let other_type = TypeName::from("SIZE");
-
-        // Global enumeration value of the requested type.
-        env.insert_enumeration_value(&Id::from("RED"), &enum_type, &ScopeKind::Global)
-            .unwrap();
-        // Scoped enumeration value of the requested type.
-        let scope = ScopeKind::Named(Id::from("FB").into());
-        env.insert_enumeration_value(&Id::from("GREEN"), &enum_type, &scope)
-            .unwrap();
-        // Enumeration value of a different type (should be excluded).
-        env.insert_enumeration_value(&Id::from("SMALL"), &other_type, &ScopeKind::Global)
-            .unwrap();
-        // Non-enumeration symbol whose enum_type is None (should be excluded).
-        env.insert(&Id::from("PLAIN"), SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        let values = env.get_enumeration_values_for_type(&enum_type);
-        assert_eq!(values.len(), 2);
-        assert!(values.iter().any(|id| **id == Id::from("RED")));
-        assert!(values.iter().any(|id| **id == Id::from("GREEN")));
-    }
-
-    #[test]
-    fn get_enumeration_values_for_type_when_no_matching_values_then_returns_empty() {
-        let mut env = SymbolEnvironment::new();
-        env.insert(&Id::from("PLAIN"), SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        let values = env.get_enumeration_values_for_type(&TypeName::from("COLOR"));
-        assert!(values.is_empty());
-    }
-
-    #[test]
-    fn get_structure_fields_for_type_when_fields_in_global_and_scoped_then_returns_matching_only() {
-        let mut env = SymbolEnvironment::new();
-        let struct_type = TypeName::from("POINT");
-        let other_type = TypeName::from("LINE");
-
-        // Global structure field of the requested type.
-        env.insert_structure_field(&Id::from("X"), &struct_type, &ScopeKind::Global)
-            .unwrap();
-        // Scoped structure field of the requested type.
-        let scope = ScopeKind::Named(Id::from("FB").into());
-        env.insert_structure_field(&Id::from("Y"), &struct_type, &scope)
-            .unwrap();
-        // Structure field of a different type (should be excluded).
-        env.insert_structure_field(&Id::from("START"), &other_type, &ScopeKind::Global)
-            .unwrap();
-        // Non-structure symbol whose struct_type is None (should be excluded).
-        env.insert(&Id::from("PLAIN"), SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        let fields = env.get_structure_fields_for_type(&struct_type);
-        assert_eq!(fields.len(), 2);
-        assert!(fields.iter().any(|id| **id == Id::from("X")));
-        assert!(fields.iter().any(|id| **id == Id::from("Y")));
-    }
-
-    #[test]
-    fn get_structure_fields_for_type_when_no_matching_fields_then_returns_empty() {
-        let mut env = SymbolEnvironment::new();
-        env.insert(&Id::from("PLAIN"), SymbolKind::Variable, &ScopeKind::Global)
-            .unwrap();
-
-        let fields = env.get_structure_fields_for_type(&TypeName::from("POINT"));
-        assert!(fields.is_empty());
-    }
-
-    #[test]
-    fn symbol_info_span_and_scope_when_creating_symbol_info_then_has_correct_span_and_scope() {
-        let span = ironplc_dsl::core::SourceSpan::default();
-        let scope = ScopeKind::Named(Id::from("TEST_FUNCTION").into());
-
-        let symbol_info = SymbolInfo::new(SymbolKind::Variable, scope.clone(), span);
-
-        // Test that scope and visibility_scope are set correctly
-        assert_eq!(symbol_info.scope, scope);
-        assert_eq!(symbol_info.visibility_scope, scope);
-        assert_eq!(symbol_info.span, ironplc_dsl::core::SourceSpan::default());
-        assert!(!symbol_info.is_external);
-        assert!(symbol_info.data_type.is_none());
-    }
-
-    /// A scope path nests, so a symbol declared in an enclosing scope is
-    /// visible from an inner one -- how a method body sees the fields of
-    /// the function block it is declared on.
-    #[test]
-    fn find_when_symbol_is_in_enclosing_scope_then_found_from_inner_scope() {
-        let mut env = SymbolEnvironment::new();
-
-        let outer = ScopeKind::Named(Id::from("FB_Motor").into());
-        let inner = ScopeKind::Named(ScopePath::new(vec![
-            Id::from("FB_Motor"),
-            Id::from("GetSpeed"),
-        ]));
-
-        let field = Id::from("speed");
-        env.insert(&field, SymbolKind::Variable, &outer).unwrap();
-
-        assert!(
-            env.find(&field, &inner).is_some(),
-            "an enclosing scope's symbol should be visible from the inner scope"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Repeated global declaration names.
-    // -----------------------------------------------------------------
-
-    fn global(env: &mut SymbolEnvironment, name: &str, kind: SymbolKind) -> Result<(), Diagnostic> {
-        env.insert(&Id::from(name), kind, &ScopeKind::Global)
-    }
-
-    #[test]
-    fn insert_when_program_repeats_program_then_p4013_and_first_kept() {
-        let mut env = SymbolEnvironment::new();
-        let first = Id::from("Main");
-        env.insert(&first, SymbolKind::Program, &ScopeKind::Global)
-            .unwrap();
-
-        let error = global(&mut env, "main", SymbolKind::Program).unwrap_err();
-
-        assert_eq!(error.code, Problem::PouDeclNameDuplicated.code());
-        let kept = env.find(&Id::from("Main"), &ScopeKind::Global).unwrap();
-        assert_eq!(kept.span, first.span());
-    }
-
-    #[test]
-    fn insert_when_program_repeats_function_block_then_p4013() {
-        let mut env = SymbolEnvironment::new();
-        global(&mut env, "T", SymbolKind::FunctionBlock).unwrap();
-
-        let error = global(&mut env, "T", SymbolKind::Program).unwrap_err();
-
-        assert_eq!(error.code, Problem::PouDeclNameDuplicated.code());
-    }
-
-    /// A repeated type or function block is the type environment's to
-    /// report, so it is recorded here without a second diagnostic.
-    #[test]
-    fn insert_when_function_block_repeats_type_then_ok_here() {
-        let mut env = SymbolEnvironment::new();
-        global(&mut env, "T", SymbolKind::Type).unwrap();
-
-        assert!(global(&mut env, "T", SymbolKind::FunctionBlock).is_ok());
-    }
-
-    #[test]
-    fn insert_when_program_repeats_configuration_then_p4013() {
-        let mut env = SymbolEnvironment::new();
-        global(&mut env, "C", SymbolKind::Configuration).unwrap();
-
-        let error = global(&mut env, "C", SymbolKind::Program).unwrap_err();
-
-        assert_eq!(error.code, Problem::PouDeclNameDuplicated.code());
-    }
-
-    #[test]
-    fn insert_variable_when_name_repeated_in_scope_then_p4014_and_first_kept() {
-        let mut env = SymbolEnvironment::new();
-        let scope = ScopeKind::Named(Id::from("Unit").into());
-        env.insert_variable(
-            &Id::from("x"),
-            SymbolKind::Parameter,
-            &scope,
-            VariableType::Input,
-            None,
-        )
-        .unwrap();
-
-        let error = env
-            .insert_variable(
-                &Id::from("X"),
-                SymbolKind::Variable,
-                &scope,
-                VariableType::Var,
-                None,
-            )
-            .unwrap_err();
-
-        assert_eq!(error.code, Problem::SymbolDeclDuplicated.code());
-        let kept = env.find(&Id::from("x"), &scope).unwrap();
-        assert_eq!(kept.kind, SymbolKind::Parameter);
-    }
-
-    #[test]
-    fn insert_variable_when_same_name_in_two_scopes_then_ok() {
-        let mut env = SymbolEnvironment::new();
-        env.insert_variable(
-            &Id::from("x"),
-            SymbolKind::Variable,
-            &ScopeKind::Global,
-            VariableType::Global,
-            None,
-        )
-        .unwrap();
-
-        assert!(env
-            .insert_variable(
-                &Id::from("x"),
-                SymbolKind::Variable,
-                &ScopeKind::Named(Id::from("Unit").into()),
-                VariableType::Var,
-                None,
-            )
-            .is_ok());
-    }
-
-    #[test]
-    fn insert_variable_when_name_is_compiler_provided_then_reserved() {
-        let mut env = SymbolEnvironment::new();
-        env.insert_compiler_provided(
-            &Id::from("__SYSTEM_UP_TIME"),
-            SymbolKind::Variable,
-            &ScopeKind::Global,
-        )
-        .unwrap();
-
-        let error = env
-            .insert_variable(
-                &Id::from("__SYSTEM_UP_TIME"),
-                SymbolKind::Variable,
-                &ScopeKind::Global,
-                VariableType::Global,
-                None,
-            )
-            .unwrap_err();
-
-        assert_eq!(error.code, Problem::SymbolDeclDuplicated.code());
-        assert!(error.primary.message.contains("reserved"));
-        assert!(error.secondary.is_empty());
-    }
-
-    /// A global variable and a type of one name are different namespaces
-    /// as far as this environment is concerned; other rules decide that.
-    #[test]
-    fn insert_variable_when_name_matches_type_then_ok() {
-        let mut env = SymbolEnvironment::new();
-        global(&mut env, "T", SymbolKind::Type).unwrap();
-
-        assert!(env
-            .insert_variable(
-                &Id::from("T"),
-                SymbolKind::Variable,
-                &ScopeKind::Global,
-                VariableType::Global,
-                None,
-            )
-            .is_ok());
-    }
-
-    /// An enumeration value or structure element sharing a declaration's
-    /// name is not a repeated declaration; those names have their own rules.
-    #[test]
-    fn insert_when_enumeration_value_shares_type_name_then_ok() {
-        let mut env = SymbolEnvironment::new();
-        global(&mut env, "Red", SymbolKind::Type).unwrap();
-
-        assert!(global(&mut env, "Red", SymbolKind::EnumerationValue).is_ok());
-    }
-
-    #[test]
-    fn insert_when_name_repeated_in_named_scope_then_p4014() {
-        let mut env = SymbolEnvironment::new();
-        let scope = ScopeKind::Named(Id::from("Unit").into());
-        env.insert(&Id::from("x"), SymbolKind::Variable, &scope)
-            .unwrap();
-
-        let error = env
-            .insert(&Id::from("x"), SymbolKind::Variable, &scope)
-            .unwrap_err();
-
-        assert_eq!(error.code, Problem::SymbolDeclDuplicated.code());
-    }
-
-    /// The innermost declaration of a name wins, so a method local
-    /// shadows a function block field of the same name.
-    #[test]
-    fn find_when_inner_scope_redeclares_name_then_inner_symbol_shadows_outer() {
-        let mut env = SymbolEnvironment::new();
-
-        let outer = ScopeKind::Named(Id::from("FB_Motor").into());
-        let inner = ScopeKind::Named(ScopePath::new(vec![
-            Id::from("FB_Motor"),
-            Id::from("GetSpeed"),
-        ]));
-
-        let name = Id::from("v");
-        env.insert(&name, SymbolKind::Variable, &outer).unwrap();
-        env.insert(&name, SymbolKind::Parameter, &inner).unwrap();
-
-        assert_eq!(env.find(&name, &inner).unwrap().kind, SymbolKind::Parameter);
-        assert_eq!(env.find(&name, &outer).unwrap().kind, SymbolKind::Variable);
-    }
-
-    /// A name declared only in an inner scope does not leak outward.
-    #[test]
-    fn find_when_symbol_is_in_inner_scope_then_not_found_from_enclosing_scope() {
-        let mut env = SymbolEnvironment::new();
-
-        let outer = ScopeKind::Named(Id::from("FB_Motor").into());
-        let inner = ScopeKind::Named(ScopePath::new(vec![
-            Id::from("FB_Motor"),
-            Id::from("GetSpeed"),
-        ]));
-
-        let local = Id::from("q");
-        env.insert(&local, SymbolKind::Variable, &inner).unwrap();
-
-        assert!(env.find(&local, &outer).is_none());
-    }
-
-    /// Enough names that a hash-seeded order almost never matches the
-    /// declaration order by chance.
-    fn names(prefix: &str) -> Vec<Id> {
-        (0..16).map(|i| Id::from(&format!("{prefix}{i}"))).collect()
-    }
-
-    #[test]
-    fn get_programs_when_several_declared_then_returns_declaration_order() {
-        let mut env = SymbolEnvironment::new();
-        let programs = names("prog");
-        for name in &programs {
-            env.insert(name, SymbolKind::Program, &ScopeKind::Global)
-                .unwrap();
-        }
-
-        let actual: Vec<&Id> = env.get_programs().into_iter().map(|(id, _)| id).collect();
-        let expected: Vec<&Id> = programs.iter().collect();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn get_variables_in_scope_when_several_declared_then_returns_declaration_order() {
-        let mut env = SymbolEnvironment::new();
-        let scope = ScopeKind::Named(Id::from("main").into());
-        let variables = names("var");
-        for name in &variables {
-            env.insert_variable(name, SymbolKind::Variable, &scope, VariableType::Var, None)
-                .unwrap();
-        }
-
-        let actual: Vec<&Id> = env
-            .get_variables_in_scope(&scope)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let expected: Vec<&Id> = variables.iter().collect();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn get_enumeration_values_for_type_when_several_declared_then_returns_declaration_order() {
-        let mut env = SymbolEnvironment::new();
-        let enum_type = TypeName::from("Color");
-        let values = names("value");
-        for name in &values {
-            env.insert_enumeration_value(name, &enum_type, &ScopeKind::Global)
-                .unwrap();
-        }
-
-        let actual = env.get_enumeration_values_for_type(&enum_type);
-        let expected: Vec<&Id> = values.iter().collect();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn insert_when_symbol_redefined_then_keeps_first_declared_position() {
-        let mut env = SymbolEnvironment::new();
-        let first = Id::from("first");
-        let second = Id::from("second");
-        env.insert(&first, SymbolKind::Program, &ScopeKind::Global)
-            .unwrap();
-        env.insert(&second, SymbolKind::Program, &ScopeKind::Global)
-            .unwrap();
-        // The repeat is reported and the first declaration stays in place.
-        assert!(env
-            .insert(&first, SymbolKind::Program, &ScopeKind::Global)
-            .is_err());
-
-        let actual: Vec<&Id> = env.get_programs().into_iter().map(|(id, _)| id).collect();
-        assert_eq!(actual, vec![&first, &second]);
-    }
-}
+mod resolve_variable_tests;
+#[cfg(test)]
+mod tests;

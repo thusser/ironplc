@@ -43,6 +43,64 @@ Example
 Member names must be unique within the type. The members take consecutive
 values starting at zero, so ``Red`` is 0, ``Yellow`` is 1 and ``Green`` is 2.
 
+Inline Enumerations
+-------------------
+
+A variable can list its values in place of a type name. The values number
+the same way as in a ``TYPE`` declaration, and a variable without an initial
+value starts at the first one:
+
+.. playground::
+
+   PROGRAM main
+       VAR
+           mode : (Idle, Running, Stopped) := Running;
+           count : DINT;
+       END_VAR
+
+       CASE mode OF
+           Idle: count := 0;
+           Running: count := count + 1;
+           Stopped: mode := Idle;
+       END_CASE;
+   END_PROGRAM
+
+Each such declaration declares a type of its own, even when two declarations
+list the same values. The type has no name, so debugging output such as
+``ironplcvm run --dump-vars`` shows the variable's value as ``RUNNING (1)``
+and describes its type by a generated name.
+
+Values Shared by Two Enumerations
+---------------------------------
+
+Two enumerations may declare the same value name. A value written without its
+type takes the type of where it is used: the variable it is assigned to, the
+other operand of a comparison, the selector of a ``CASE``, the input of a
+function block it is passed to, or the variable it initializes:
+
+.. playground::
+
+   TYPE
+       Color : (Red, Green);
+       Light : (Off, Green);
+   END_TYPE
+
+   PROGRAM main
+       VAR
+           shade : Color := Green;  (* 1, the Green of Color *)
+           lamp : Light;
+       END_VAR
+
+       lamp := Green;               (* 1, the Green of Light *)
+       IF shade = Green THEN        (* the Green of Color *)
+           lamp := Off;
+       END_IF;
+   END_PROGRAM
+
+Where nothing says which enumeration is meant, such as an assignment to a
+``DINT``, the value is ambiguous and the compiler reports
+:doc:`/reference/compiler/problems/P2043`.
+
 Explicit Values
 ---------------
 
@@ -72,12 +130,17 @@ is 1 and ``Type_BOOL`` is 2:
 Values are not checked for uniqueness: ``(A := 1, B := 1)`` gives two names
 for the same value and is accepted. Only the *names* must differ.
 
+Every value, written or continued from the one before, must be within the
+range of ``DINT``: from -2147483648 to 2147483647. A value outside it is
+:doc:`/reference/compiler/problems/P2044`, whatever base type the declaration
+names.
+
 Base Type (Language Extension)
 ------------------------------
 
 .. include:: ../../../../includes/requires-dialect-extension.rst
 
-A declaration can name the elementary type the members are stored in:
+A declaration can name a base type after its members:
 
 .. playground::
    :allows: enum-base-type
@@ -96,12 +159,18 @@ A declaration can name the elementary type the members are stored in:
        END_IF;
    END_PROGRAM
 
-Without it, IronPLC picks the smallest type that holds every member's value.
+IronPLC accepts the base type and stores the enumeration as a ``DINT``
+whatever type it names, as it stores every enumeration.
 
 Related Problem Codes
 ---------------------
 
 - :doc:`/reference/compiler/problems/P2003` — Duplicate enumeration value
+- :doc:`/reference/compiler/problems/P2006` — Value not defined in the
+  enumeration
+- :doc:`/reference/compiler/problems/P2043` — Enumerated value is ambiguous
+- :doc:`/reference/compiler/problems/P2044` — Enumeration value is outside
+  the range of ``DINT``
 - :doc:`/reference/compiler/problems/P4055` — Explicit enumeration member
   value requires a dialect or flag
 - :doc:`/reference/compiler/problems/P4056` — Enumeration base-type suffix

@@ -1,60 +1,61 @@
 //! Transformation pass that resolves expression types.
 //!
-//! This pass populates the `resolved_type` field on `Expr` nodes. After this
-//! pass, codegen can read types directly from expression nodes instead of
-//! re-inferring them from variable names.
-//!
-//! The key problem this solves: codegen string-matches declared type names
-//! (e.g., `"INT"`) against a hardcoded list. Type aliases like `"MyByte"`
-//! don't match, causing incorrect opcode selection. By resolving aliases to
-//! elementary types here, codegen gets clean type names.
+//! This pass populates the `expr_type` field on `Expr` nodes: the type of
+//! each expression's value by identity (ADR-0055). Later rules and codegen
+//! read an expression's type from it and nowhere else. Where a relation
+//! compares types by name, it derives the name from the id through
+//! `value_type::operand_type_name`.
 use ironplc_dsl::common::*;
 use ironplc_dsl::core::{Id, Located};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
 use ironplc_dsl::fold::Fold;
 use ironplc_dsl::scope::ScopeNode;
 use ironplc_dsl::textual::*;
-use std::collections::HashMap;
+use ironplc_dsl::type_id::TypeId;
 
+use crate::builtin_function::{BuiltinFunction, InputsOfOneType, OneTypeResult};
+use crate::enumerated_value_type::{self, EnumeratedValueType};
 use crate::function_environment::FunctionEnvironment;
-use crate::intermediate_type::IntermediateType;
 use crate::intermediates::arithmetic_overload::{
     resolve_arithmetic_fold, resolve_arithmetic_overload, Overload,
 };
-use crate::intermediates::inherited_fields::collect_inherited_fields;
+use crate::intermediates::common_operand::common_operand_of;
+use crate::intermediates::numeric_operation::literal_default_type;
 use crate::intermediates::operator_function_form::{operator_function_form, FormOf};
-use crate::system_globals::SYSTEM_UPTIME_GLOBALS;
-use crate::type_environment::TypeEnvironment;
-use crate::variable_type::{Declarations, Declared};
+use crate::symbol_environment::{ScopeTracker, SymbolEnvironment};
+use crate::type_environment::{MethodSignature, TypeEnvironment};
+use crate::value_type::operand_type_name;
+use crate::variable_type;
 use ironplc_parser::options::CompilerOptions;
 
+/// Returns the library with every expression's type, and the unqualified
+/// enumerated values whose type is ambiguous (`P2043`).
 pub fn apply(
     lib: Library,
+    symbols: &SymbolEnvironment,
     type_environment: &mut TypeEnvironment,
     function_environment: &FunctionEnvironment,
     options: &CompilerOptions,
-) -> Result<Library, Vec<Diagnostic>> {
-    let inherited_fields = collect_inherited_fields(&lib);
+) -> Result<(Library, Vec<Diagnostic>), Vec<Diagnostic>> {
+    let named_enumerations = enumerated_value_type::named_enumerations(type_environment);
     let mut resolver = ExprTypeResolver {
-        declarations: Declarations::new(),
-        inherited_fields,
+        symbols,
+        scope: ScopeTracker::default(),
         type_environment,
         function_environment,
         options: *options,
+        named_enumerations,
+        ambiguous: Vec::new(),
+        calls: Vec::new(),
     };
 
-    // Implicit system globals live in the outermost scope, so every POU
-    // body sees them and a POU-local of the same name shadows them.
-    if options.allow_system_uptime_global {
-        for global in &SYSTEM_UPTIME_GLOBALS {
-            resolver.declarations.add(
-                &Id::from(global.name),
-                Declared::Typed(TypeName::from(global.type_name)),
-            );
-        }
-    }
-
-    resolver.fold_library(lib).map_err(|e| vec![e])
+    let library = resolver.fold_library(lib).map_err(|e| vec![e])?;
+    let diagnostics = resolver
+        .ambiguous
+        .iter()
+        .map(enumerated_value_type::ambiguous)
+        .collect();
+    Ok((library, diagnostics))
 }
 
 /// Returns true if the type name is an IEC 61131-3 generic type category.
@@ -73,278 +74,337 @@ fn is_generic_type(tn: &TypeName) -> bool {
     GENERIC_TYPES.iter().any(|name| TypeName::from(name) == *tn)
 }
 
-/// Maps an [`IntermediateType`] to its canonical elementary [`TypeName`].
-///
-/// Delegates to [`TypeEnvironment::elementary_type_name_for`] for the simple
-/// cases. That helper does a strict equality lookup against the elementary
-/// types table, which only contains `String { max_len: None }`. A struct
-/// field declared `STRING[n]` resolves to `String { max_len: Some(n) }` and
-/// would otherwise return `None`, so we handle strings explicitly.
-fn intermediate_to_elementary_type_name(
-    env: &TypeEnvironment,
-    it: &IntermediateType,
-) -> Option<TypeName> {
-    if let Some(tn) = env.elementary_type_name_for(it) {
-        return Some(tn);
-    }
-    match it {
-        IntermediateType::String { .. } => Some(TypeName::from("STRING")),
-        _ => None,
-    }
+/// The inputs of `f` when every argument is an input, in the order the call
+/// lists them: the order of the parameters, for a call the binding pass wrote
+/// in normal form.
+fn all_inputs(f: &Function) -> Option<Vec<&Expr>> {
+    f.param_assignment
+        .iter()
+        .map(ParamAssignmentKind::input_expr)
+        .collect()
 }
 
-/// Walks a nested [`SymbolicVariableKind`] chain to find the root named variable.
-///
-/// For example, `pt^[i]` is `Array { Deref { Named("pt") } }` — this returns `"pt"`.
-fn find_base_variable_name(var: &SymbolicVariableKind) -> Option<&Id> {
-    match var {
-        SymbolicVariableKind::Named(nv) => Some(&nv.name),
-        SymbolicVariableKind::Deref(dv) => find_base_variable_name(&dv.variable),
-        SymbolicVariableKind::Array(av) => find_base_variable_name(&av.subscripted_variable),
-        SymbolicVariableKind::BitAccess(ba) => find_base_variable_name(&ba.variable),
-        SymbolicVariableKind::PartialAccess(pa) => find_base_variable_name(&pa.variable),
-        _ => None,
+/// The type of an operation on two operands that keeps their type: the
+/// concrete operand's when the other is an untyped literal (an untyped
+/// literal and a `DWORD` give a `DWORD`), else the left operand's, else the
+/// right's.
+fn prefer_concrete(left: &Option<ExprType>, right: &Option<ExprType>) -> Option<ExprType> {
+    match (left, right) {
+        (Some(ExprType::Literal(_)), Some(concrete @ ExprType::Concrete(_))) => {
+            Some(concrete.clone())
+        }
+        (Some(left), _) => Some(left.clone()),
+        (None, right) => right.clone(),
     }
 }
 
 struct ExprTypeResolver<'a> {
-    /// Declared type of every variable in scope.
-    ///
-    /// The outermost scope holds `VAR_GLOBAL` and the implicit system
-    /// globals; each POU the traversal enters pushes a scope of its own.
-    /// A method's scope nests inside its function block's, so a method
-    /// body sees the instance's fields and a method local shadows a
-    /// field of the same name.
-    declarations: Declarations<'static>,
-    /// Fields inherited via `EXTENDS`, per function block -- see
-    /// `intermediates::inherited_fields`. Seeded into `var_types` before a
-    /// function block's own fields so unqualified references to a base
-    /// class's fields type-check correctly.
-    inherited_fields: HashMap<TypeName, Vec<VarDecl>>,
-    type_environment: &'a TypeEnvironment,
+    /// The variables in scope, by the scope the traversal is in.
+    symbols: &'a SymbolEnvironment,
+    scope: ScopeTracker,
+    type_environment: &'a mut TypeEnvironment,
     function_environment: &'a FunctionEnvironment,
     /// The compiler options, which decide whether a bit-string operand of
     /// an arithmetic operator is judged as an unsigned integer (ADR-0053).
     options: CompilerOptions,
+    /// See [`enumerated_value_type::named_enumerations`].
+    named_enumerations: Vec<TypeId>,
+    /// The unqualified enumerated values left ambiguous so far. A value
+    /// leaves the list when the place it is used in gives it a type.
+    ambiguous: Vec<EnumeratedValue>,
+    /// The calls the fold is inside, innermost last: an
+    /// [`ExprKind::CallOutput`] reads an output of the innermost.
+    calls: Vec<CallFrame>,
+}
+
+/// A call whose arguments the fold is inside, for the type of the outputs a
+/// [`ExprKind::CallOutput`] reads from it.
+enum CallFrame {
+    /// A call of the function block instance of this name: its output `q`
+    /// has the type `instance.q` has.
+    Instance(Id),
+    /// A call of the function of this name: an output has the type its
+    /// signature declares.
+    Function(Id),
+    /// A call of a method on a receiver: an output has the type the method
+    /// declares it with. A receiver other than an instance has none.
+    Method {
+        receiver: MethodReceiver,
+        method: Id,
+    },
 }
 
 impl ExprTypeResolver<'_> {
-    /// Registers a declaration's own name as its result variable, so
-    /// `Foo := ...` inside `FUNCTION Foo` (or a `METHOD Foo : T`)
-    /// resolves to the declared return type.
-    fn insert_result_variable(&mut self, name: &Id, return_type: &FunctionReturnType) {
-        self.declarations
-            .add(name, Declared::Typed(return_type.to_type_name()));
-    }
-
-    /// Records a variable declaration in the current scope.
-    fn insert(&mut self, node: &VarDecl) {
-        self.declarations
-            .add_if(node.identifier.symbolic_id(), Declared::of(node));
-    }
-
-    /// Returns the type name a variable in scope was declared with.
-    ///
-    /// `None` for a variable that is not in scope and for one whose type
-    /// has no name to give: an inline enumeration, an inline array, or a
-    /// declaration without a type.
-    fn declared_type_name(&self, id: &Id) -> Option<TypeName> {
-        let init = match self.declarations.find(id)? {
-            Declared::Variable { init, .. } => init,
-            Declared::Typed(type_name) => return Some(type_name.clone()),
-        };
-        match init.as_ref() {
-            InitialValueAssignmentKind::None(_) => None,
-            InitialValueAssignmentKind::Simple(si) => Some(si.type_name.clone()),
-            InitialValueAssignmentKind::String(si) => Some(si.type_name()),
-            InitialValueAssignmentKind::EnumeratedValues(_) => None,
-            InitialValueAssignmentKind::EnumeratedType(e) => Some(e.type_name.clone()),
-            InitialValueAssignmentKind::FunctionBlock(fb) => Some(fb.type_name.clone()),
-            InitialValueAssignmentKind::FunctionBlockCall(fbc) => Some(fbc.type_name.clone()),
-            InitialValueAssignmentKind::Subrange(spec) => match spec {
-                SpecificationKind::Named(tn) => Some(tn.clone()),
-                SpecificationKind::Inline(sr) => Some(TypeName::from(&sr.type_name.to_string())),
-            },
-            InitialValueAssignmentKind::Structure(s) => Some(s.type_name.clone()),
-            InitialValueAssignmentKind::Array(a) => match &a.spec {
-                SpecificationKind::Named(tn) => Some(tn.clone()),
-                SpecificationKind::Inline(_) => None,
-            },
-            // An inline array target has no single type name.
-            InitialValueAssignmentKind::Reference(ref_init) => ref_init.target.type_name().cloned(),
-            InitialValueAssignmentKind::LateResolvedType(LateResolvedInitializer {
-                type_name: tn,
-                ..
-            }) => Some(tn.clone()),
-            InitialValueAssignmentKind::SimpleExpr(se) => Some(se.type_name.clone()),
-        }
-    }
-
-    /// Returns the element type name of a variable in scope declared as an
-    /// array or a reference to one, so that `arr[i]` and `pt^[i]` resolve
-    /// to the element type.
-    ///
-    /// For `arr : ARRAY[0..10] OF INT` this is `"int"`; for
-    /// `pt : REF_TO ARRAY[1..255] OF BYTE` it is `"byte"`.
-    fn declared_element_type_name(&self, id: &Id) -> Option<TypeName> {
-        let Declared::Variable { init, .. } = self.declarations.find(id)? else {
-            // A result variable or system global is never subscripted.
-            return None;
-        };
-        match init.as_ref() {
-            // ARRAY[...] OF T (inline spec)
-            InitialValueAssignmentKind::Array(a) => match &a.spec {
-                SpecificationKind::Inline(inline) => {
-                    Some(self.resolve_element_type_name(&inline.type_name))
-                }
-                SpecificationKind::Named(tn) => self.element_type_from_named_array(tn),
-            },
-            // REF_TO ARRAY[...] OF T or REF_TO <named_array_type>
-            InitialValueAssignmentKind::Reference(ref_init) => match &ref_init.target {
-                ReferenceTarget::Array(subranges) => {
-                    Some(self.resolve_element_type_name(&subranges.type_name))
-                }
-                ReferenceTarget::Named(tn) => self.element_type_from_named_array(tn),
-            },
-            // Named type that may be an array alias (e.g., `arr : MyArr`
-            // where `TYPE MyArr : ARRAY[0..10] OF INT; END_TYPE`)
-            InitialValueAssignmentKind::Simple(si) => {
-                self.element_type_from_named_array(&si.type_name)
-            }
-            // Late-resolved type that may be an array alias
-            InitialValueAssignmentKind::LateResolvedType(LateResolvedInitializer {
-                type_name: tn,
-                ..
-            }) => self.element_type_from_named_array(tn),
-            _ => None,
-        }
-    }
-
-    /// Resolves an [`ArrayElementType`] to a canonical elementary type name.
-    fn resolve_element_type_name(&self, elem: &ArrayElementType) -> TypeName {
-        let tn = elem.to_type_name();
-        self.type_environment
-            .resolve_elementary_type_name(&tn)
-            .unwrap_or(tn)
-    }
-
-    /// Looks up a named type in the type environment; if it is an array,
-    /// returns the element type name.
-    fn element_type_from_named_array(&self, type_name: &TypeName) -> Option<TypeName> {
-        let attrs = self.type_environment.get(type_name)?;
-        match &attrs.representation {
-            IntermediateType::Array { element_type, .. } => {
-                self.type_environment.elementary_type_name_for(element_type)
-            }
-            _ => None,
-        }
-    }
-
-    /// Determines the resolved type for the given expression kind.
-    fn resolve_type(&self, kind: &ExprKind) -> Option<TypeName> {
+    /// Determines the type of the value of an expression of `kind`, once its
+    /// operands' types are known.
+    fn resolve_type(&mut self, kind: &ExprKind) -> Option<ExprType> {
         match kind {
-            ExprKind::Const(constant) => self.resolve_const_type(constant),
-            ExprKind::Variable(var) => self.resolve_variable_type(var),
+            ExprKind::Const(constant) => self.expr_type_named(self.resolve_const_type(constant)?),
+            // A whole variable takes the type its declaration declares,
+            // which is the only answer for an anonymous type and the
+            // precise one for an alias (`x : MyByte` is a `MyByte`).
+            ExprKind::Variable(var) => self.variable_type_id(var).map(ExprType::Concrete),
             ExprKind::BinaryOp(op) => {
-                let left = op.left.resolved_type.as_ref();
-                let right = op.right.resolved_type.as_ref();
+                let left = self.operand_name(&op.left);
+                let right = self.operand_name(&op.right);
                 // The type of the overload that applies (see
                 // `intermediates::arithmetic_overload`). Where none is
                 // judged or none applies, the left operand's type, so later
                 // passes still see a type and the operator rule reports it.
-                match resolve_arithmetic_overload(&op.op, left, right, &self.options) {
+                match resolve_arithmetic_overload(
+                    &op.op,
+                    left.as_ref(),
+                    right.as_ref(),
+                    &self.options,
+                ) {
                     Some(Overload::Numeric { result } | Overload::Typed { result, .. }) => {
-                        return Some(result);
+                        return self.expr_type_named(result);
                     }
                     Some(Overload::Unchecked { .. }) | None => {}
                 }
-                match (&op.left.resolved_type, &op.right.resolved_type) {
-                    // If left is generic and right is concrete, use the concrete type.
-                    (Some(l), Some(r)) if is_generic_type(l) && !is_generic_type(r) => {
-                        Some(r.clone())
-                    }
-                    (Some(l), _) => Some(l.clone()),
-                    (_, r) => r.clone(),
-                }
+                prefer_concrete(&op.left.expr_type, &op.right.expr_type)
             }
-            ExprKind::UnaryOp(op) => op.term.resolved_type.clone(),
+            ExprKind::UnaryOp(op) => op.term.expr_type.clone(),
             ExprKind::Compare(compare) => match compare.op {
-                CompareOp::And
-                | CompareOp::Or
-                | CompareOp::Xor
-                | CompareOp::AndThen
-                | CompareOp::OrElse => {
-                    // Bitwise/logical operators preserve operand type.
-                    // When one operand is generic (e.g. ANY_INT literal)
-                    // and the other is concrete (e.g. DWORD variable), use
-                    // the concrete type.
-                    match (&compare.left.resolved_type, &compare.right.resolved_type) {
-                        (Some(l), Some(r)) if is_generic_type(l) && !is_generic_type(r) => {
-                            Some(r.clone())
-                        }
-                        (Some(l), _) => Some(l.clone()),
-                        (_, r) => r.clone(),
-                    }
+                // AND, OR and XOR have the type both operands widen to, as
+                // their function forms do: `w OR lw` on a `WORD` and an
+                // `LWORD` is an `LWORD`, and `d AND 16#FF` on a `DWORD` is a
+                // `DWORD`.
+                CompareOp::And | CompareOp::Or | CompareOp::Xor => self.inputs_of_one_type_result(
+                    &[&compare.left, &compare.right],
+                    InputsOfOneType {
+                        first: 0,
+                        result: OneTypeResult::Common,
+                    },
+                ),
+                // Only `BOOL`s.
+                CompareOp::AndThen | CompareOp::OrElse => {
+                    prefer_concrete(&compare.left.expr_type, &compare.right.expr_type)
                 }
-                _ => Some(TypeName::from("BOOL")),
+                CompareOp::Eq
+                | CompareOp::Ne
+                | CompareOp::Lt
+                | CompareOp::Gt
+                | CompareOp::LtEq
+                | CompareOp::GtEq => self.expr_type_named(TypeName::from("BOOL")),
             },
             ExprKind::Function(f) => {
                 if let Some(result) = self.resolve_overloaded_call(f) {
-                    return Some(result);
+                    return self.expr_type_named(result);
                 }
                 let sig = self.function_environment.get(&f.name)?;
                 let return_type = sig.return_type.as_ref()?.to_type_name();
-                if is_generic_type(&return_type) {
-                    // Generic return type: infer concrete type from the first argument
-                    // whose parameter declaration type matches the generic return type.
-                    // This correctly skips selector parameters whose type differs from
-                    // the return type (e.g., BOOL for SEL, ANY_INT for MUX).
-                    let mut positional_index = 0usize;
-                    f.param_assignment.iter().find_map(|p| match p {
-                        ParamAssignmentKind::PositionalInput(pos) => {
-                            let idx = positional_index;
-                            positional_index += 1;
-                            match sig.parameters.get(idx) {
-                                Some(param) if param.param_type == return_type => {
-                                    pos.expr.resolved_type.clone()
-                                }
-                                _ => None,
-                            }
+                if !is_generic_type(&return_type) {
+                    return self.expr_type_named(return_type);
+                }
+                match &sig.builtin_function {
+                    // An integer of whichever type its context stores it
+                    // at, which the literal pass gives it (ADR-0028).
+                    Some(builtin) if builtin.result_is_integer_of_context() => {
+                        return Some(ExprType::Literal(GenericTypeName::AnyInt));
+                    }
+                    Some(BuiltinFunction::IntToBcd) => return self.bcd_result(f),
+                    _ => {}
+                }
+                if let Some(shape) = sig
+                    .builtin_function
+                    .as_ref()
+                    .and_then(BuiltinFunction::inputs_of_one_type)
+                {
+                    if let Some(inputs) = all_inputs(f) {
+                        return self.inputs_of_one_type_result(&inputs, shape);
+                    }
+                }
+                // Generic return type: infer concrete type from the first argument
+                // whose parameter declaration type matches the generic return type.
+                // This correctly skips selector parameters whose type differs from
+                // the return type (e.g., BOOL for SEL, ANY_INT for MUX).
+                sig.inputs_of(&f.param_assignment)
+                    .find_map(|(param, expr)| {
+                        if param.param_type == return_type {
+                            expr.expr_type.clone()
+                        } else {
+                            None
                         }
-                        ParamAssignmentKind::NamedInput(named) => {
-                            let param = sig.parameters.iter().find(|p| p.name == named.name);
-                            match param {
-                                Some(param) if param.param_type == return_type => {
-                                    named.expr.resolved_type.clone()
-                                }
-                                _ => None,
-                            }
-                        }
-                        _ => None,
                     })
+            }
+            // The method's return type. A call on `THIS^`/`SUPER^`, or to a
+            // method without a return type, has no type here; the method
+            // call rule reports both.
+            ExprKind::MethodCall(call) => {
+                let MethodReceiver::Instance(instance) = &call.receiver else {
+                    return None;
+                };
+                // The result's type named again, as a function call's
+                // is, so a `STRING[10]` result types the call as `STRING`.
+                let result = self.method(instance, &call.method)?.result_type()?;
+                let return_type = self.type_environment.name_of(result)?.clone();
+                self.expr_type_named(return_type)
+            }
+            ExprKind::EnumeratedValue(ev) => match &ev.type_name {
+                Some(type_name) => self.expr_type_named(type_name.clone()),
+                None => self.unqualified_enumerated_value_type(ev, None),
+            },
+            ExprKind::Expression(inner) => inner.expr_type.clone(),
+            ExprKind::LateBound(_) => None,
+            // `REF(x)` is a reference to `x`'s type.
+            ExprKind::Ref(var) => {
+                let target = self.variable_type_id(var)?;
+                self.type_environment
+                    .reference_to(target)
+                    .map(ExprType::Concrete)
+            }
+            // Dereferencing a reference gives the type it references.
+            ExprKind::Deref(inner) => match &inner.expr_type {
+                Some(ExprType::Concrete(reference) | ExprType::Inferred(reference)) => self
+                    .type_environment
+                    .referenced_type(*reference)
+                    .map(ExprType::Concrete),
+                Some(ExprType::Literal(_) | ExprType::Null) | None => None,
+            },
+            ExprKind::Null(_) => Some(ExprType::Null),
+            // The type a conversion converts to is not a property of what it
+            // converts, so it is recorded on the node, which `fold_expr`
+            // keeps.
+            ExprKind::ImplicitConversion(_) => None,
+            ExprKind::CallOutput(output) => self.call_output_type(output).map(ExprType::Concrete),
+        }
+    }
+
+    /// The type of the output `output` of the innermost call the fold is
+    /// inside: for a function block, the type the read of that output of the
+    /// instance has; for a function or method, the type it declares the
+    /// output with.
+    fn call_output_type(&mut self, output: &Id) -> Option<TypeId> {
+        match self.calls.last()? {
+            CallFrame::Instance(instance) => {
+                self.symbolic_type_id(&SymbolicVariableKind::Structured(StructuredVariable {
+                    record: Box::new(SymbolicVariableKind::Named(NamedVariable {
+                        name: instance.clone(),
+                    })),
+                    field: output.clone(),
+                }))
+            }
+            CallFrame::Function(function) => {
+                let parameter = self
+                    .function_environment
+                    .get(function)?
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.is_output && parameter.name == *output)?;
+                let declared = self.type_environment.id_of(&parameter.param_type)?;
+                // A `REF_TO` parameter records the type it references.
+                if parameter.is_reference {
+                    self.type_environment.reference_to(declared)
                 } else {
-                    Some(return_type)
+                    Some(declared)
                 }
             }
-            ExprKind::EnumeratedValue(ev) => ev.type_name.clone(),
-            ExprKind::Expression(inner) => inner.resolved_type.clone(),
-            ExprKind::LateBound(_) => None,
-            ExprKind::Ref(var) => {
-                // REF(var) produces a reference — resolve the variable's type
-                self.resolve_variable_type(var)
-            }
-            ExprKind::Deref(inner) => {
-                // Dereference: the result type is the referenced variable's type.
-                // The inner expression should be a reference whose resolved_type
-                // is the referenced type name.
-                inner.resolved_type.clone()
-            }
-            ExprKind::Null(_) => {
-                // NULL has placeholder type BOOL (see design doc NULL Type Resolution Strategy).
-                // Actual type compatibility is checked contextually by semantic rules.
-                Some(TypeName::from("BOOL"))
-            }
+            CallFrame::Method {
+                receiver: MethodReceiver::Instance(instance),
+                method,
+            } => self.method(instance, method)?.output_type(output),
+            CallFrame::Method { .. } => None,
         }
+    }
+
+    /// The signature of the method `method` called on the function block
+    /// instance `instance`: the one its block declares or inherits.
+    fn method(&self, instance: &Id, method: &Id) -> Option<&MethodSignature> {
+        let block = self.declared_type_id(instance)?;
+        self.type_environment
+            .method(block, method)
+            .map(|(_, signature)| signature)
+    }
+
+    /// The type of the unqualified enumerated value `ev` used where a value
+    /// of type `context` is expected (see [`enumerated_value_type`]). An
+    /// ambiguous value is recorded until a context resolves it.
+    fn unqualified_enumerated_value_type(
+        &mut self,
+        ev: &EnumeratedValue,
+        context: Option<TypeId>,
+    ) -> Option<ExprType> {
+        // The anonymous enumerations of the variables in scope, each
+        // declared in place (`e : (A, B)`).
+        let mut in_scope: Vec<TypeId> = self
+            .symbols
+            .visible_variables(&self.scope.current())
+            .into_iter()
+            .filter_map(|(_, info)| info.type_id)
+            .filter(|id| {
+                self.type_environment.name_of(*id).is_none()
+                    && self
+                        .type_environment
+                        .get_by_id(*id)
+                        .is_some_and(|attributes| attributes.representation.is_enumeration())
+            })
+            .collect();
+        in_scope.sort();
+        let candidates = self.named_enumerations.iter().copied().chain(in_scope);
+        let span = ev.span();
+        self.ambiguous.retain(|pending| pending.span() != span);
+        match enumerated_value_type::resolve(self.type_environment, &ev.value, context, candidates)
+        {
+            EnumeratedValueType::Resolved(id) => Some(ExprType::Concrete(id)),
+            EnumeratedValueType::Ambiguous => {
+                self.ambiguous.push(ev.clone());
+                None
+            }
+            EnumeratedValueType::Undeclared => None,
+        }
+    }
+
+    /// Gives `expr` the type `context` expects when `expr` is an
+    /// unqualified enumerated value that `context`, an enumeration, declares.
+    fn type_from_context(&mut self, expr: &mut Expr, context: Option<TypeId>) {
+        if context.is_none() {
+            return;
+        }
+        match &mut expr.kind {
+            ExprKind::Expression(inner) => {
+                self.type_from_context(inner, context);
+                expr.expr_type = inner.expr_type.clone();
+            }
+            ExprKind::EnumeratedValue(ev) if ev.type_name.is_none() => {
+                let ev = ev.clone();
+                expr.expr_type = self.unqualified_enumerated_value_type(&ev, context);
+            }
+            _ => {}
+        }
+    }
+
+    /// The type a value compared with `expr` is expected to have.
+    fn expr_context(&self, expr: &Expr) -> Option<TypeId> {
+        match (&expr.expr_type, &expr.kind) {
+            (Some(ExprType::Concrete(id)), _) => Some(*id),
+            (None, ExprKind::Variable(variable)) => self.variable_type_id(variable),
+            _ => None,
+        }
+    }
+
+    /// The type a value the input `input` of the function block instance
+    /// `instance` receives is expected to have: the declared type of the
+    /// field, own or inherited.
+    fn function_block_input_type(&self, instance: &Id, input: &Id) -> Option<TypeId> {
+        self.type_environment
+            .field_type(self.declared_type_id(instance)?, input)
+    }
+
+    /// The type `type_name` names: a literal of the category a generic name
+    /// names, else the named type.
+    fn expr_type_named(&self, type_name: TypeName) -> Option<ExprType> {
+        if let Ok(generic) = GenericTypeName::try_from(&type_name.name) {
+            return Some(ExprType::Literal(generic));
+        }
+        self.type_environment
+            .id_of(&type_name)
+            .map(ExprType::Concrete)
+    }
+
+    /// The name the name-based relations know `expr`'s value by.
+    fn operand_name(&self, expr: &Expr) -> Option<TypeName> {
+        operand_type_name(self.type_environment, expr.expr_type.as_ref()?)
     }
 
     /// Returns the result type of a call to `ADD`, `SUB`, `MUL` or `DIV`, the
@@ -352,9 +412,9 @@ impl ExprTypeResolver<'_> {
     /// applies to its inputs folded from the left: `SUB(d1, d2)` on `DATE`
     /// is `TIME`, and `ADD(i, d)` on `INT` and `DINT` is `DINT`.
     ///
-    /// Returns `None` for any other function, for a call with a named input
-    /// left (one the named-argument pass diagnosed), or when no overload is
-    /// judged or applies; the caller then types the call from its signature.
+    /// Returns `None` for any other function, for a call with an output
+    /// assignment, or when no overload is judged or applies; the caller then
+    /// types the call from its signature.
     fn resolve_overloaded_call(&self, f: &Function) -> Option<TypeName> {
         let form = operator_function_form(&f.name.to_string())?;
         let FormOf::Arithmetic(op) = &form.operator else {
@@ -363,55 +423,87 @@ impl ExprTypeResolver<'_> {
         if form.typed_overloads().is_empty() {
             return None;
         }
-        let inputs: Vec<Option<&TypeName>> = f
-            .param_assignment
-            .iter()
-            .map(|p| match p {
-                ParamAssignmentKind::PositionalInput(input) => {
-                    Some(input.expr.resolved_type.as_ref())
-                }
-                ParamAssignmentKind::NamedInput(_) | ParamAssignmentKind::Output(_) => None,
-            })
-            .collect::<Option<_>>()?;
+        let names: Vec<Option<TypeName>> = all_inputs(f)?
+            .into_iter()
+            .map(|input| self.operand_name(input))
+            .collect();
+        let inputs: Vec<Option<&TypeName>> = names.iter().map(Option::as_ref).collect();
         match resolve_arithmetic_fold(op, &inputs, &self.options) {
             Ok(Overload::Numeric { result } | Overload::Typed { result, .. }) => Some(result),
             Ok(Overload::Unchecked { .. }) | Err(_) => None,
         }
     }
 
-    /// Determines the type of `expr`'s value by identity, once its
-    /// `resolved_type` is known.
+    /// The type of a call to `INT_TO_BCD`: the bit string as wide as its
+    /// input, which it encodes digit by digit. `INT_TO_BCD(i)` on an `INT` is
+    /// a `WORD`, and an untyped literal input is a `DINT` (ADR-0028), so
+    /// `INT_TO_BCD(42)` is a `DWORD`.
+    fn bcd_result(&self, f: &Function) -> Option<ExprType> {
+        let input = *all_inputs(f)?.first()?;
+        let name = match &input.expr_type {
+            Some(ExprType::Literal(generic)) => literal_default_type(generic)?.into(),
+            _ => self.operand_name(input)?,
+        };
+        let bit_string = match ElementaryTypeName::try_from(&name.name).ok()? {
+            ElementaryTypeName::SINT | ElementaryTypeName::USINT => ElementaryTypeName::BYTE,
+            ElementaryTypeName::INT | ElementaryTypeName::UINT => ElementaryTypeName::WORD,
+            ElementaryTypeName::DINT | ElementaryTypeName::UDINT => ElementaryTypeName::DWORD,
+            ElementaryTypeName::LINT | ElementaryTypeName::ULINT => ElementaryTypeName::LWORD,
+            _ => return None,
+        };
+        self.expr_type_named(bit_string.into())
+    }
+
+    /// The type of a call to a function of several inputs of one type, whose
+    /// inputs are `inputs`: the type every input of that type widens to, or
+    /// for `EXPT` its first input's (see [`BuiltinFunction::inputs_of_one_type`]).
+    /// `MAX(i, l)` on an `INT` and an `LINT` is an `LINT`.
     ///
-    /// A whole variable takes the type its declaration declares, which is
-    /// the only answer for an anonymous type and the precise one for an
-    /// alias (`x : MyByte` is a `MyByte`, where `resolved_type` says
-    /// `BYTE`). Anything else takes the type its `resolved_type` names, or
-    /// is a literal of the generic category it names.
-    fn resolve_expr_type(&self, expr: &Expr) -> Option<ExprType> {
-        match &expr.kind {
-            ExprKind::Variable(Variable::Symbolic(SymbolicVariableKind::Named(nv))) => {
-                let declared = self
-                    .declarations
-                    .find(&nv.name)
-                    .and_then(|declared| declared.type_id(self.type_environment));
-                if let Some(id) = declared {
-                    return Some(ExprType::Concrete(id));
-                }
+    /// When no input's type accepts every other one -- a `DINT` and a `UDINT`
+    /// -- the call has the type of its first concrete input, else of its
+    /// first, as a comparison of such a pair compares at its concrete left
+    /// operand's (#1931).
+    fn inputs_of_one_type_result(
+        &self,
+        inputs: &[&Expr],
+        shape: InputsOfOneType,
+    ) -> Option<ExprType> {
+        let inputs = inputs.get(shape.first..)?;
+        let index = match shape.result {
+            OneTypeResult::First => 0,
+            OneTypeResult::Common => {
+                let names: Vec<Option<TypeName>> = inputs
+                    .iter()
+                    .map(|input| self.operand_name(input))
+                    .collect();
+                let names: Vec<Option<&TypeName>> = names.iter().map(Option::as_ref).collect();
+                common_operand_of(&names, &self.options)
+                    .or_else(|| {
+                        inputs.iter().position(|input| {
+                            matches!(
+                                input.expr_type,
+                                Some(ExprType::Concrete(_) | ExprType::Inferred(_))
+                            )
+                        })
+                    })
+                    .unwrap_or(0)
             }
-            ExprKind::Expression(inner) => return inner.expr_type.clone(),
-            // `resolved_type` records the referenced variable's type for
-            // `REF(x)` and a placeholder for `NULL`; neither is the type of
-            // the value.
-            ExprKind::Ref(_) | ExprKind::Null(_) => return None,
-            _ => {}
+        };
+        inputs.get(index)?.expr_type.clone()
+    }
+
+    /// The id of the type the variable `name` names from the current scope
+    /// was declared with.
+    fn declared_type_id(&self, name: &Id) -> Option<TypeId> {
+        variable_type::declared_type_id(name, self.symbols, &self.scope.current())
+    }
+
+    /// The id of the type of the value `var` names.
+    fn variable_type_id(&self, var: &Variable) -> Option<TypeId> {
+        match var {
+            Variable::Symbolic(kind) => self.symbolic_type_id(kind),
+            Variable::Direct(_) => None,
         }
-        let type_name = expr.resolved_type.as_ref()?;
-        if let Ok(generic) = GenericTypeName::try_from(&type_name.name) {
-            return Some(ExprType::Literal(generic));
-        }
-        self.type_environment
-            .id_of(type_name)
-            .map(ExprType::Concrete)
     }
 
     fn resolve_const_type(&self, constant: &ConstantKind) -> Option<TypeName> {
@@ -457,203 +549,26 @@ impl ExprTypeResolver<'_> {
         }
     }
 
-    /// Resolves the type of a member access expression (e.g., `setup.FLAG` or
-    /// `timer.Q`).
-    ///
-    /// Walks the member chain to find the root variable, looks up its type
-    /// definition, then finds the leaf member's type.
-    fn resolve_structured_variable_type(&self, sv: &StructuredVariable) -> Option<TypeName> {
-        let parent_type = self.resolve_parent_struct_type(sv.record.as_ref())?;
-        let field = parent_type
-            .member_fields()?
-            .iter()
-            .find(|f| f.name == sv.field)?;
-        self.type_environment
-            .elementary_type_name_for(&field.field_type)
-    }
-
-    /// Resolves a `SymbolicVariableKind` to the `IntermediateType` whose
-    /// members it exposes.
-    ///
-    /// For `Named`, looks up the variable's declared type and resolves it as a
-    /// structure or function block instance. For `Structured`, recursively
-    /// resolves the parent and finds the nested member type.
-    fn resolve_parent_struct_type<'b>(
-        &'b self,
-        kind: &SymbolicVariableKind,
-    ) -> Option<&'b IntermediateType> {
-        match kind {
-            SymbolicVariableKind::Named(nv) => {
-                let var_type = self.declared_type_name(&nv.name)?;
-                self.type_environment.resolve_member_access_type(&var_type)
-            }
-            SymbolicVariableKind::Structured(sv) => {
-                let parent_type = self.resolve_parent_struct_type(sv.record.as_ref())?;
-                let field = parent_type
-                    .member_fields()?
-                    .iter()
-                    .find(|f| f.name == sv.field)?;
-                if field.field_type.has_members() {
-                    Some(&field.field_type)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Resolves the element type of an array that lives inside a struct field.
-    ///
-    /// For an expression like `DATA.DIRS[i, j]`, `sv` is the `DATA.DIRS`
-    /// struct field access. Walks the struct chain to find `DIRS`'s
-    /// `IntermediateType::Array`, then returns the element type's
-    /// canonical `TypeName`.
-    fn resolve_struct_field_array_element_type(&self, sv: &StructuredVariable) -> Option<TypeName> {
-        let parent_type = self.resolve_parent_struct_type(sv.record.as_ref())?;
-        let field = parent_type
-            .member_fields()?
-            .iter()
-            .find(|f| f.name == sv.field)?;
-        let IntermediateType::Array { element_type, .. } = &field.field_type else {
-            return None;
-        };
-        intermediate_to_elementary_type_name(self.type_environment, element_type)
-    }
-
-    fn resolve_variable_type(&self, var: &Variable) -> Option<TypeName> {
-        match var {
-            Variable::Symbolic(SymbolicVariableKind::Named(nv)) => {
-                let declared = self.declared_type_name(&nv.name)?;
-                // Try to resolve to an elementary type. If the type is complex
-                // (enum, struct, etc.), keep the declared name.
-                Some(
-                    self.type_environment
-                        .resolve_elementary_type_name(&declared)
-                        .unwrap_or(declared),
-                )
-            }
-            Variable::Symbolic(SymbolicVariableKind::Array(arr_var)) => {
-                // Array subscript on a struct field (e.g. `DATA.DIRS[i, j]`).
-                // The base variable is a struct, not the array itself, so we
-                // resolve the field's type through the struct chain.
-                if let SymbolicVariableKind::Structured(sv) = arr_var.subscripted_variable.as_ref()
-                {
-                    return self.resolve_struct_field_array_element_type(sv);
-                }
-
-                // Array subscript: walk to base variable, return element type.
-                let base_name = find_base_variable_name(&arr_var.subscripted_variable)?;
-                let elem_type = self.declared_element_type_name(base_name)?;
-                Some(
-                    self.type_environment
-                        .resolve_elementary_type_name(&elem_type)
-                        .unwrap_or(elem_type),
-                )
-            }
-            Variable::Symbolic(SymbolicVariableKind::Structured(sv)) => {
-                self.resolve_structured_variable_type(sv)
-            }
-            Variable::Symbolic(SymbolicVariableKind::BitAccess(_)) => Some(TypeName::from("BOOL")),
-            Variable::Symbolic(SymbolicVariableKind::PartialAccess(pa)) => {
-                let type_name = match pa.size {
-                    PartialAccessSize::Byte => "BYTE",
-                    PartialAccessSize::Word => "WORD",
-                    PartialAccessSize::DWord => "DWORD",
-                    PartialAccessSize::LWord => "LWORD",
-                };
-                Some(TypeName::from(type_name))
-            }
-            Variable::Symbolic(SymbolicVariableKind::Deref(deref_var)) => {
-                // Dereference: resolve the target type of the reference.
-                let base_name = find_base_variable_name(&deref_var.variable)?;
-                let declared = self.declared_type_name(base_name)?;
-                let attrs = self.type_environment.get(&declared)?;
-                if let Some(target) = attrs.representation.referenced_type() {
-                    self.type_environment.elementary_type_name_for(target)
-                } else {
-                    None
-                }
-            }
-            Variable::Symbolic(SymbolicVariableKind::SelfRef(_)) => {
-                // THIS^/SUPER^ has no resolvable type until function-block
-                // member resolution exists. Unreachable in practice:
-                // `fold_self_ref_variable` rejects the construct before any
-                // type resolution runs. See issue #1406.
-                None
-            }
-            Variable::Direct(_) => None,
-        }
+    /// The id of the type of the value the symbolic variable `kind` names
+    /// (see [`variable_type::type_id`]).
+    fn symbolic_type_id(&self, kind: &SymbolicVariableKind) -> Option<TypeId> {
+        variable_type::type_id(
+            kind,
+            self.symbols,
+            self.type_environment,
+            &self.scope.current(),
+        )
     }
 }
 
 impl Fold<Diagnostic> for ExprTypeResolver<'_> {
-    fn fold_library(
-        &mut self,
-        node: ironplc_dsl::common::Library,
-    ) -> Result<ironplc_dsl::common::Library, Diagnostic> {
-        // Collect top-level VAR_GLOBAL types into the outermost scope,
-        // where they stay visible to every POU body the fold enters.
-        for element in &node.elements {
-            if let LibraryElementKind::GlobalVarDeclarations(decls) = element {
-                for decl in decls {
-                    self.insert(decl);
-                }
-            }
-        }
-        node.recurse_fold(self)
-    }
-
-    /// Opens a declaration's scope and registers the types it declares.
-    ///
-    /// Replaces the per-POU `clear()` this pass used to do: clearing at a
-    /// method boundary would discard the enclosing function block's
-    /// fields, which a method body needs. A scope stack drops only what
-    /// the declaration itself added.
-    ///
-    /// The match is exhaustive so a new kind of scope has to state what
-    /// it contributes rather than silently contributing nothing -- which
-    /// in this pass means silently skipping type checks, not failing.
     fn enter_scope(&mut self, node: ScopeNode<'_>) -> Result<(), Diagnostic> {
-        self.declarations.enter();
-
-        match node {
-            ScopeNode::Function(node) => {
-                node.variables.iter().for_each(|v| self.insert(v));
-                self.insert_result_variable(&node.name, &node.return_type);
-            }
-            ScopeNode::FunctionBlock(node) => {
-                // Inherited fields first so the function block's own
-                // fields, inserted next into the same scope, win for a
-                // name declared in both. A program that reaches code
-                // generation never has such a name --
-                // `rule_extends_field_duplicated` (`P4044`) rejects it --
-                // but that rule runs after this transform, so this pass
-                // still needs a defined answer.
-                if let Some(fields) = self.inherited_fields.get(&node.name).cloned() {
-                    fields.iter().for_each(|v| self.insert(v));
-                }
-                node.variables.iter().for_each(|v| self.insert(v));
-            }
-            ScopeNode::Program(node) => {
-                node.variables.iter().for_each(|v| self.insert(v));
-            }
-            ScopeNode::Method(node) => {
-                node.variables.iter().for_each(|v| self.insert(v));
-                // Only a method that declares a return type has a result
-                // variable; see `rule_use_declared_symbolic_var`, which
-                // rejects the assignment for one that does not.
-                if let Some(return_type) = &node.return_type {
-                    self.insert_result_variable(&node.name, return_type);
-                }
-            }
-        }
-
+        self.scope.enter(&node);
         Ok(())
     }
 
     fn exit_scope(&mut self) {
-        self.declarations.exit();
+        self.scope.exit();
     }
 
     fn fold_self_ref_variable(
@@ -677,10 +592,69 @@ impl Fold<Diagnostic> for ExprTypeResolver<'_> {
         // First, recurse to fold children (bottom-up)
         let mut expr = node.recurse_fold(self)?;
 
+        // An unqualified enumerated value compared with a value of an
+        // enumeration type has that type.
+        if let ExprKind::Compare(compare) = &mut expr.kind {
+            if !matches!(
+                compare.op,
+                CompareOp::And
+                    | CompareOp::Or
+                    | CompareOp::Xor
+                    | CompareOp::AndThen
+                    | CompareOp::OrElse
+            ) {
+                let left = self.expr_context(&compare.left);
+                let right = self.expr_context(&compare.right);
+                self.type_from_context(&mut compare.right, left);
+                self.type_from_context(&mut compare.left, right);
+            }
+        }
+
         // Then determine type based on the (now-folded) kind
-        expr.resolved_type = self.resolve_type(&expr.kind);
-        expr.expr_type = self.resolve_expr_type(&expr);
+        if !matches!(expr.kind, ExprKind::ImplicitConversion(_)) {
+            expr.expr_type = self.resolve_type(&expr.kind);
+        }
         Ok(expr)
+    }
+
+    fn fold_assignment(&mut self, node: Assignment) -> Result<Assignment, Diagnostic> {
+        let mut node = node.recurse_fold(self)?;
+        // An unqualified enumerated value assigned has the target's type.
+        let target = self.variable_type_id(&node.target);
+        self.type_from_context(&mut node.value, target);
+        Ok(node)
+    }
+
+    fn fold_function(&mut self, node: Function) -> Result<Function, Diagnostic> {
+        self.calls.push(CallFrame::Function(node.name.clone()));
+        let folded = node.recurse_fold(self);
+        self.calls.pop();
+        folded
+    }
+
+    fn fold_method_call(&mut self, node: MethodCall) -> Result<MethodCall, Diagnostic> {
+        self.calls.push(CallFrame::Method {
+            receiver: node.receiver.clone(),
+            method: node.method.clone(),
+        });
+        let folded = node.recurse_fold(self);
+        self.calls.pop();
+        folded
+    }
+
+    fn fold_fb_call(&mut self, node: FbCall) -> Result<FbCall, Diagnostic> {
+        self.calls.push(CallFrame::Instance(node.var_name.clone()));
+        let folded = node.recurse_fold(self);
+        self.calls.pop();
+        let mut node = folded?;
+        // An unqualified enumerated value passed to an input has its type.
+        for param in &mut node.params {
+            if let ParamAssignmentKind::NamedInput(input) = param {
+                let input_type = self.function_block_input_type(&node.var_name, &input.name);
+                self.type_from_context(&mut input.expr, input_type);
+            }
+        }
+        Ok(node)
     }
 
     fn fold_initial_value_assignment_kind(

@@ -2,6 +2,12 @@
 #![allow(clippy::result_large_err)]
 extern crate ironplc_dsl as dsl;
 
+// Declared before the rule modules so the token-rule test macros are in scope
+// for their inline `#[cfg(test)] mod test`.
+#[cfg(test)]
+#[macro_use]
+mod test_rule_macros;
+
 pub mod declarations;
 mod lexer;
 pub mod options;
@@ -11,10 +17,12 @@ mod rule_no_empty_var_blocks;
 mod rule_token_no_c_style_comment;
 mod rule_token_no_paren_string_length;
 mod rule_token_no_partial_access_syntax;
+mod rule_token_string_escape;
 mod vars;
 mod xform_assign_file_id;
 mod xform_collapse_pragmas;
 mod xform_demote_keywords;
+mod xform_split_duration_units;
 mod xform_tokens;
 
 use crate::parser::{parse_library, parse_statements};
@@ -27,6 +35,10 @@ use preprocessor::preprocess;
 use token::Token;
 use xform_tokens::insert_keyword_statement_terminators;
 
+#[cfg(test)]
+mod test_rule_conventions;
+#[cfg(test)]
+mod test_rule_helpers;
 #[cfg(test)]
 mod tests;
 
@@ -43,6 +55,8 @@ mod spec_conformance_adr;
 mod spec_conformance_behavior_policies;
 #[cfg(test)]
 mod spec_conformance_pointer_to;
+#[cfg(test)]
+mod spec_conformance_string_literals;
 pub mod token;
 
 /// Tokenize a IEC 61131 program.
@@ -66,6 +80,7 @@ pub fn tokenize_program(
     let (tokens, mut errors) = tokenize(&source, file_id, line_offset, col_offset);
 
     let tokens = xform_collapse_pragmas::apply(tokens, options);
+    let tokens = xform_split_duration_units::apply(tokens);
     let mut tokens = insert_keyword_statement_terminators(tokens, file_id, options);
     xform_demote_keywords::apply(&mut tokens, options);
     let result = check_tokens(&tokens, options);
@@ -84,6 +99,7 @@ fn check_tokens(tokens: &[Token], options: &CompilerOptions) -> Result<(), Vec<D
         rule_no_empty_var_blocks::apply,
         rule_token_no_partial_access_syntax::apply,
         rule_token_no_paren_string_length::apply,
+        rule_token_string_escape::apply,
     ];
 
     let mut errors = vec![];

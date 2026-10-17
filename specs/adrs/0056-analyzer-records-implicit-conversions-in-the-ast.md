@@ -1,0 +1,261 @@
+# The Analyzer Records Implicit Conversions in the AST
+
+status: accepted
+date: 2026-10-01
+
+## Context and Problem Statement
+
+IEC 61131-3 converts a value without the program spelling it: an operand of
+one type compared with an operand of another, and an untyped literal that takes
+its type from where it is used (ADR-0028). Which conversion applies is a
+language rule, but the analyzer did not record its answer. It resolved each
+expression's type (`Expr::expr_type`), and codegen decided the rest. For a
+comparison, codegen chose the operand type from the concrete left operand, the
+concrete right one or the enclosing operation type, and then converted an
+operand whose width differed from it when that operand was a variable.
+
+That leaves three gaps:
+
+* **Nobody but codegen can see the decision.** The language server cannot
+  show how an expression will be interpreted, which is often hard to work out
+  from the source.
+* **Every backend has to repeat it.** A second backend would have to apply the
+  same fallbacks, and nothing checks that it does.
+* **The decision is spread across codegen.** The same "compile at its own
+  type, then convert" logic lived in three places, each with a slightly
+  different test for when to convert.
+
+Where should the decision live?
+
+## Decision Drivers
+
+* **One answer per expression**, recorded once, that every consumer reads.
+* **The language server can show it** without running codegen.
+* **Backends lower; they do not decide** what the language means.
+* **The semantic rules are unaffected:** what a program is allowed to write
+  does not change.
+
+## Considered Options
+
+* Insert `ExprKind::ImplicitConversion` nodes in an analyzer pass
+* Record the operand type on the comparison node
+* Keep the decision in codegen
+
+## Decision Outcome
+
+Chosen option: "Insert `ExprKind::ImplicitConversion` nodes in an analyzer
+pass", because it records the decision on the operand it applies to, in the
+tree every consumer already walks.
+
+* **`ExprKind::ImplicitConversion(Box<Expr>)`**: the inner expression keeps
+  its own type, and the enclosing `Expr`'s `expr_type` is the type it is
+  converted to. The parser never produces one, and it is written (`Display`,
+  plc2plc) as the expression it converts.
+* **A lowering pass, `xform_insert_implicit_conversions`,** runs in
+  `stages::analyze` after the semantic rules. For each comparison it settles
+  the operand type, gives an untyped literal operand that type, and wraps an
+  operand it converts in a conversion. A backend compiles the library
+  `analyze` returns; `resolve_types` alone does not lower it.
+* **Codegen compiles what the tree says.** A conversion compiles its inner
+  expression at its own type and converts. A comparison compiles at its left
+  operand's type, which the pass made the operand type.
+
+The pass starts by recording exactly what codegen did for a comparison, so
+introducing it changes no generated code; correcting what it records is then a
+change to one analyzer pass (#1920). Arithmetic operands, assignments and
+function arguments are still converted by codegen; each moves to the pass in
+its own change. See `specs/design/implicit-conversions.md`.
+
+### Consequences
+
+* Good, because the language server can show where a value is converted and
+  to what, from the analyzed tree.
+* Good, because a backend no longer chooses an operand type for a comparison,
+  so two backends cannot choose differently.
+* Good, because a questionable conversion becomes visible: an `LINT`
+  compared with a `DINT` on its left shows as a conversion to `DINT` (#1920).
+* Good, because the pass runs after the semantic rules, so a rule checks the
+  operands the program wrote. Running it before them was tried and lost
+  diagnostics: `rule_constant_range` checks a literal against the other
+  operand's type, and `DINT#300 < s` on a `SINT` stopped reporting P2026 once
+  `s` was converted to `DINT`.
+* Bad, because a caller that compiles the output of `resolve_types` rather
+  than `analyze` gets no conversions, and a comparison with an untyped
+  literal on its left compiles at the literal's default type. Every caller in
+  the repository that compiles uses `analyze`.
+* Bad, because the analyzed tree is no longer only what the program wrote. A
+  consumer that renders it must render a conversion as its operand.
+
+### Confirmation
+
+The pass has unit tests asserting the conversions it records for each kind of
+operand pair (`xform_insert_implicit_conversions/tests.rs`), tied to the
+`REQ-IC-analyzer-*` requirements in `specs/design/implicit-conversions.md`,
+including that the semantic rules still see the operands as written. The
+codegen tests pass unchanged.
+
+## Pros and Cons of the Options
+
+### Insert `ExprKind::ImplicitConversion` nodes in an analyzer pass (chosen)
+
+* Good, because the conversion sits on the operand it converts, where a
+  language server hover or inlay hint would show it.
+* Good, because the same node serves every later kind of implicit
+  conversion: arithmetic operands, assignments, arguments.
+* Bad, because adding an `ExprKind` variant touches every exhaustive match.
+
+### Record the operand type on the comparison node
+
+* Good, because it is a smaller change: one field on `CompareExpr`.
+* Bad, because each backend would still decide which operand to convert, and
+  how, from the recorded type.
+* Bad, because the function forms (`GT(a, b)`) are `Function` nodes and would
+  need the field somewhere else.
+
+### Keep the decision in codegen
+
+* Good, because nothing changes.
+* Bad, because the language server cannot see the decision, and every backend
+  repeats it.
+
+## More Information
+
+### Arithmetic operands (postscript)
+
+The pass now records the conversions of arithmetic operands too, for the
+operator expression and for the function forms `ADD`, `SUB`, `MUL`, `DIV` and
+`MOD` (see `specs/design/implicit-conversions.md`). Codegen compiles the
+recorded nodes and no longer converts an arithmetic operand itself, or asks
+the analyzer's overload resolver a second time for a numeric fold. A function
+form of three or more inputs is recorded as the nested calls it folds to,
+because each step computes at its own result type and the accumulated value is
+converted between steps, and an accumulator is not an operand a node can wrap.
+Assignments and function arguments are still converted by codegen, and so is
+the conversion of an arithmetic result to the type of its context; each moves
+to the pass in its own change. The decision above is unchanged.
+
+### Assignments (postscript)
+
+The pass also records the conversion of an assigned value to the type its
+target is stored as, where codegen converts it: a variable or an arithmetic
+result of another operation width. The conversions a variable or an arithmetic
+result makes to the type of its context stay in codegen until arguments, the
+remaining context, record them too, since the same code serves both. The
+decision above is unchanged.
+
+### Arguments (postscript)
+
+The pass also records the conversion of an argument to a user-defined
+function to the type its parameter is passed as, and codegen no longer
+converts an argument itself. The recording makes two existing choices visible:
+a parameter of a non-elementary type is passed as a `DINT`, and an untyped
+real literal is a `REAL` converted to an `LREAL` parameter. Correcting either
+is a change to the pass. Function block and method arguments are not recorded
+yet. The decision above is unchanged.
+
+### Literals (postscript)
+
+The pass also gives an untyped numeric literal the type codegen compiles it
+at, in every context: a statement's target or condition, and on the way to
+the literal every construct that passes its context's type on, computes at
+its own, or computes at a fixed one (a selector, a shift count, a string
+position, a subscript). Codegen compiles an integer or real literal at its
+recorded type rather than one passed down, and a typed literal (`DINT#5`) in a
+context of another type is recorded as converted to it. The decision above is
+unchanged.
+
+### A rule after the pass (postscript)
+
+`rule_constant_range` now runs after the pass, on the library it returns, so
+that it can read the type the pass records on a literal (#2071). It still
+checks the program as written: it reads an operand's type through the
+conversion that wraps it, and gives an untyped literal no type of its own. So
+`DINT#300 < s` on a `SINT` still reports P2026, the diagnostic that was lost
+when the pass first ran before the rules. The other rules still run before the
+pass. The decision above is unchanged.
+
+### Literal arguments (postscript)
+
+The second choice the Arguments postscript names is corrected: an untyped
+literal argument now takes its parameter's type rather than its default type
+converted to it (#2071). `f(0.1)` with an `LREAL` parameter passed `0.1`
+rounded to a `REAL`, and `f(1.0E300)` passed infinity; `f(5000000000)` with an
+`LINT` parameter failed. The decision above is unchanged.
+
+### Functions of several inputs of one type (postscript)
+
+`MIN`, `MAX`, `LIMIT`, `SEL`, `MUX`, `EXPT` and `ATAN2` computed at the
+type of their context, because the analyzer typed the result by the first
+input, which need not be the widest: `i2 := MAX(i, l)` on `INT`s and an
+`LINT` passed analysis and truncated the `LINT` (#2127), and `MAX` of two
+`UDINT`s passed to a `DINT` input compared them signed. The resolver now types
+such a call by the type every input widens to (`EXPT` by its base), the pass
+converts each input to it and records the conversion of the result to its
+context, and codegen selects the builtin from the call's recorded type rather
+than from its context. The decision above is unchanged.
+
+### Function block inputs, method arguments and loop bounds (postscript)
+
+The pass also records the conversion of a value stored into a variable of a
+function block or a loop: an input of a function block call, named or
+positional, an argument of a method call, an assignment to a function block
+field or through a dereference, and the bounds and step of a `FOR` loop. Each
+is converted to the declared type of the variable it is stored in, not to a
+storage type of a backend: codegen used to store a field or parameter declared
+with anything but a simple type, and a dereferenced target, as a `DINT`, and
+now stores the field and parameter at their declared types too. The first
+choice the Arguments postscript names is corrected the same way: a function's
+parameter of an alias or a subrange type is passed at the type it is operated
+as, not as a `DINT` (#2108), so an argument of an alias of `LREAL` no longer
+arrives as the bits of an integer. The decision above is unchanged.
+
+### Lowering (postscript)
+
+[ADR-0058](0058-the-analyzer-decides-and-lowering-translates.md) builds on
+this decision. The analyzer makes and records every decision whose outcome can
+make a program invalid, and a lowering stage between analysis and code
+generation translates what it recorded into a target-neutral program. That ADR
+extends this one and does not supersede it.
+
+The pass this ADR calls "a lowering pass" records decisions rather than
+lowering anything, so it is now called the **recording pass**. "Lowering"
+names only the stage after analysis. The decision above is unchanged.
+
+### Function block outputs (postscript)
+
+An output assignment of a function block call, `fb(q => x)`, stores the
+output in `x` after the call, and codegen stored it at the output's own
+type: a `REAL` output's bits were read as an `LREAL`, and an unsigned output
+was sign-extended into an `LINT` (#2125). The source names the output, not an
+expression, so there was no operand for a conversion node to wrap.
+
+Two ways to record it were considered: a target type on the `Output` node,
+which a backend would read alongside `ImplicitConversion` to convert the
+field it loads; or the output read as an expression. The second was chosen.
+The binding pass records on each output assignment of a call that binds the
+value it stores, `fb.q` (`NOT fb.q` for a negated output), written where the
+output is named. It is typed and converted as the value of `x := fb.q` is,
+so the conversion is an `ImplicitConversion` like every other, and an output
+the target cannot hold is now rejected as that assignment is (P4035). The
+analyzed tree holds an expression the program did not write, as it already
+did for a conversion; the plain rendering writes the output as `q => x`, and
+the annotated rendering adds the value's comment. An output of a function or
+method call has no instance field to read and records none. See
+`specs/design/call-binding.md` and `specs/design/implicit-conversions.md`.
+The decision above is unchanged.
+
+### Call outputs (postscript)
+
+The read `fb.q` named a field of the instance, which a function or method
+call does not have: it leaves its outputs in the callee's own variables. So
+the read is now a node of its own, `ExprKind::CallOutput(q)`: the output the
+enclosing call leaves. It appears only as the value of an output assignment,
+has the type the output is declared with (for a function block, the type
+`fb.q` has), and is wrapped in an `ImplicitConversion` as before. A backend
+reads it from wherever the call it compiles leaves its outputs.
+
+A narrower type for `Output::value`, holding an output read and its
+conversion and nothing else, was considered so the value could not be an
+arbitrary expression. The expression was kept, so that the conversion stays
+the `ImplicitConversion` every consumer already reads. The decision above is
+unchanged.

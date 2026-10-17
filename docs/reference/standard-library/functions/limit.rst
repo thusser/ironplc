@@ -25,9 +25,10 @@ Signature
      END_VAR
    END_FUNCTION
 
-The return type matches the input type. ``LIMIT`` accepts ``SINT``,
-``INT``, ``DINT``, ``LINT``, ``USINT``, ``UINT``, ``UDINT``, ``ULINT``,
-``REAL``, ``LREAL``. All three inputs must share the same type.
+``LIMIT`` accepts ``SINT``, ``INT``, ``DINT``, ``LINT``, ``USINT``,
+``UINT``, ``UDINT``, ``ULINT``, ``REAL``, ``LREAL``.
+
+.. include:: ../../../includes/widest-input-return-type.rst
 
 .. rubric:: Inputs
 
@@ -61,7 +62,7 @@ The return type matches the input type. ``LIMIT`` accepts ``SINT``,
      - Description
    * - Return value
      - ``ANY_MAGNITUDE``
-     - IN clamped to [MN, MX]. Same type as the inputs.
+     - IN clamped to [MN, MX].
 
 Description
 -----------
@@ -73,7 +74,8 @@ function returns:
 - *MX* if *IN* > *MX*
 - *IN* otherwise
 
-The behavior is undefined if *MN* > *MX*.
+``LIMIT`` is defined as ``MIN(MAX(IN, MN), MX)``, so when *MN* > *MX* the
+result is *MX*.
 
 Example
 -------

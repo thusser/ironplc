@@ -1,6 +1,6 @@
 # Bit-String Arithmetic Behind Its Own Flag
 
-status: proposed
+status: accepted
 date: 2026-09-19
 
 ## Context and Problem Statement
@@ -111,8 +111,8 @@ parameter is expected, which stays the business of the cross-family flags.
 
 ## More Information
 
-This ADR is `proposed` until the change that implements the design lands; that
-change flips it to `accepted`. The design is
+The change that implements the design landed the flag and flipped this ADR to
+`accepted`. The design is
 [Arithmetic Operator Overloads](../design/arithmetic-operator-overloads.md);
 REQ-AO-analyzer-010 and REQ-AO-analyzer-011 are its requirements.
 
@@ -132,3 +132,19 @@ decision holds.
   each other; `b + i` with `b : BYTE` is accepted because `USINT` widens to
   `INT`. Admitting `w + i` would be a widening rule, which is the business of
   the cross-family flags, not of this one.
+
+### Postscript, 2026-10-05: bit-string constants are range-checked
+
+A bit string treated as the unsigned integer of its width wraps at that width
+when a value computed at run time overflows it: `b + 1` on a `BYTE` holding
+255 gives 0. That is unchanged.
+
+A constant is no longer allowed to wrap. Until #2071, `rule_constant_range`
+exempted `BYTE`, `WORD`, `DWORD` and `LWORD` on the grounds that wrapping a
+bit pattern is legitimate. Analysis accepted `BYTE#256`, `d : DWORD := -1`
+and, with `--allow-int-literal-to-bit-string`, `pattern := 255 + 1`, and each
+either stored a value the program did not write or failed only in code
+generation. A constant is not a run-time value, and `BYTE#256` is not a byte, so
+each bit string now has the range of its width (`BYTE` holds 0 to 255) and a
+constant outside it is reported as P2026, as one outside an integer type is.
+The decision above, which concerns arithmetic, is unchanged.

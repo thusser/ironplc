@@ -1,5 +1,7 @@
 //! End-to-end integration tests for IF/ELSIF/ELSE statements.
 
+use spec_test_macro::spec_test;
+
 e2e_i32!(
     end_to_end_when_if_true_then_executes_body,
     "
@@ -14,10 +16,10 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, 5), (1, 1)],
+    &[("x", 5), ("y", 1)],
 );
 
-// vars[1] is untouched.
+// y is untouched.
 e2e_i32!(
     end_to_end_when_if_false_then_skips_body,
     "
@@ -32,7 +34,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, -5), (1, 0)],
+    &[("x", -5), ("y", 0)],
 );
 
 e2e_i32!(
@@ -51,7 +53,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, 5), (1, 1)],
+    &[("x", 5), ("y", 1)],
 );
 
 e2e_i32!(
@@ -70,7 +72,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, -5), (1, 2)],
+    &[("x", -5), ("y", 2)],
 );
 
 e2e_i32!(
@@ -91,7 +93,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, 10), (1, 1)],
+    &[("x", 10), ("y", 1)],
 );
 
 e2e_i32!(
@@ -112,7 +114,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, 3), (1, 2)],
+    &[("x", 3), ("y", 2)],
 );
 
 e2e_i32!(
@@ -133,7 +135,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, -5), (1, 3)],
+    &[("x", -5), ("y", 3)],
 );
 
 // n defaults to 0, so 2 > 0 is true.
@@ -150,7 +152,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(1, 1)],
+    &[("y", 1)],
 );
 
 // n is 5, so 2 > 5 is false.
@@ -168,7 +170,7 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, 5), (1, 0)],
+    &[("n", 5), ("y", 0)],
 );
 
 // 2 * 4 = 8, and 8 > 8 is false.
@@ -184,5 +186,65 @@ PROGRAM main
   END_IF;
 END_PROGRAM
 ",
-    &[(0, 0)],
+    &[("y", 0)],
+);
+
+// A condition is a BOOL whatever its comparison compares, so NOT negates the
+// BOOL rather than the bits of the comparison's DWORD operands: 5 > 3 is
+// TRUE, and NOT of it skips the body.
+e2e_i32!(
+    #[spec_test(REQ_IC_codegen_007)]
+    end_to_end_when_if_not_of_dword_comparison_true_then_skips_body,
+    "
+PROGRAM main
+  VAR
+    a : DWORD := 5;
+    b : DWORD := 3;
+    y : DINT;
+  END_VAR
+  IF NOT (a > b) THEN
+    y := 1;
+  END_IF;
+END_PROGRAM
+",
+    &[("y", 0)],
+);
+
+e2e_i32!(
+    #[spec_test(REQ_IC_codegen_007)]
+    end_to_end_when_if_not_of_lword_comparison_true_then_skips_body,
+    "
+PROGRAM main
+  VAR
+    a : LWORD := 5;
+    b : LWORD := 3;
+    y : DINT;
+  END_VAR
+  IF NOT (a > b) THEN
+    y := 1;
+  END_IF;
+END_PROGRAM
+",
+    &[("y", 0)],
+);
+
+e2e_i32!(
+    end_to_end_when_elsif_not_of_dword_comparison_true_then_skips_branch,
+    "
+PROGRAM main
+  VAR
+    a : DWORD := 5;
+    b : DWORD := 3;
+    y : DINT;
+  END_VAR
+  IF FALSE THEN
+    y := 1;
+  ELSIF NOT (a > b) THEN
+    y := 2;
+  ELSE
+    y := 3;
+  END_IF;
+END_PROGRAM
+",
+    &[("y", 3)],
 );

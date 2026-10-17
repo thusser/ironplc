@@ -129,7 +129,7 @@ The scan mode and `scan_interval` are VM configuration parameters, not encoded i
 
 ### Scan Cycle Counter
 
-The VM maintains a `scan_count` (u64) that increments by 1 at the start of each cycle (before INPUT_FREEZE). The counter starts at 0 for the first scan cycle after entering RUNNING state (or after a restart from FAULTED). The counter is available to the diagnostic interface but is not directly accessible from bytecode.
+The VM maintains a `scan_count` (u64) that increments by 1 at the start of each cycle (before INPUT_FREEZE). The counter starts at 0 for the first scan cycle after entering RUNNING state (or after a restart from FAULTED). The counter saturates at `u64::MAX` rather than wrapping. The counter is available to the diagnostic interface but is not directly accessible from bytecode.
 
 ### Scan Cycle Timing
 
@@ -304,7 +304,7 @@ All FB instance fields are initialized during the Initialization Sequence:
 
 ## String Buffer Management
 
-A string value is held in one of two places. Every declared string -- a variable, an array element, a structure field, a function parameter or return -- and every compiler-allocated scratch slot has a fixed byte offset in the unified data region (ADR-0017). The result of a string instruction goes to the temporary buffer pool, where it stays only until the instruction that consumes it copies the value into the data region. Both are allocated once at load time from header fields (`data_region_bytes`, `num_temp_bufs`, `max_temp_buf_bytes`) and never grow.
+A string value is held in one of two places. Every declared string -- a variable, an array element, a structure field, a parameter, local or output of a function or method, or a function's return -- and every compiler-allocated scratch slot has a fixed byte offset in the unified data region (ADR-0017). The result of a string instruction goes to the temporary buffer pool, where it stays only until the instruction that consumes it copies the value into the data region. Both are allocated once at load time from header fields (`data_region_bytes`, `num_temp_bufs`, `max_temp_buf_bytes`) and never grow.
 
 ### String Layout
 

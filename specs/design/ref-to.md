@@ -81,7 +81,9 @@ References allow aliasing: two references can point to the same variable, and mo
 
 ### Scope and Reference Validity
 
-All variable-table indices are global to a program instance. References created inside a function block scope remain valid after the function block call returns, because the referenced variable persists in the flat variable table. The `scope.check_access(index)` call in the VM validates that the index is within the variable table bounds, not that it belongs to the current scope. This means cross-scope references are valid — a reference obtained in one function block can be used in another.
+All variable-table indices are global to a program instance. References created inside a function block scope remain valid after the function block call returns, because the referenced variable persists in the flat variable table. `LOAD_INDIRECT` and `STORE_INDIRECT` check the target index against the program instance's scope (its shared globals and its own partition of the variable table), not against the current frame's scope. This means cross-scope references are valid — a reference obtained in one function block can be used in another, and a function can write through a reference to a variable in its caller's frame — while another program instance's variables stay out of reach.
+
+`VAR_IN_OUT` parameters of functions use this mechanism: each is an implicit reference, never null and never reassigned, bound by the caller. See [VAR_IN_OUT parameters](var-in-out-parameters.md).
 
 ### Why Variable-Table Indices (Not Raw Pointers)
 
@@ -253,29 +255,29 @@ ExprKind::Null(SourceSpan)      // NULL     — null literal
 
 Add visit/fold methods for new AST nodes following the existing pattern.
 
-## Intermediate Type Representation — `compiler/analyzer/src/intermediate_type.rs`
+## Semantic Type Representation — `compiler/analyzer/src/semantic_type.rs`
 
 ```rust
-// New variant in IntermediateType:
-IntermediateType::Reference {
-    target_type: Box<IntermediateType>,
+// New variant in SemanticType:
+SemanticType::Reference {
+    target_type: Box<SemanticType>,
 }
 ```
 
 New methods:
 - `is_reference() -> bool`
-- `referenced_type() -> Option<&IntermediateType>`
+- `referenced_type() -> Option<&SemanticType>`
 
 ### Type Resolution
 
-- `REF_TO INT` → `IntermediateType::Reference { target_type: Box::new(IntermediateType::Int { size: B32 }) }`
+- `REF_TO INT` → `SemanticType::Reference { target_type: Box::new(SemanticType::Int { size: B32 }) }`
 - `REF_TO` of user-defined types (structures, FBs, enumerations) → `Reference { target_type: ... }` with the resolved inner type
 
 ### NULL Type Resolution Strategy
 
-NULL uses **contextual typing** (inferred from the assignment target or comparison operand), not a dedicated `NullRef` intermediate type. This avoids adding a special type variant that would need to be handled in every type-checking path.
+NULL uses **contextual typing** (inferred from the assignment target or comparison operand), not a dedicated `NullRef` semantic type. This avoids adding a special type variant that would need to be handled in every type-checking path.
 
-**How it works:** `ExprKind::Null` is assigned `IntermediateType::Reference { target_type: Box::new(IntermediateType::Bool) }` as a placeholder during expression type resolution. The actual type compatibility check happens in the semantic rules:
+**How it works:** `ExprKind::Null` is assigned `SemanticType::Reference { target_type: Box::new(SemanticType::Bool) }` as a placeholder during expression type resolution. The actual type compatibility check happens in the semantic rules:
 
 - **Assignment** (`ref := NULL`): The rule checks that the target is a reference type. The NULL expression is valid regardless of its placeholder type because the codegen always emits `LOAD_CONST_I64 u64::MAX` — the same bit pattern for all reference types.
 - **Comparison** (`ref = NULL`, `ref <> NULL`): The rule checks that one operand is a reference type. NULL is valid as the other operand. The codegen emits `EQ_I64`/`NE_I64` which compares raw u64 values — type-agnostic.
@@ -287,9 +289,9 @@ This approach works because references are type-erased at the bytecode level (al
 
 | Expression | Resolved type |
 |------------|---------------|
-| `REF(var)` | `IntermediateType::Reference { target_type: typeof(var) }` |
+| `REF(var)` | `SemanticType::Reference { target_type: typeof(var) }` |
 | `ref^` | Target type of the reference (unwraps one level) |
-| `NULL` | `IntermediateType::Reference { target_type: Bool }` (placeholder; see NULL Type Resolution Strategy above) |
+| `NULL` | `SemanticType::Reference { target_type: Bool }` (placeholder; see NULL Type Resolution Strategy above) |
 | `ref = NULL` / `ref <> NULL` | `BOOL` |
 
 ## Semantic Rules — `compiler/analyzer/src/rule_ref_to.rs` (new file)

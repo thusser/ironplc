@@ -76,7 +76,7 @@
       "patterns": [
         {
           "name": "string.quoted.single.st",
-          "match": "'[^']*'",
+          "match": "'(?:[^'$]|\\$.)*'",
           "captures": {
             "0": {
               "name": "punctuation.definition.string.st"
@@ -85,7 +85,7 @@
         },
         {
           "name": "string.quoted.double.st",
-          "match": "\"[^\"]*\"",
+          "match": "\"(?:[^\"$]|\\$.)*\"",
           "captures": {
             "0": {
               "name": "punctuation.definition.string.st"
@@ -130,7 +130,7 @@
         },
         {
           "name": "keyword.control.flow.st",
-          "match": "(?i)\\b(?:EXIT|RETURN)\\b"
+          "match": "(?i)\\b(?:EXIT|CONTINUE|RETURN)\\b"
         },
         {
           "match": "(?i)\\b(PROGRAM|FUNCTION_BLOCK|FUNCTION)\\s+([A-Za-z_][A-Za-z0-9_]*)",

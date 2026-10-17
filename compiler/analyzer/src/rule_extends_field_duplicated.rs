@@ -1,7 +1,8 @@
 //! Semantic rule that rejects a derived function block (declared with
 //! the IEC 61131-3 Edition 3 `EXTENDS` clause) redeclaring a field
 //! already declared on its base function block or any ancestor further
-//! up the `EXTENDS` chain.
+//! up the `EXTENDS` chain, or declaring a field with the name of a
+//! property it inherits.
 //!
 //! A redeclaration is rejected as a duplicate definition even when the
 //! redeclared field has a different type. Edition 3 inheritance gives a
@@ -50,24 +51,19 @@ use ironplc_dsl::{
 use ironplc_problems::Problem;
 
 use crate::{
-    intermediates::inherited_fields::collect_inherited_fields, result::SemanticResult,
-    semantic_context::SemanticContext,
+    result::SemanticResult, semantic_context::SemanticContext, symbol_environment::SymbolKind,
 };
 use ironplc_parser::options::CompilerOptions;
 
 pub fn apply(
     lib: &Library,
-    _context: &SemanticContext,
+    context: &SemanticContext,
     _options: &CompilerOptions,
 ) -> SemanticResult {
-    let inherited = collect_inherited_fields(lib);
     let mut diagnostics = vec![];
 
     for element in &lib.elements {
         let LibraryElementKind::FunctionBlockDeclaration(fb) = element else {
-            continue;
-        };
-        let Some(inherited_fields) = inherited.get(&fb.name) else {
             continue;
         };
 
@@ -75,25 +71,24 @@ pub fn apply(
             let Some(own_id) = own_field.identifier.symbolic_id() else {
                 continue;
             };
-            if let Some(base_field) = inherited_fields
-                .iter()
-                .find(|f| f.identifier.symbolic_id() == Some(own_id))
-            {
-                let base_name = base_field
-                    .identifier
-                    .symbolic_id()
-                    .map(|id| id.to_string())
-                    .unwrap_or_default();
-                diagnostics.push(Diagnostic::problem(
-                    Problem::ExtendsFieldNameDuplicated,
-                    Label::span(
-                        own_id.span(),
-                        format!(
-                            "Field '{own_id}' is already declared as '{base_name}' in a base function block"
-                        ),
+            let Some((base_name, base)) = context.symbols().inherited_member(own_id, &fb.name.name)
+            else {
+                continue;
+            };
+            let what = if base.kind == SymbolKind::Property {
+                "property"
+            } else {
+                "field"
+            };
+            diagnostics.push(Diagnostic::problem(
+                Problem::ExtendsFieldNameDuplicated,
+                Label::span(
+                    own_id.span(),
+                    format!(
+                        "Field '{own_id}' is already declared as {what} '{base_name}' in a base function block"
                     ),
-                ));
-            }
+                ),
+            ));
         }
     }
 
@@ -106,17 +101,10 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::fb_inheritance_options;
 
-    fn opts_with_fb_inheritance() -> CompilerOptions {
-        CompilerOptions {
-            allow_fb_inheritance: true,
-            ..CompilerOptions::default()
-        }
-    }
-
-    rule_err1_with!(
+    rule_err!(
         apply_when_derived_redeclares_base_field_same_type_then_error,
-        opts_with_fb_inheritance(),
         "
 FUNCTION_BLOCK FB_Base
 VAR
@@ -129,12 +117,12 @@ VAR
     state : INT;
 END_VAR
 END_FUNCTION_BLOCK",
-        Problem::ExtendsFieldNameDuplicated
+        [Problem::ExtendsFieldNameDuplicated],
+        fb_inheritance_options()
     );
 
-    rule_err1_with!(
+    rule_err!(
         apply_when_derived_redeclares_base_field_different_type_then_error,
-        opts_with_fb_inheritance(),
         "
 FUNCTION_BLOCK FB_Base
 VAR
@@ -147,12 +135,12 @@ VAR
     state : BOOL;
 END_VAR
 END_FUNCTION_BLOCK",
-        Problem::ExtendsFieldNameDuplicated
+        [Problem::ExtendsFieldNameDuplicated],
+        fb_inheritance_options()
     );
 
-    rule_ok_with!(
+    rule_ok!(
         apply_when_derived_has_no_field_collision_then_ok,
-        opts_with_fb_inheritance(),
         "
 FUNCTION_BLOCK FB_Base
 VAR
@@ -164,12 +152,12 @@ FUNCTION_BLOCK FB_Derived EXTENDS FB_Base
 VAR
     derivedState : BOOL;
 END_VAR
-END_FUNCTION_BLOCK"
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
     );
 
-    rule_err1_with!(
+    rule_err!(
         apply_when_grandparent_field_collision_then_error,
-        opts_with_fb_inheritance(),
         "
 FUNCTION_BLOCK FB_A
 VAR
@@ -188,17 +176,81 @@ VAR
     a : INT;
 END_VAR
 END_FUNCTION_BLOCK",
-        Problem::ExtendsFieldNameDuplicated
+        [Problem::ExtendsFieldNameDuplicated],
+        fb_inheritance_options()
     );
 
-    rule_ok_with!(
+    rule_ok!(
         apply_when_no_extends_then_ok,
-        opts_with_fb_inheritance(),
         "
 FUNCTION_BLOCK FB_Plain
 VAR
     x : INT;
 END_VAR
-END_FUNCTION_BLOCK"
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
+
+    rule_err_at!(
+        apply_when_derived_redeclares_base_field_then_error_at_derived_field,
+        "
+FUNCTION_BLOCK FB_Derived EXTENDS FB_Base
+VAR
+    state : INT;
+END_VAR
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK FB_Base
+VAR
+    state : INT;
+END_VAR
+END_FUNCTION_BLOCK",
+        Problem::ExtendsFieldNameDuplicated,
+        "state",
+        fb_inheritance_options()
+    );
+
+    rule_err!(
+        apply_when_derived_declares_field_named_as_inherited_property_then_error,
+        "
+FUNCTION_BLOCK FB_PosBase
+VAR
+    _pos : INT;
+END_VAR
+PROPERTY Position : INT
+GET
+    Position := _pos;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK FB_PosDerived EXTENDS FB_PosBase
+VAR
+    Position : INT;
+END_VAR
+END_FUNCTION_BLOCK",
+        [Problem::ExtendsFieldNameDuplicated],
+        fb_inheritance_options()
+    );
+
+    rule_ok!(
+        apply_when_derived_declares_property_of_base_property_name_then_ok,
+        "
+FUNCTION_BLOCK FB_PosBase
+PROPERTY Position : INT
+GET
+    Position := 1;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK FB_PosDerived EXTENDS FB_PosBase
+PROPERTY Position : INT
+GET
+    Position := 2;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
     );
 }

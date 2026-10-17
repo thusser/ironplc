@@ -30,7 +30,24 @@ use ironplc_dsl::common::*;
 use ironplc_dsl::configuration::*;
 use ironplc_dsl::core::Id;
 use ironplc_dsl::core::Located;
+use ironplc_dsl::member_qualifier::{
+    AccessSpecifier, MemberQualifier, MemberQualifierKind, MemberQualifiers,
+};
 use ironplc_dsl::sfc::*;
+
+/// One member declared after a function block's body. TwinCAT stores
+/// methods and properties in file order, so the two interleave.
+enum FunctionBlockMember {
+    Method(Box<MethodDeclaration>),
+    Property(Box<PropertyDeclaration>),
+}
+
+/// One member prototype declared in an interface. As with
+/// [`FunctionBlockMember`], methods and properties interleave.
+enum InterfaceMember {
+    Method(Box<MethodPrototype>),
+    Property(Box<PropertyPrototype>),
+}
 use ironplc_dsl::textual::*;
 use ironplc_dsl::time::*;
 
@@ -236,14 +253,75 @@ fn span_of_tokens(tokens: &[Token], start: usize, end: usize) -> SourceSpan {
     }
 }
 
-/// Returns the characters of a character-string token without its two
-/// delimiting quotes. The token text is the source as written: `$` escapes
-/// are not decoded.
-fn unquote(text: &str) -> Vec<char> {
-    let mut chars = text.chars();
-    chars.next();
-    chars.next_back();
-    chars.collect()
+/// Returns the characters a character-string token denotes: the text
+/// between its two delimiting quotes with its `$` escapes decoded. An
+/// invalid escape is kept as written; `rule_token_string_escape` reports it.
+fn unquote(text: &str, width: &StringType) -> Vec<char> {
+    let inner = text
+        .get(1..text.len().saturating_sub(1))
+        .unwrap_or_default();
+    dsl::string_escape::decode(inner, width).chars
+}
+
+/// A unit of a duration literal part, smallest first so that the derived
+/// order is the order of magnitude.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DurationUnit {
+    Milliseconds,
+    Seconds,
+    Minutes,
+    Hours,
+    Days,
+}
+
+/// One `number unit` part of a duration literal.
+struct IntervalPart {
+    value: FixedPoint,
+    unit: DurationUnit,
+    /// Whether the number was written with a fraction (`1.0`), whatever its
+    /// value.
+    is_fixed_point: bool,
+}
+
+/// Sums the parts of a duration literal (REQ-TL-021): the units must be in
+/// strictly descending magnitude, which also rules out a repeated unit, and
+/// only the last part may be written as a fixed-point number.
+fn combine_interval_parts(
+    first: IntervalPart,
+    rest: Vec<IntervalPart>,
+) -> Result<DurationLiteral, &'static str> {
+    let last = rest.len();
+    let mut total: Option<DurationLiteral> = None;
+    let mut previous: Option<DurationUnit> = None;
+    for (
+        index,
+        IntervalPart {
+            value,
+            unit,
+            is_fixed_point,
+        },
+    ) in std::iter::once(first).chain(rest).enumerate()
+    {
+        if previous.is_some_and(|p| unit >= p) {
+            return Err("duration units in descending order");
+        }
+        if index < last && is_fixed_point {
+            return Err("an integer before the last duration unit");
+        }
+        previous = Some(unit);
+        let part = match unit {
+            DurationUnit::Days => DurationLiteral::days(value),
+            DurationUnit::Hours => DurationLiteral::hours(value),
+            DurationUnit::Minutes => DurationLiteral::minutes(value),
+            DurationUnit::Seconds => DurationLiteral::seconds(value),
+            DurationUnit::Milliseconds => DurationLiteral::milliseconds(value),
+        };
+        total = Some(match total {
+            None => part,
+            Some(sum) => sum.plus(part),
+        });
+    }
+    total.ok_or("a duration")
 }
 
 /// The default implementation of the parsing traits for `[T]` expects `T` to be
@@ -305,6 +383,17 @@ parser! {
 
     rule tok_eq(ty: TokenType, val: &'static str) -> &'input Token = token:[t] {?
       if token.token_type == ty && token.text.as_str() == val {
+        return Ok(token)
+      }
+      Err(val)
+    }
+
+    // An identifier spelled `val`, in any case. For a word that is a
+    // keyword only in one position, such as a duration unit, the `S` in
+    // `S=` or a property's `GET`/`SET`, and an ordinary name everywhere
+    // else.
+    rule contextual_keyword(val: &'static str) -> &'input Token = token:[t] {?
+      if token.token_type == TokenType::Identifier && token.text.eq_ignore_ascii_case(val) {
         return Ok(token)
       }
       Err(val)
@@ -414,9 +503,9 @@ parser! {
     rule integer__string() -> &'input str = n:tok(TokenType::Digits) { n.text.as_str() }
     rule integer__string_simplified() -> String = n:integer__string() { n.to_string().chars().filter(|c| c.is_ascii_digit()).collect() }
     rule integer() -> Integer = n:tok(TokenType::Digits) {? Integer::new(n.text.as_str(), n.span.clone()) }
-    rule binary_integer() -> Integer =  n:tok(TokenType::BinDigits) {? Integer::try_binary(n.text.as_str()) }
-    rule octal_integer() -> Integer = n:tok(TokenType::OctDigits) {? Integer::try_octal(n.text.as_str()) }
-    rule hex_integer() -> Integer = n:tok(TokenType::HexDigits) {? Integer::try_hex(n.text.as_str()) }
+    rule binary_integer() -> Integer =  n:tok(TokenType::BinDigits) {? Integer::try_binary(n.text.as_str()).map(|i| Integer { span: n.span.clone(), value: i.value }) }
+    rule octal_integer() -> Integer = n:tok(TokenType::OctDigits) {? Integer::try_octal(n.text.as_str()).map(|i| Integer { span: n.span.clone(), value: i.value }) }
+    rule hex_integer() -> Integer = n:tok(TokenType::HexDigits) {? Integer::try_hex(n.text.as_str()).map(|i| Integer { span: n.span.clone(), value: i.value }) }
     // real_literal_type is used specifically for real literals (returns RealTypeName)
     rule real_literal_type() -> (RealTypeName, &'input Token) =
       t:tok(TokenType::Real) { (RealTypeName::REAL, t) }
@@ -469,14 +558,14 @@ parser! {
     rule character_string_literal() -> CharacterStringLiteral = single_byte_character_string() / double_byte_character_string()
     rule single_byte_character_string() -> CharacterStringLiteral = start:position!() (tok(TokenType::String) tok(TokenType::Hash))? t:tok(TokenType::SingleByteString) end:position!() {
       CharacterStringLiteral {
-        value: unquote(&t.text),
+        value: unquote(&t.text, &StringType::String),
         width: StringType::String,
         span: span_of_tokens(tokens, start, end),
       }
     }
     rule double_byte_character_string() -> CharacterStringLiteral = start:position!() (tok(TokenType::WString) tok(TokenType::Hash))? t:tok(TokenType::DoubleByteString) end:position!() {
       CharacterStringLiteral {
-        value: unquote(&t.text),
+        value: unquote(&t.text, &StringType::WString),
         width: StringType::WString,
         span: span_of_tokens(tokens, start, end),
       }
@@ -486,10 +575,9 @@ parser! {
     // Omitted and subsumed into constant.
 
     // B.1.2.3.1 Duration
-    // dt_sep defines case insensitive separators between parts of duration.
+    // Duration separators and units are case insensitive, so they are
+    // matched with contextual_keyword.
     // See specs/design/time-literals.md — REQ-TL-011.
-    rule dt_sep(val: &str) -> &'input Token = [t if t.token_type == TokenType::Identifier && t.text.eq_ignore_ascii_case(val)]
-
     pub rule duration() -> DurationLiteral = start:position!() width:duration_prefix() tok(TokenType::Hash) s:(tok(TokenType::Minus))? i:interval() end:position!() {
       let span = span_of_tokens(tokens, start, end);
       let interval = match s {
@@ -503,16 +591,30 @@ parser! {
       }
     }
     // The prefix names the type: `LTIME#` is an LTIME, `TIME#` and `T#` a
-    // TIME. `dt_sep("T")` matches a bare identifier, so it comes last and
-    // cannot shadow the keyword forms.
-    rule duration_prefix() -> TemporalWidth = tok(TokenType::Time) { TemporalWidth::Short } / tok(TokenType::Ltime) { TemporalWidth::Long } / dt_sep("T") { TemporalWidth::Short }
-    // milliseconds must come first because the "m" in "ms" would match the minutes rule
-    rule interval() -> DurationLiteral = ms:milliseconds() { ms }
-      / d:days() { d }
-      / h:hours() { h }
-      / m:minutes() { m }
-      / s:seconds() { s }
-    rule days() -> DurationLiteral = days:fixed_point() dt_sep("d") { DurationLiteral::days(days) } / days:integer() dt_sep("d") dt_sep("_")? hours:hours() { hours.plus(DurationLiteral::days(days.into())) }
+    // TIME. `contextual_keyword("T")` matches a bare identifier, so it comes
+    // last and cannot shadow the keyword forms.
+    rule duration_prefix() -> TemporalWidth = tok(TokenType::Time) { TemporalWidth::Short } / tok(TokenType::Ltime) { TemporalWidth::Long } / contextual_keyword("T") { TemporalWidth::Short }
+    // One or more `number unit` parts, with an optional `_` between parts
+    // (REQ-TL-020 to 022); `combine_interval_parts` checks their order. The
+    // token transform `xform_split_duration_units` has already split a unit
+    // from the digits the lexer glued to it (`m30s`).
+    rule interval() -> DurationLiteral = first:interval_part() rest:(contextual_keyword("_")? p:interval_part() { p })* {?
+      combine_interval_parts(first, rest)
+    }
+    rule interval_part() -> IntervalPart =
+      fp:tok(TokenType::FixedPoint) unit:duration_unit() {?
+        Ok(IntervalPart { value: FixedPoint::parse(fp.text.as_str())?, unit, is_fixed_point: true })
+      }
+      / i:integer() unit:duration_unit() {
+        IntervalPart { value: i.into(), unit, is_fixed_point: false }
+      }
+    // `ms` must come before `m`, or `100ms` would read as minutes.
+    rule duration_unit() -> DurationUnit =
+      contextual_keyword("ms") { DurationUnit::Milliseconds }
+      / contextual_keyword("d") { DurationUnit::Days }
+      / contextual_keyword("h") { DurationUnit::Hours }
+      / contextual_keyword("m") { DurationUnit::Minutes }
+      / contextual_keyword("s") { DurationUnit::Seconds }
     rule fixed_point() -> FixedPoint =
       fp:tok(TokenType::FixedPoint) {?
         FixedPoint::parse(fp.text.as_str())
@@ -520,22 +622,27 @@ parser! {
       / i:integer() {?
         Ok(i.into())
     }
-    rule hours() -> DurationLiteral = hours:fixed_point() dt_sep("h") { DurationLiteral::hours(hours) } / hours:integer() dt_sep("h") dt_sep("_")? min:minutes() { min.plus(DurationLiteral::hours(hours.into())) }
-    rule minutes() -> DurationLiteral = min:fixed_point() dt_sep("m") { DurationLiteral::minutes(min) } / mins:integer() dt_sep("m") dt_sep("_")? sec:seconds() { sec.plus(DurationLiteral::minutes(mins.into())) }
-    rule seconds() -> DurationLiteral = secs:fixed_point() dt_sep("s") { DurationLiteral::seconds(secs) } / sec:integer() dt_sep("s") dt_sep("_")? ms:milliseconds() { ms.plus(DurationLiteral::seconds(sec.into())) }
-    rule milliseconds() -> DurationLiteral = ms:fixed_point() dt_sep("ms") { DurationLiteral::milliseconds(ms) }
 
     // 1.2.3.2 Time of day and date
     rule time_of_day() -> TimeOfDayLiteral = width:time_of_day_prefix() tok(TokenType::Hash) d:daytime() { TimeOfDayLiteral::new(d).with_width(width) }
     rule time_of_day_prefix() -> TemporalWidth = tok(TokenType::TimeOfDay) { TemporalWidth::Short } / tok(TokenType::Ltod) { TemporalWidth::Long }
+    // The seconds are fixed point, and their fraction is part of the value:
+    // `TOD#10:00:00.250` is 250 ms past ten. `Time` holds nanoseconds, so a
+    // fraction finer than that is truncated; the stored count truncates
+    // further, to the type's own unit (ADR-0025).
     rule daytime() -> Time = h:day_hour() tok(TokenType::Colon) m:day_minute() tok(TokenType::Colon) s:day_second() {?
-      Time::from_hms(h.try_into().map_err(|e| "hour")?, m.try_into().map_err(|e| "min")?, s.whole as u8).map_err(|e| "time")
+      Time::from_hms_nano(
+        h.try_into().map_err(|e| "hour")?,
+        m.try_into().map_err(|e| "min")?,
+        u8::try_from(s.whole).map_err(|e| "second")?,
+        s.nanoseconds(),
+      ).map_err(|e| "time")
     }
     rule day_hour() -> Integer = integer()
     rule day_minute() -> Integer = integer()
     rule day_second() -> FixedPoint = fixed_point()
     rule date() -> DateLiteral = width:date_prefix() tok(TokenType::Hash) d:date_literal() { DateLiteral::new(d).with_width(width) }
-    rule date_prefix() -> TemporalWidth = tok(TokenType::Date) { TemporalWidth::Short } / tok(TokenType::Ldate) { TemporalWidth::Long } / dt_sep("D") { TemporalWidth::Short }
+    rule date_prefix() -> TemporalWidth = tok(TokenType::Date) { TemporalWidth::Short } / tok(TokenType::Ldate) { TemporalWidth::Long } / contextual_keyword("D") { TemporalWidth::Short }
     rule date_literal() -> Date = y:year() tok(TokenType::Minus) m:month() tok(TokenType::Minus) d:day() {?
       let y = y.value;
       let m = Month::try_from(<dsl::common::Integer as TryInto<u8>>::try_into(m).map_err(|e| "month")?).map_err(|e| "month")?;
@@ -602,6 +709,10 @@ parser! {
           syntax,
         })
       }
+      // A simple type without an initializer whose base is an elementary
+      // type. The base is a keyword, so unlike `identifier : identifier`
+      // below this is not ambiguous.
+      / simple:simple_type_declaration__without_value() { DataTypeDeclarationKind::Simple(simple) }
       // The remaining are structure, enumerated and simple without an initializer
       // These all have the general form of
       //    `identifier : identifier`
@@ -620,6 +731,15 @@ parser! {
       SimpleDeclaration {
         type_name,
         spec_and_init,
+      }
+    }
+    rule simple_type_declaration__without_value() -> SimpleDeclaration = type_name:simple_type_name() _ tok(TokenType::Colon) _ base:elementary_type_name() {
+      SimpleDeclaration {
+        type_name,
+        spec_and_init: InitialValueAssignmentKind::Simple(SimpleInitializer {
+          type_name: base.into(),
+          initial_value: None,
+        }),
       }
     }
     rule simple_spec_init() -> InitialValueAssignmentKind = type_name:simple_specification() _ tok(TokenType::Assignment) _ e:expression() {
@@ -792,7 +912,7 @@ parser! {
     rule structure_element_declaration() -> StructureElementDeclaration = name:structure_element_name() _ tok(TokenType::Colon) _ init:(
       arr:array_spec_init() { InitialValueAssignmentKind::Array(arr) }
       // handle the initial value
-      / subrange:subrange_spec_init__with_range() { InitialValueAssignmentKind::Subrange(subrange.0) }
+      / subrange:subrange_spec_init__with_range() { InitialValueAssignmentKind::Subrange(SubrangeInitialValueAssignment { spec: subrange.0, initial_value: subrange.1 }) }
       / i:initialized_structure__without_ambiguous() { late_resolved_members(i) }
       / spec_init:enumerated_spec_init__with_value() {
         match spec_init.0 {
@@ -882,9 +1002,11 @@ parser! {
           })
         }
       }
-    } / tok(TokenType::LeftParen) _ values:enumerated_value() ** (_ tok(TokenType::Comma) _ ) _ tok(TokenType::RightParen) _  init:(tok(TokenType::Assignment) _ i:enumerated_value() {i})? {
+    } / tok(TokenType::LeftParen) _ values:enumerated_value_decl() ** (_ tok(TokenType::Comma) _ ) _ tok(TokenType::RightParen) _  init:(tok(TokenType::Assignment) _ i:enumerated_value() {i})? {
       // An enumerated_specification defined by enum values is unambiguous because
-      // the parenthesis are not valid simple_specification.
+      // the parenthesis are not valid simple_specification. Members are
+      // declarations, so they may carry explicit values as they may with an
+      // initial value in the alternative above.
       InitialValueAssignmentKind::EnumeratedValues(EnumeratedValuesInitializer {
         values,
         initial_value: init,
@@ -1174,7 +1296,7 @@ parser! {
     // 61131-3 (a case-insensitive language) treats every other keyword.
     rule ref_bind_op() -> &'input Token =
       tok(TokenType::Ref) eq:tok(TokenType::Equal) { eq }
-      / [t if t.token_type == TokenType::Identifier && t.text.eq_ignore_ascii_case("REF")] eq:tok(TokenType::Equal) { eq }
+      / contextual_keyword("REF") eq:tok(TokenType::Equal) { eq }
     // Matches the TwinCAT/CODESYS `S=` (set) and `R=` (reset) assignment
     // operators, same technique as `ref_bind_op()`: the letter and `=` must
     // be adjacent (no `_`), so `S = x` is not the operator. `S`/`R` are
@@ -1182,9 +1304,9 @@ parser! {
     // token for them) -- deliberately not a demoted keyword, since `S` and
     // `R` are common variable names and this would demote every occurrence.
     rule set_bind_op() -> &'input Token =
-      [t if t.token_type == TokenType::Identifier && t.text.eq_ignore_ascii_case("S")] eq:tok(TokenType::Equal) { eq }
+      contextual_keyword("S") eq:tok(TokenType::Equal) { eq }
     rule reset_bind_op() -> &'input Token =
-      [t if t.token_type == TokenType::Identifier && t.text.eq_ignore_ascii_case("R")] eq:tok(TokenType::Equal) { eq }
+      contextual_keyword("R") eq:tok(TokenType::Equal) { eq }
     rule ref_initial_value() -> ReferenceInitialValue =
       t:tok(TokenType::Null) { ReferenceInitialValue::Null(t.span.clone()) }
       / tok(TokenType::Ref) _ tok(TokenType::LeftParen) _ v:variable() _ tok(TokenType::RightParen) { ReferenceInitialValue::Ref(v) }
@@ -1199,7 +1321,7 @@ parser! {
     }
     rule var_declaration() -> Vec<UntypedVarDecl> = temp_var_decl()
     rule temp_var_decl() -> Vec<UntypedVarDecl> = string_var_declaration() / var1_declaration() / array_var_declaration() / structured_var_declaration()
-    rule var1_declaration() -> Vec<UntypedVarDecl> = names:var1_list() _ tok(TokenType::Colon) _ init:(spec:subrange_specification__with_range() {InitialValueAssignmentKind::Subrange(spec)} / values:enumerated_specification__only_values()  {InitialValueAssignmentKind::EnumeratedValues(EnumeratedValuesInitializer{ values, initial_value: None})} / spec:simple_specification() { InitialValueAssignmentKind::LateResolvedType(LateResolvedInitializer::bare(spec))} ) {
+    rule var1_declaration() -> Vec<UntypedVarDecl> = names:var1_list() _ tok(TokenType::Colon) _ init:(spec:subrange_specification__with_range() {InitialValueAssignmentKind::Subrange(SubrangeInitialValueAssignment::bare(spec))} / values:enumerated_specification__only_values()  {InitialValueAssignmentKind::EnumeratedValues(EnumeratedValuesInitializer{ values, initial_value: None})} / spec:simple_specification() { InitialValueAssignmentKind::LateResolvedType(LateResolvedInitializer::bare(spec))} ) {
       // TODO this could eventually cause duplicated definitions because
       // multiple variables have the same type declaration
       names.iter().map(|identifier| {
@@ -1255,6 +1377,7 @@ parser! {
         initializer,
         block: next_block_id(),
         type_id: None,
+        reset_on_call: false,
       }
     }
     // We use the same type as in other places for VarInit, but the external always omits the initializer
@@ -1282,6 +1405,7 @@ parser! {
         initializer: spec,
         block: next_block_id(),
         type_id: None,
+        reset_on_call: false,
       }
     }
     rule global_var_name() -> Id = i:identifier() { i }
@@ -1308,6 +1432,7 @@ parser! {
           initializer: init,
           block: next_block_id(),
           type_id: None,
+          reset_on_call: false,
         }
       }).collect()
      }
@@ -1420,6 +1545,7 @@ parser! {
         variables,
         edge_variables,
         body,
+        result: Default::default(),
       }
     }
     rule io_var_declarations() -> Vec<VarDeclarations> = input_declarations() / o:output_declarations() { vec![VarDeclarations::Outputs(o)] } / io:input_output_declarations() { vec![VarDeclarations::Inouts(io)] }
@@ -1447,33 +1573,115 @@ parser! {
     // element and appends it after the function block body, so the XML form
     // reaches `MethodDeclaration` through this rule as well. See ADR-0041
     // Phase 1.
-    rule method_declaration() -> MethodDeclaration = start:tok(TokenType::Method) _ name:identifier() _ rt:(tok(TokenType::Colon) _ rt:function_return_type() {rt})? _ decls:(io:io_var_declarations() { io } / other:other_var_declarations() { vec![other] } / temp:temp_var_decls() { vec![temp] }) ** _ _ body:function_body() _ end:tok(TokenType::EndMethod) {
+    // A qualifier between `METHOD`/`FUNCTION_BLOCK` and the name. Except
+    // for `ABSTRACT`, the words are contextual keywords, so they stay
+    // ordinary identifiers everywhere else.
+    rule member_qualifier() -> MemberQualifier =
+      t:tok(TokenType::Abstract) { MemberQualifier { kind: MemberQualifierKind::Abstract, span: t.span.clone() } }
+      / t:contextual_keyword("PUBLIC") { MemberQualifier { kind: MemberQualifierKind::Access(AccessSpecifier::Public), span: t.span.clone() } }
+      / t:contextual_keyword("PRIVATE") { MemberQualifier { kind: MemberQualifierKind::Access(AccessSpecifier::Private), span: t.span.clone() } }
+      / t:contextual_keyword("PROTECTED") { MemberQualifier { kind: MemberQualifierKind::Access(AccessSpecifier::Protected), span: t.span.clone() } }
+      / t:contextual_keyword("INTERNAL") { MemberQualifier { kind: MemberQualifierKind::Access(AccessSpecifier::Internal), span: t.span.clone() } }
+      / t:contextual_keyword("FINAL") { MemberQualifier { kind: MemberQualifierKind::Final, span: t.span.clone() } }
+      / t:contextual_keyword("OVERRIDE") { MemberQualifier { kind: MemberQualifierKind::Override, span: t.span.clone() } }
+    // Qualifiers in source order; their order and combination are checked
+    // after parsing. A word is only a qualifier when the declaration's name
+    // still follows it, so `METHOD Override : BOOL` is a method named
+    // `Override`. The name must not be the start of a statement either:
+    // in `METHOD Override x := 1;` the method has no header and `x := 1;`
+    // is its body.
+    rule member_qualifiers() -> MemberQualifiers = qs:(q:member_qualifier() &(_ (member_qualifier() / identifier() !(_ statement_continuation()))) { q }) ** _ {
+      MemberQualifiers::new(qs)
+    }
+    // The token after the first identifier of a statement: `x := `,
+    // `x(`, `x.`, `x[`, `x^`, or `x REF=`/`x S=`/`x R=`.
+    rule statement_continuation() =
+      tok(TokenType::Assignment) / tok(TokenType::LeftParen) / tok(TokenType::Period)
+      / tok(TokenType::LeftBracket) / tok(TokenType::Caret)
+      / ref_bind_op() / set_bind_op() / reset_bind_op()
+
+    // `method_header` is `METHOD qualifiers name (: return_type)?`, shared
+    // with an interface's method prototype. It returns the `METHOD` token
+    // for the span.
+    rule method_header() -> (&'input Token, MemberQualifiers, Id, Option<FunctionReturnType>) = start:tok(TokenType::Method) _ qualifiers:member_qualifiers() _ name:identifier() rt:(_ tok(TokenType::Colon) _ rt:function_return_type() {rt})? {
+      (start, qualifiers, name, rt)
+    }
+
+    // Unlike a function, a method may have an empty body: an `ABSTRACT`
+    // method has none, and TwinCAT writes a do-nothing method that way.
+    rule method_declaration() -> MethodDeclaration = header:method_header() _ decls:(io:io_var_declarations() { io } / other:other_var_declarations() { vec![other] } / temp:temp_var_decls() { vec![temp] }) ** _ _ body:function_body()? _ end:tok(TokenType::EndMethod) {
       let decls = VarDeclarations::flatten(decls);
       let (variables, remainder) = VarDeclarations::drain_var_decl(decls);
       let (edge_variables, _) = VarDeclarations::drain_edge_decl(remainder);
+      let (start, qualifiers, name, return_type) = header;
       MethodDeclaration {
+        qualifiers,
+        accessor: None,
         name,
-        return_type: rt,
+        return_type,
+        implicit_variables: vec![],
         variables,
         edge_variables,
-        body,
+        body: body.unwrap_or_default(),
+        span: SourceSpan::join(&start.span, &end.span),
+        result: Default::default(),
+      }
+    }
+
+    // OOP extension: PROPERTY name : type, with an optional GET and an
+    // optional SET accessor, then END_PROPERTY. `GET`/`SET` are matched by
+    // text because they stay identifiers everywhere else. TwinCAT's `.TcPOU`
+    // form stores a `<Property>` element with `<Get>`/`<Set>` children;
+    // `ironplc-sources` rebuilds this textual form from it. Each accessor
+    // becomes a `MethodDeclaration`, see `PropertyDeclaration`.
+    rule property_accessor_parts() -> (Vec<VarDecl>, Vec<EdgeVarDecl>, Vec<StmtKind>) = decls:(io:io_var_declarations() { io } / other:other_var_declarations() { vec![other] } / temp:temp_var_decls() { vec![temp] }) ** _ _ body:function_body()? {
+      let decls = VarDeclarations::flatten(decls);
+      let (variables, remainder) = VarDeclarations::drain_var_decl(decls);
+      let (edge_variables, _) = VarDeclarations::drain_edge_decl(remainder);
+      (variables, edge_variables, body.unwrap_or_default())
+    }
+    // `property_header` is `PROPERTY name : type`, shared with an interface's
+    // property prototype. It returns the `PROPERTY` token for the span.
+    rule property_header() -> (&'input Token, Id, FunctionReturnType) = start:tok(TokenType::Property) _ name:identifier() _ tok(TokenType::Colon) _ property_type:function_return_type() {
+      (start, name, property_type)
+    }
+    rule property_declaration() -> PropertyDeclaration = header:property_header() _ get:(g:contextual_keyword("GET") _ parts:property_accessor_parts() _ e:tok(TokenType::EndGet) { (g, parts, e) })? _ set:(s:contextual_keyword("SET") _ parts:property_accessor_parts() _ e:tok(TokenType::EndSet) { (s, parts, e) })? _ end:tok(TokenType::EndProperty) {
+      let (start, name, property_type) = header;
+      let get = get.map(|(g, (variables, edge_variables, body), e)| {
+        PropertyDeclaration::get_accessor(&name, &property_type, variables, edge_variables, body, SourceSpan::join(&g.span, &e.span))
+      });
+      let set = set.map(|(s, (variables, edge_variables, body), e)| {
+        PropertyDeclaration::set_accessor(&name, &property_type, variables, edge_variables, body, SourceSpan::join(&s.span, &e.span))
+      });
+      PropertyDeclaration {
+        name,
+        property_type,
+        get,
+        set,
         span: SourceSpan::join(&start.span, &end.span),
       }
     }
 
-    rule function_block_declaration() -> FunctionBlockDeclaration = start:tok(TokenType::FunctionBlock) _ is_abstract:(t:tok(TokenType::Abstract) {t})? _ name:derived_function_block_name() _ extends:(e:tok(TokenType::Extends) _ t:type_name() {(e, t)})? _ implements:(i:tok(TokenType::Implements) _ names:type_name_list() {(i, names)})? _ decls:(io:io_var_declarations() { io } / other:other_var_declarations() { vec![other] } / temp:temp_var_decls() { vec![temp] }) ** _ _ body:function_block_body() _ methods:(_ m:method_declaration() {m}) ** _ _ end:tok(TokenType::EndFunctionBlock) {
+    rule function_block_member() -> FunctionBlockMember = m:method_declaration() { FunctionBlockMember::Method(Box::new(m)) } / p:property_declaration() { FunctionBlockMember::Property(Box::new(p)) }
+
+    rule function_block_declaration() -> FunctionBlockDeclaration = start:tok(TokenType::FunctionBlock) _ qualifiers:member_qualifiers() _ name:derived_function_block_name() _ extends:(e:tok(TokenType::Extends) _ t:type_name() {(e, t)})? _ implements:(i:tok(TokenType::Implements) _ names:type_name_list() {(i, names)})? _ decls:(io:io_var_declarations() { io } / other:other_var_declarations() { vec![other] } / temp:temp_var_decls() { vec![temp] }) ** _ _ body:function_block_body() _ members:(_ m:function_block_member() {m}) ** _ _ end:tok(TokenType::EndFunctionBlock) {
+      let mut methods = Vec::new();
+      let mut properties = Vec::new();
+      for member in members {
+        match member {
+          FunctionBlockMember::Method(m) => methods.push(*m),
+          FunctionBlockMember::Property(p) => properties.push(*p),
+        }
+      }
+
       let decls = VarDeclarations::flatten(decls);
       let (variables, remainder) = VarDeclarations::drain_var_decl(decls);
       let (edge_variables, _) = VarDeclarations::drain_edge_decl(remainder);
 
       let base = extends.as_ref().map(|(_, t)| t.clone());
       let implements_list = implements.as_ref().map(|(_, names)| names.clone()).unwrap_or_default();
-      let is_abstract_present = is_abstract.is_some();
-      let oop = if is_abstract_present || base.is_some() || !implements_list.is_empty() {
-        let mut oop_spans: Vec<SourceSpan> = Vec::new();
-        if let Some(t) = &is_abstract {
-          oop_spans.push(t.span.clone());
-        }
+      let oop = if !qualifiers.is_empty() || base.is_some() || !implements_list.is_empty() {
+        let mut oop_spans: Vec<SourceSpan> = qualifiers.iter().map(|q| q.span.clone()).collect();
         if let Some((e, t)) = &extends {
           oop_spans.push(e.span.clone());
           oop_spans.push(t.span());
@@ -1491,7 +1699,7 @@ parser! {
         Some(FunctionBlockOop {
           base,
           implements: implements_list,
-          is_abstract: is_abstract_present,
+          qualifiers,
           span: oop_span,
         })
       } else {
@@ -1506,17 +1714,61 @@ parser! {
         span: SourceSpan::join(&start.span, &end.span),
         oop,
         methods,
+        properties,
       }
     }
 
-    // OOP extension: INTERFACE ... END_INTERFACE. Only the
-    // header (name + optional EXTENDS list) is parsed — method/property
-    // signatures are not yet supported (see
-    // specs/design/beckhoff-twincat-dialect.md §1.3).
-    rule interface_declaration() -> InterfaceDeclaration = tok(TokenType::Interface) _ name:identifier() _ extends:(tok(TokenType::Extends) _ names:type_name_list() {names})? _ tok(TokenType::EndInterface) {
+    // OOP extension: a method signature inside an INTERFACE (Ed. 3 calls it
+    // a method prototype). Only input, output and in-out blocks are
+    // allowed, and there is no body.
+    rule method_prototype() -> MethodPrototype = header:method_header() decls:(_ io:io_var_declarations() { io }) ** _ _ end:tok(TokenType::EndMethod) {
+      let decls = VarDeclarations::flatten(decls);
+      let (variables, remainder) = VarDeclarations::drain_var_decl(decls);
+      let (edge_variables, _) = VarDeclarations::drain_edge_decl(remainder);
+      let (start, qualifiers, name, return_type) = header;
+      MethodPrototype {
+        qualifiers,
+        name,
+        return_type,
+        variables,
+        edge_variables,
+        span: SourceSpan::join(&start.span, &end.span),
+      }
+    }
+
+    // OOP extension: a property signature inside an INTERFACE. Each
+    // accessor that is present is an empty `GET END_GET` or `SET END_SET`.
+    rule property_prototype() -> PropertyPrototype = header:property_header() get:(_ g:contextual_keyword("GET") _ e:tok(TokenType::EndGet) { SourceSpan::join(&g.span, &e.span) })? set:(_ s:contextual_keyword("SET") _ e:tok(TokenType::EndSet) { SourceSpan::join(&s.span, &e.span) })? _ end:tok(TokenType::EndProperty) {
+      let (start, name, property_type) = header;
+      PropertyPrototype {
+        name,
+        property_type,
+        get,
+        set,
+        span: SourceSpan::join(&start.span, &end.span),
+      }
+    }
+
+    rule interface_member() -> InterfaceMember = m:method_prototype() { InterfaceMember::Method(Box::new(m)) } / p:property_prototype() { InterfaceMember::Property(Box::new(p)) }
+
+    // OOP extension: INTERFACE ... END_INTERFACE, with the method and
+    // property prototypes it declares, in any order. TwinCAT's `.TcIO` form
+    // stores each member as a `<Method>`/`<Property>` element;
+    // `ironplc-sources` rebuilds this textual form from them.
+    rule interface_declaration() -> InterfaceDeclaration = tok(TokenType::Interface) _ name:identifier() _ extends:(tok(TokenType::Extends) _ names:type_name_list() {names})? members:(_ m:interface_member() {m}) ** _ _ tok(TokenType::EndInterface) {
+      let mut methods = Vec::new();
+      let mut properties = Vec::new();
+      for member in members {
+        match member {
+          InterfaceMember::Method(m) => methods.push(*m),
+          InterfaceMember::Property(p) => properties.push(*p),
+        }
+      }
       InterfaceDeclaration {
         name,
         extends: extends.unwrap_or_default(),
+        methods,
+        properties,
       }
     }
 
@@ -1915,6 +2167,12 @@ parser! {
       / function:function_expression() {
           function
         }
+      // Before `variable()`: `m.GetSpeed` is also a valid structured
+      // variable, so the call has to be tried first.
+      / call:method_call() {
+          let span = call.span();
+          Expr::new(ExprKind::MethodCall(call)).with_span(span)
+        }
       / id:identifier() _ !(tok(TokenType::LeftParen) / tok(TokenType::LeftBracket) / tok(TokenType::Period) / tok(TokenType::Caret)) {
         Expr::new(ExprKind::LateBound(LateBound{ value: id }))
       }
@@ -2023,22 +2281,27 @@ parser! {
     rule method_receiver() -> MethodReceiver =
       s:self_ref() { MethodReceiver::SelfRef(s) }
       / id:identifier() { MethodReceiver::Instance(id) }
-    rule method_invocation() -> StmtKind = receiver:method_receiver() _ period() _ method:identifier() _ tok(TokenType::LeftParen) _ params:param_assignment() ** (_ tok(TokenType::Comma) _) _ end:tok(TokenType::RightParen) {
+    // `receiver.Method(args)`, shared by the statement form below and the
+    // expression form in `primary_expression`, so the receiver grammar is
+    // in one place.
+    rule method_call() -> MethodCall = receiver:method_receiver() _ period() _ method:identifier() _ tok(TokenType::LeftParen) _ params:param_assignment() ** (_ tok(TokenType::Comma) _) _ end:tok(TokenType::RightParen) {
       let span = SourceSpan::join(&receiver.span(), &end.span);
-      StmtKind::MethodCall(MethodCall {
+      MethodCall {
         receiver,
         method,
         params,
         position: span,
-      })
+      }
     }
+    rule method_invocation() -> StmtKind = call:method_call() { StmtKind::MethodCall(call) }
     // TODO this needs much more
     rule param_assignment() -> ParamAssignmentKind = not:(tok(TokenType::Not) {})? _ src:variable_name() _ tok(TokenType::RightArrow) _ tgt:variable() {
       ParamAssignmentKind::Output (
         Output{
-        not: false,
+        not: not.is_some(),
         src,
         tgt,
+        value: None,
       })
     } / name:(n:variable_name() _ tok(TokenType::Assignment) { n })? _ expr:expression() {
       match name {
@@ -2093,7 +2356,7 @@ parser! {
     }
 
     // B.3.2.4 Iteration statements
-    rule iteration_statement() -> StmtKind = f:for_statement() {StmtKind::For(f)} / w:while_statement() {StmtKind::While(w)} / r:repeat_statement() {StmtKind::Repeat(r)} / exit_statement()
+    rule iteration_statement() -> StmtKind = f:for_statement() {StmtKind::For(f)} / w:while_statement() {StmtKind::While(w)} / r:repeat_statement() {StmtKind::Repeat(r)} / exit_statement() / continue_statement()
     rule for_statement() -> For = start:tok(TokenType::For) _ control:control_variable() _ tok(TokenType::Assignment) _ range:for_list() _ tok(TokenType::Do) _ body:statement_list() _ end:tok(TokenType::EndFor) {
       For {
         control,
@@ -2121,5 +2384,6 @@ parser! {
       }
     }
     rule exit_statement() -> StmtKind = t:tok(TokenType::Exit) { StmtKind::Exit(t.span.clone()) }
+    rule continue_statement() -> StmtKind = t:tok(TokenType::Continue) { StmtKind::Continue(t.span.clone()) }
   }
 }

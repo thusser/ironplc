@@ -44,7 +44,7 @@ against its single row.
   the analyzer derives the signature and codegen the dispatch. This design
   gives the arithmetic rows their Table 30 overloads.
 - **[Expression Type Resolution](expression-type-resolution.md)** — every
-  `Expr` carries a `resolved_type`; this design changes how an arithmetic
+  `Expr` carries an `expr_type`; this design changes how an arithmetic
   binary expression's type is chosen, and makes codegen use it.
 - **[ADR-0001](../adrs/0001-bytecode-integer-arithmetic-type-strategy.md)** —
   two operation widths, operands promoted on load, results narrowed on store.
@@ -189,8 +189,8 @@ operator is not defined for the pair. It is a pure function of its arguments,
 so calling it from more than one pass needs no annotation on the tree.
 
 1. If either operand has no resolved type, or a type the compatibility
-   predicate cannot judge (a subrange, an enumeration, a structure, a user
-   type), return `Unchecked`
+   predicate cannot judge (an enumeration, a structure, a user type), return
+   `Unchecked`
    with the left operand's type. This is today's behaviour, and the operator
    rule already skips such operands. It is a separate answer from `Numeric`
    so that nothing downstream mistakes "not judged" for "judged numeric".
@@ -252,13 +252,16 @@ An extensible call with more than two inputs (`ADD(a, b, c)`) folds from the
 left: the resolver runs on the first two inputs, then on that result and the
 third, and so on. `ADD(t1, t2, t3)` is therefore two `ADD_TIME` steps, which
 is what `t1 + t2 + t3` is, so the function form accepts exactly what the
-operator accepts (the invariant of Keyword Function Forms). Codegen folds the
-same way, asking the resolver at each step with the accumulated result type.
+operator accepts (the invariant of Keyword Function Forms). The analyzer's
+conversion pass folds the same way, asking the resolver at each step with the
+accumulated result type, and records each step as a call of its own (see
+[Implicit Conversions](implicit-conversions.md)); codegen asks the resolver
+only for the typed overloads on the time and date types.
 
-For the numeric overload, codegen calls the resolver with the compiler
-options the analyzer ran with, which it reads from the semantic context it is
-given (`SemanticContext::compiler_options`). The two passes therefore ask the
-same question with the same options and cannot disagree about a result type.
+For the numeric overload the conversion pass calls the resolver with the
+compiler options the analyzer ran with, so the type resolver and the pass ask
+the same question with the same options and cannot disagree about a result
+type.
 
 ### Type resolution
 
@@ -273,15 +276,15 @@ still see a type and the operator rule can report the operands.
 `rule_operator_operand_type_check` checks every arithmetic operator, not only
 `MOD`, and also every call to one of the four overloaded names, by asking the
 resolver; `checked_form` goes away. It reports P4049 when the answer is
-`None`. Both spellings of an operator get the same diagnostic, so `t * r` and
-`MUL(t, r)` are reported the same way. P4049 changes its context from an
+`None`. Both spellings of an operator get the same diagnostic, so `t1 * t2` and
+`MUL(t1, t2)` are reported the same way. P4049 changes its context from an
 `expected` category to the two operand types, because an operator with
 overloads has no single expected type, and its message changes from "the
 operand type" to "the operand types":
 
 ```
 error[P4049]: Operator is not defined for the operand types
-              (operator=*, left=TIME, right=REAL)
+              (operator=*, left=TIME, right=TIME)
 ```
 
 An arithmetic expression is reported once, labelled at the whole expression,
@@ -309,17 +312,18 @@ Codegen changes in two places.
 
 **Typed dispatch.** Both spellings compile in `compile_arith.rs`: the
 operator expression and the function-form fold ask the typed step. When it
-answers, they compile the two operands through the typed routine named by the
-answer (`compile_time_arith.rs`), the routine that `ADD_TIME(a, b)` already
-reaches by name. The typed routines take their operands rather than a
-`Function`, so both spellings share them, and take their operation width from
-the typed name (32-bit for the short form, 64-bit for the long one) instead
-of hard-coding 32-bit, so the long forms compile. In a fold after the first
-step, the left operand is the accumulated result already on the stack rather
-than an expression, so a routine's left operand is either one. A short-width
-operand of a long form is loaded at 32 bits and widened by its signedness, as
-ADR-0001 loads any narrower integer: a `TIME` is sign-extended and a date
-type is zero-extended.
+answers, they compile the two operands through the routine of the time
+function that the answer's signature names as its intrinsic
+(`compile_time_arith.rs`), the routine a call of `ADD_TIME(a, b)` reaches
+through the same intrinsic. The typed routines take their operands rather
+than a `Function`, so both spellings share them, and take their operation
+width from the intrinsic (32-bit for the short form, 64-bit for the long one)
+instead of hard-coding 32-bit, so the long forms compile. The analyzer writes
+a typed fold of three or more inputs as the two-input calls it folds to, and
+converts a short-width operand of a long form to its long type (see
+`implicit-conversions.md`, Time and date operations), which widens it by its
+signedness: a `TIME` is sign-extended and a date type is zero-extended. Each
+routine compiles its operands at the types the analyzer recorded.
 
 **Numeric width.** A numeric binary expression compiles at the width of its
 resolved type, not at the width of the variable it is assigned to. An operand
@@ -340,11 +344,10 @@ operands and a `DINT` target divides signed; it now divides unsigned, as its
 operands are. An expression whose operands and target share both width and
 signedness compiles to the same bytecode as before.
 
-Codegen applies this only when the expression's resolved type is a concrete
-elementary numeric or bit-string type. An expression typed otherwise (a
-generic literal type, a subrange, an enumeration, or no type) compiles at the
-enclosing operation type, as it does today, because codegen cannot place its
-width.
+Codegen applies this when the expression's resolved type is a concrete
+elementary numeric or bit-string type, a subrange being known by its base
+type's name. An expression the analyzer resolved to neither that nor a typed
+overload is an internal error, not compiled at another type.
 
 The function form follows the same rule at each step of its fold, so
 `ADD(i, r)` and `i + r` compute the same value, and `ADD(a, b, c)` compiles
@@ -358,7 +361,8 @@ codegen would only ever see calls it already compiles. That is one more pass,
 a call node in the analyzed tree that the user did not write, a fabricated
 span on its name, and a rule whose correctness depends on the pass having
 run. Codegen already depends on the analyzer's table (`compile_function_call`
-looks up `operator_function_form`), so asking the typed step from codegen is
+compiles a call as the intrinsic its signature names), so asking the typed
+step from codegen is
 the same dependency with no new node, and the tree stays what the parser
 produced for every consumer of it. The rewrite was dropped.
 
@@ -464,7 +468,7 @@ Programs that keep working: `t1 + t2`, `t + lt`, `lt + LTIME#1s`, `dt + t`,
 
 **REQ-AO-analyzer-030** An arithmetic operator whose operands do not resolve is reported as P4049 naming the operator and both operand types.
 
-**REQ-AO-analyzer-031** Every arithmetic operator (`+`, `-`, `*`, `/`, `MOD`) is checked, so `r MOD 2.0`, `t1 * 1.5`, `s1 + s2` and `x * x` on `BOOL` are each reported as P4049.
+**REQ-AO-analyzer-031** Every arithmetic operator (`+`, `-`, `*`, `/`, `MOD`) is checked, so `r MOD 2.0`, `t1 * t2`, `s1 + s2` and `x * x` on `BOOL` are each reported as P4049.
 
 **REQ-AO-analyzer-032** A call to an overloaded name whose inputs do not resolve is reported as P4049 naming the function and the two operand types of the failing step, and not as P4026.
 
@@ -496,11 +500,11 @@ Programs that keep working: `t1 + t2`, `t + lt`, `lt + LTIME#1s`, `dt + t`,
 
 **REQ-AO-codegen-009** An extensible call on a Table 30 pair compiles to the typed routine folded from the left, so `ADD(t1, t2, t3)` computes what `t1 + t2 + t3` computes.
 
-**REQ-AO-codegen-010** A numeric operator expression computes with the signedness of its resolved type, so `UDINT / UDINT` assigned to `DINT` divides unsigned and gives 2000000000 for 4000000000 and 2.
+**REQ-AO-codegen-010** A numeric operator expression computes with the signedness of its resolved type, so `UDINT / UDINT` assigned to a signed `LINT` divides unsigned and gives 2000000000 for 4000000000 and 2.
 
 **REQ-AO-codegen-011** A call to the function form of a numeric operator computes each fold step as the operator expression does, so `ADD(i, r)` gives 4.5 for `INT` 3 and `REAL` 1.5.
 
-**REQ-AO-codegen-012** An arithmetic expression whose resolved type is not a concrete elementary numeric or bit-string type, such as a subrange, compiles at the enclosing operation type as before this design.
+**REQ-AO-codegen-012** An arithmetic expression on a subrange computes at the subrange's base type, and its result is widened by the conversion the analyzer records to its target: `l := s + s` on a subrange of `INT` adds at 32 bits and widens the sum.
 
 ## Out of scope
 

@@ -468,6 +468,7 @@ fn transform_function(
             variables,
             edge_variables: vec![],
             body,
+            result: Default::default(),
         },
     ))
 }
@@ -497,6 +498,7 @@ fn transform_function_block(
             // <Method> element, not nested under the POU body handled
             // here. Wiring those into `methods` is a follow-up slice.
             methods: vec![],
+            properties: vec![],
         },
     ))
 }
@@ -624,6 +626,7 @@ fn transform_variable(
         initializer,
         block: next_block_id(),
         type_id: None,
+        reset_on_call: false,
     })
 }
 

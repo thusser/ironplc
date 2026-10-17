@@ -4,7 +4,7 @@
 //! Each function is one of a few instruction sequences, chosen by the units
 //! its operands are stored in (ADR-0025): `TIME` and `TIME_OF_DAY` in
 //! milliseconds, `DATE` and `DATE_AND_TIME` in seconds. [`time_arith_for`]
-//! names the sequence for a function and [`compile_time_arith`] emits it for
+//! names the sequence for a [`TimeFunction`] and [`compile_time_arith`] emits it for
 //! two operand expressions, so the sequences do not depend on how the
 //! operands were written.
 //!
@@ -12,15 +12,22 @@
 //! and `LDATE_AND_TIME` (`ADD_LTIME`, `SUB_LDATE_LDATE`, ...). A long type
 //! stores the same unit as its short type (ADR-0021, ADR-0025), so a long
 //! form is the same sequence at 64-bit width.
+//!
+//! The analyzer converted each operand to the width its sequence computes at
+//! (ADR-0056): a short `TIME` or `DATE` operand of a long form to its long
+//! type, and the number `MUL` and `DIV` scale by to `LINT` or `LREAL` where
+//! the sequence needs it. Each operand compiles at the type the analyzer
+//! recorded for it; one of another width is an internal error rather than
+//! widened here.
 
+use ironplc_analyzer::TimeFunction;
 use ironplc_container::opcode;
-use ironplc_dsl::diagnostic::Diagnostic;
+use ironplc_dsl::core::Located;
+use ironplc_dsl::diagnostic::{Diagnostic, Label};
 use ironplc_dsl::textual::Expr;
 
 use super::compile::{CompileContext, OpType, OpWidth, Signedness};
-use super::compile_expr::{
-    compile_expr, emit_add, emit_div, emit_mul, emit_sub, op_type_from_expr,
-};
+use super::compile_expr::{compile_expr, emit_add, emit_div, emit_mul, emit_sub, op_type};
 use crate::emit::Emitter;
 
 /// The instruction sequence a typed time or date function compiles to.
@@ -40,32 +47,25 @@ pub(crate) enum TimeArith {
     Divide,
 }
 
-/// Returns the instruction sequence for the typed time or date function
-/// `name` (lower case) and the width it operates at, or `None` when `name`
-/// is not one.
-///
-/// The width comes from the name: 32-bit for a short form, 64-bit for a
-/// long one.
-pub(crate) fn time_arith_for(name: &str) -> Option<(TimeArith, OpWidth)> {
-    use OpWidth::{W32, W64};
-    let found = match name {
-        "add_time" | "add_tod_time" => (TimeArith::SameUnit(emit_add), W32),
-        "add_ltime" | "add_ltod_ltime" => (TimeArith::SameUnit(emit_add), W64),
-        "sub_time" | "sub_tod_time" | "sub_tod_tod" => (TimeArith::SameUnit(emit_sub), W32),
-        "sub_ltime" | "sub_ltod_ltime" | "sub_ltod_ltod" => (TimeArith::SameUnit(emit_sub), W64),
-        "add_dt_time" | "concat_date_tod" => (TimeArith::SecondsAndMillis(emit_add), W32),
-        "add_ldt_ltime" => (TimeArith::SecondsAndMillis(emit_add), W64),
-        "sub_dt_time" => (TimeArith::SecondsAndMillis(emit_sub), W32),
-        "sub_ldt_ltime" => (TimeArith::SecondsAndMillis(emit_sub), W64),
-        "sub_dt_dt" | "sub_date_date" => (TimeArith::SecondsDifference, W32),
-        "sub_ldt_ldt" | "sub_ldate_ldate" => (TimeArith::SecondsDifference, W64),
-        "mul_time" => (TimeArith::Multiply, W32),
-        "mul_ltime" => (TimeArith::Multiply, W64),
-        "div_time" => (TimeArith::Divide, W32),
-        "div_ltime" => (TimeArith::Divide, W64),
-        _ => return None,
+/// Returns the instruction sequence for the time or date function
+/// `function` and the width it operates at: 32-bit for a short form, 64-bit
+/// for a long one.
+pub(crate) fn time_arith_for(function: TimeFunction, long: bool) -> (TimeArith, OpWidth) {
+    let arith = match function {
+        TimeFunction::AddTime | TimeFunction::AddTodTime => TimeArith::SameUnit(emit_add),
+        TimeFunction::SubTime | TimeFunction::SubTodTime | TimeFunction::SubTodTod => {
+            TimeArith::SameUnit(emit_sub)
+        }
+        TimeFunction::AddDtTime | TimeFunction::ConcatDateTod => {
+            TimeArith::SecondsAndMillis(emit_add)
+        }
+        TimeFunction::SubDtTime => TimeArith::SecondsAndMillis(emit_sub),
+        TimeFunction::SubDtDt | TimeFunction::SubDateDate => TimeArith::SecondsDifference,
+        TimeFunction::MulTime => TimeArith::Multiply,
+        TimeFunction::DivTime => TimeArith::Divide,
     };
-    Some(found)
+    let width = if long { OpWidth::W64 } else { OpWidth::W32 };
+    (arith, width)
 }
 
 /// Compiles `arith` at `width` over the operands `in1` and `in2`, leaving
@@ -75,7 +75,7 @@ pub(crate) fn compile_time_arith(
     ctx: &mut CompileContext,
     arith: TimeArith,
     width: OpWidth,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
 ) -> Result<(), Diagnostic> {
     let op_type = (width, Signedness::Signed);
@@ -96,7 +96,7 @@ fn compile_scale(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     width: OpWidth,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
     emit_fn: fn(&mut Emitter, OpType),
 ) -> Result<(), Diagnostic> {
@@ -106,60 +106,35 @@ fn compile_scale(
     }
 }
 
-/// The left operand of a typed time or date function.
+/// Compiles an operand of a typed time or date function at its own type,
+/// which the analyzer converted to `width`, the width the function computes
+/// at.
 ///
-/// A call or operator expression has an expression on each side. In a fold
-/// such as `ADD(t1, t2, t3)`, the left operand of every step after the first
-/// is the previous step's result, already on the stack.
-#[derive(Clone, Copy)]
-pub(crate) enum Operand<'a> {
-    /// An operand expression still to compile.
-    Expr(&'a Expr),
-    /// A value already on the stack, at its natural operation type.
-    Stack(OpType),
-}
-
-/// Leaves the left operand on the stack at `op_type`: compiles it when it is
-/// an expression, and widens it in place when it is already on the stack,
-/// as [`compile_operand`] widens an expression.
-fn compile_left(
-    emitter: &mut Emitter,
-    ctx: &mut CompileContext,
-    op_type: OpType,
-    left: Operand<'_>,
-) -> Result<(), Diagnostic> {
-    match left {
-        Operand::Expr(expr) => compile_operand(emitter, ctx, op_type, expr),
-        Operand::Stack(natural) => {
-            if op_type.0 == OpWidth::W64 && natural == (OpWidth::W32, Signedness::Unsigned) {
-                emitter.emit_builtin(opcode::builtin::CONV_U32_TO_I64);
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Compiles an operand of a typed time or date function at `op_type`.
-///
-/// A `DATE`, `TIME_OF_DAY` or `DATE_AND_TIME` operand of a long form is
-/// narrower than the operation and unsigned (ADR-0025), so it compiles at
-/// its own width and is zero-extended; loading it at 64 bits directly would
-/// sign-extend a date after 2038. Every other operand compiles at `op_type`,
-/// which sign-extends a narrower `TIME` as ADR-0001 loads any narrower
-/// integer.
+/// A `DATE`, `TIME_OF_DAY` or `DATE_AND_TIME` operand is unsigned and the
+/// sequence signed (ADR-0025); at one width they hold the same bits.
 fn compile_operand(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    op_type: OpType,
+    width: OpWidth,
     operand: &Expr,
 ) -> Result<(), Diagnostic> {
-    let natural = op_type_from_expr(operand);
-    if op_type.0 == OpWidth::W64 && natural == Some((OpWidth::W32, Signedness::Unsigned)) {
-        compile_expr(emitter, ctx, operand, (OpWidth::W32, Signedness::Unsigned))?;
-        emitter.emit_builtin(opcode::builtin::CONV_U32_TO_I64);
-        return Ok(());
+    let own = op_type(ctx, operand)?;
+    if own.0 != width {
+        return Err(unconverted_operand(operand, own.0, width));
     }
-    compile_expr(emitter, ctx, operand, op_type)
+    compile_expr(emitter, ctx, operand)
+}
+
+/// The internal error for an operand of a typed time or date function whose
+/// width `own` is not `expected`, the width the function computes at, and
+/// that the analyzer did not convert.
+fn unconverted_operand(operand: &Expr, own: OpWidth, expected: OpWidth) -> Diagnostic {
+    Diagnostic::internal_error_at(Label::span(
+        operand.span(),
+        format!(
+            "Time function operand of width {own:?} where {expected:?} is expected, and the analyzer recorded no conversion"
+        ),
+    ))
 }
 
 /// Pushes the milliseconds in a second, 1000, at the width of `op_type`.
@@ -181,12 +156,12 @@ fn compile_same_unit(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     op_type: OpType,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
     emit_fn: fn(&mut Emitter, OpType),
 ) -> Result<(), Diagnostic> {
-    compile_left(emitter, ctx, op_type, in1)?;
-    compile_operand(emitter, ctx, op_type, in2)?;
+    compile_operand(emitter, ctx, op_type.0, in1)?;
+    compile_operand(emitter, ctx, op_type.0, in2)?;
     emit_fn(emitter, op_type);
     Ok(())
 }
@@ -200,12 +175,12 @@ fn compile_dt_time_add_sub(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     op_type: OpType,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
     emit_fn: fn(&mut Emitter, OpType),
 ) -> Result<(), Diagnostic> {
-    compile_left(emitter, ctx, op_type, in1)?;
-    compile_operand(emitter, ctx, op_type, in2)?;
+    compile_operand(emitter, ctx, op_type.0, in1)?;
+    compile_operand(emitter, ctx, op_type.0, in2)?;
     load_millis_per_second(emitter, ctx, op_type);
     emit_div(emitter, op_type);
     emit_fn(emitter, op_type);
@@ -220,11 +195,11 @@ fn compile_sub_to_time(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     op_type: OpType,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
 ) -> Result<(), Diagnostic> {
-    compile_left(emitter, ctx, op_type, in1)?;
-    compile_operand(emitter, ctx, op_type, in2)?;
+    compile_operand(emitter, ctx, op_type.0, in1)?;
+    compile_operand(emitter, ctx, op_type.0, in2)?;
     emit_sub(emitter, op_type);
     load_millis_per_second(emitter, ctx, op_type);
     emit_mul(emitter, op_type);
@@ -233,92 +208,124 @@ fn compile_sub_to_time(
 
 /// Compiles MUL_TIME and DIV_TIME.
 ///
-/// IN1 is TIME (i32 ms). IN2 is ANY_NUM — codegen inspects IN2's resolved type
-/// to select the appropriate instruction sequence. For integer IN2 we use
-/// direct i32 multiply/divide. For float IN2 we convert TIME to float, operate,
-/// and convert back.
+/// IN1 is TIME (i32 ms). IN2 is ANY_NUM, compiled at its own type: an
+/// integer of 32 bits scales the duration directly, and a real scales it
+/// converted to the real's type and back. A 64-bit integer arrives converted
+/// to `LREAL`, at which the analyzer recorded it is scaled.
 fn compile_mul_div_time(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
     emit_fn: fn(&mut Emitter, OpType),
 ) -> Result<(), Diagnostic> {
-    let time_op = (OpWidth::W32, Signedness::Signed);
-
-    let in2_op = op_type_from_expr(in2).unwrap_or(time_op);
-
-    match in2_op.0 {
+    let in2_op = op_type(ctx, in2)?;
+    compile_operand(emitter, ctx, OpWidth::W32, in1)?;
+    let (to_float, from_float) = match in2_op.0 {
         OpWidth::W32 => {
-            compile_left(emitter, ctx, time_op, in1)?;
-            compile_expr(emitter, ctx, in2, time_op)?;
-            emit_fn(emitter, time_op);
+            compile_expr(emitter, ctx, in2)?;
+            emit_fn(emitter, (OpWidth::W32, Signedness::Signed));
+            return Ok(());
         }
-        OpWidth::F32 => {
-            compile_left(emitter, ctx, time_op, in1)?;
-            emitter.emit_builtin(opcode::builtin::CONV_I32_TO_F32);
-            compile_expr(emitter, ctx, in2, (OpWidth::F32, Signedness::Signed))?;
-            let f32_op = (OpWidth::F32, Signedness::Signed);
-            emit_fn(emitter, f32_op);
-            emitter.emit_builtin(opcode::builtin::CONV_F32_TO_I32);
-        }
-        OpWidth::F64 => {
-            compile_left(emitter, ctx, time_op, in1)?;
-            emitter.emit_builtin(opcode::builtin::CONV_I32_TO_F64);
-            compile_expr(emitter, ctx, in2, (OpWidth::F64, Signedness::Signed))?;
-            let f64_op = (OpWidth::F64, Signedness::Signed);
-            emit_fn(emitter, f64_op);
-            emitter.emit_builtin(opcode::builtin::CONV_F64_TO_I32);
-        }
-        OpWidth::W64 => {
-            // LINT/ULINT: promote TIME to f64, convert IN2 to f64, operate, convert back.
-            // This avoids needing an i64→i32 truncation opcode.
-            compile_left(emitter, ctx, time_op, in1)?;
-            emitter.emit_builtin(opcode::builtin::CONV_I32_TO_F64);
-            compile_expr(emitter, ctx, in2, (OpWidth::W64, in2_op.1))?;
-            emitter.emit_builtin(opcode::builtin::CONV_I64_TO_F64);
-            let f64_op = (OpWidth::F64, Signedness::Signed);
-            emit_fn(emitter, f64_op);
-            emitter.emit_builtin(opcode::builtin::CONV_F64_TO_I32);
-        }
-    }
-
+        OpWidth::F32 => (
+            opcode::builtin::CONV_I32_TO_F32,
+            opcode::builtin::CONV_F32_TO_I32,
+        ),
+        OpWidth::F64 => (
+            opcode::builtin::CONV_I32_TO_F64,
+            opcode::builtin::CONV_F64_TO_I32,
+        ),
+        OpWidth::W64 => return Err(unconverted_operand(in2, in2_op.0, OpWidth::F64)),
+    };
+    emitter.emit_builtin(to_float)?;
+    compile_expr(emitter, ctx, in2)?;
+    emit_fn(emitter, (in2_op.0, Signedness::Signed));
+    emitter.emit_builtin(from_float)?;
     Ok(())
 }
 
 /// Compiles MUL_LTIME and DIV_LTIME.
 ///
-/// IN1 is LTIME (i64 ms), or a TIME that compiles sign-extended. An integer
-/// IN2 operates at 64 bits. A float IN2 operates at `LREAL` whatever its
-/// width: a duration in milliseconds can need more than the 24 bits of a
-/// `REAL` mantissa, so a `REAL` IN2 is widened rather than the duration
-/// narrowed.
+/// IN1 is LTIME (i64 ms). IN2 arrives converted to a 64-bit integer, which
+/// scales the duration directly, or to `LREAL`, which scales it converted to
+/// `LREAL` and back: a duration in milliseconds can need more than the 24
+/// bits of a `REAL` mantissa, so the analyzer widened a `REAL` IN2 rather
+/// than the duration being narrowed.
 fn compile_mul_div_ltime(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    in1: Operand<'_>,
+    in1: &Expr,
     in2: &Expr,
     emit_fn: fn(&mut Emitter, OpType),
 ) -> Result<(), Diagnostic> {
-    let ltime_op = (OpWidth::W64, Signedness::Signed);
-    let in2_op = op_type_from_expr(in2).unwrap_or(ltime_op);
-
-    compile_left(emitter, ctx, ltime_op, in1)?;
+    let in2_op = op_type(ctx, in2)?;
+    compile_operand(emitter, ctx, OpWidth::W64, in1)?;
     match in2_op.0 {
-        OpWidth::W32 | OpWidth::W64 => {
-            compile_operand(emitter, ctx, (OpWidth::W64, in2_op.1), in2)?;
-            emit_fn(emitter, ltime_op);
+        OpWidth::W64 => {
+            compile_expr(emitter, ctx, in2)?;
+            emit_fn(emitter, (OpWidth::W64, Signedness::Signed));
         }
-        OpWidth::F32 | OpWidth::F64 => {
-            let f64_op = (OpWidth::F64, Signedness::Signed);
-            emitter.emit_builtin(opcode::builtin::CONV_I64_TO_F64);
-            compile_expr(emitter, ctx, in2, in2_op)?;
-            if in2_op.0 == OpWidth::F32 {
-                emitter.emit_builtin(opcode::builtin::CONV_F32_TO_F64);
-            }
-            emit_fn(emitter, f64_op);
-            emitter.emit_builtin(opcode::builtin::CONV_F64_TO_I64);
+        OpWidth::F64 => {
+            emitter.emit_builtin(opcode::builtin::CONV_I64_TO_F64)?;
+            compile_expr(emitter, ctx, in2)?;
+            emit_fn(emitter, (OpWidth::F64, Signedness::Signed));
+            emitter.emit_builtin(opcode::builtin::CONV_F64_TO_I64)?;
         }
+        OpWidth::W32 => return Err(unconverted_operand(in2, in2_op.0, OpWidth::W64)),
+        OpWidth::F32 => return Err(unconverted_operand(in2, in2_op.0, OpWidth::F64)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// Names the instruction sequence `arith`, so a test can compare it.
+    fn sequence(arith: TimeArith) -> &'static str {
+        match arith {
+            TimeArith::SameUnit(_) => "same unit",
+            TimeArith::SecondsAndMillis(_) => "seconds and millis",
+            TimeArith::SecondsDifference => "seconds difference",
+            TimeArith::Multiply => "multiply",
+            TimeArith::Divide => "divide",
+        }
+    }
+
+    /// Every time function compiles as the sequence for the units of its
+    /// operands.
+    #[rstest]
+    #[case::add_time(TimeFunction::AddTime, "same unit")]
+    #[case::sub_time(TimeFunction::SubTime, "same unit")]
+    #[case::mul_time(TimeFunction::MulTime, "multiply")]
+    #[case::div_time(TimeFunction::DivTime, "divide")]
+    #[case::add_tod_time(TimeFunction::AddTodTime, "same unit")]
+    #[case::sub_tod_time(TimeFunction::SubTodTime, "same unit")]
+    #[case::add_dt_time(TimeFunction::AddDtTime, "seconds and millis")]
+    #[case::sub_dt_time(TimeFunction::SubDtTime, "seconds and millis")]
+    #[case::sub_dt_dt(TimeFunction::SubDtDt, "seconds difference")]
+    #[case::sub_date_date(TimeFunction::SubDateDate, "seconds difference")]
+    #[case::sub_tod_tod(TimeFunction::SubTodTod, "same unit")]
+    #[case::concat_date_tod(TimeFunction::ConcatDateTod, "seconds and millis")]
+    fn time_arith_for_when_time_function_then_sequence_for_its_units(
+        #[case] function: TimeFunction,
+        #[case] expected: &str,
+    ) {
+        let (arith, _) = time_arith_for(function, false);
+
+        assert_eq!(sequence(arith), expected);
+    }
+
+    /// A long form is the same sequence at 64-bit width.
+    #[rstest]
+    #[case::short(false, OpWidth::W32)]
+    #[case::long(true, OpWidth::W64)]
+    fn time_arith_for_when_form_then_its_width(#[case] long: bool, #[case] expected: OpWidth) {
+        let (short_arith, _) = time_arith_for(TimeFunction::SubDtDt, false);
+        let (arith, width) = time_arith_for(TimeFunction::SubDtDt, long);
+
+        assert_eq!(width, expected);
+        assert_eq!(sequence(arith), sequence(short_arith));
+    }
 }

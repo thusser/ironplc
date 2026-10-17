@@ -38,7 +38,6 @@
 //!    TRIG := TRIG0;
 //! END_FUNCTION_BLOCK
 //! ```
-use std::collections::HashMap;
 use std::convert::Infallible;
 
 use ironplc_dsl::{
@@ -51,52 +50,67 @@ use ironplc_dsl::{
 use ironplc_problems::Problem;
 
 use crate::{
-    intermediates::inherited_fields::collect_inherited_fields,
     result::SemanticResult,
     rule_support::{run_rule, DiagnosticVisitor},
-    scoped_table::{self, Key, ScopedTable, Value},
     semantic_context::SemanticContext,
     string_similarity::find_closest_match,
-    system_globals::SYSTEM_UPTIME_GLOBALS,
+    symbol_environment::{Resolution, ScopeTracker, SymbolEnvironment, SymbolKind},
 };
 use ironplc_parser::options::CompilerOptions;
 
 pub fn apply(
     lib: &Library,
-    _context: &SemanticContext,
-    options: &CompilerOptions,
+    context: &SemanticContext,
+    _options: &CompilerOptions,
 ) -> SemanticResult {
-    let mut checker = SymbolScopeChecker {
-        table: scoped_table::ScopedTable::new(),
-        inherited_fields: collect_inherited_fields(lib),
-        diagnostics: Vec::new(),
-    };
-
-    // Seed implicit system globals so direct references don't trigger P4007.
-    if options.allow_system_uptime_global {
-        for global in &SYSTEM_UPTIME_GLOBALS {
-            checker.table.add(&Id::from(global.name), DummyNode {});
-        }
-    }
-
-    run_rule(checker, lib)
+    run_rule(
+        SymbolScopeChecker {
+            symbols: context.symbols(),
+            scope: ScopeTracker::default(),
+            units: Vec::new(),
+            diagnostics: Vec::new(),
+        },
+        lib,
+    )
 }
 
-#[derive(Debug)]
-struct DummyNode {}
-impl Value for DummyNode {}
-
-impl Key for Id {}
-impl Key for TypeName {}
-
-/// Wraps `ScopedTable` with the `EXTENDS`-inherited fields per function
-/// block (see `intermediates::inherited_fields`), so that a derived
-/// function block's own scope also includes fields declared only on its
-/// ancestor chain.
+/// Checks each name a body uses against the symbol environment, from the
+/// scope the body is in. The environment answers for the scope's own
+/// variables, those of the scopes enclosing it, the fields a function
+/// block inherits through `EXTENDS`, and the globals, and decides whether
+/// the body reaches a global.
 struct SymbolScopeChecker<'a> {
-    table: ScopedTable<'a, Id, DummyNode>,
-    inherited_fields: HashMap<TypeName, Vec<VarDecl>>,
+    symbols: &'a SymbolEnvironment,
+    /// Where the traversal is, to look names up in the symbol environment.
+    scope: ScopeTracker,
+    /// One entry per open scope: the name of the function block or program
+    /// that opened it, which is in scope within its body, and `None` for a
+    /// function or method, whose own name is its result variable.
+    units: Vec<Option<Id>>,
     diagnostics: Vec<Diagnostic>,
+}
+
+impl SymbolScopeChecker<'_> {
+    /// Whether `name` is a property of the enclosing function block or of
+    /// a block it `EXTENDS`. A name that is not a variable but is a property
+    /// is a property access, which is not implemented yet, rather than an
+    /// undefined variable.
+    fn is_property(&self, name: &Id) -> bool {
+        self.symbols
+            .find(name, &self.scope.current())
+            .is_some_and(|info| info.kind == SymbolKind::Property)
+    }
+
+    /// Whether `name` is in scope where the traversal is.
+    fn is_in_scope(&self, name: &Id) -> bool {
+        if self.units.iter().flatten().any(|unit| unit == name) {
+            return true;
+        }
+        matches!(
+            self.symbols.resolve_variable(name, &self.scope.current()),
+            Resolution::Variable { .. }
+        )
+    }
 }
 
 impl DiagnosticVisitor for SymbolScopeChecker<'_> {
@@ -108,79 +122,52 @@ impl DiagnosticVisitor for SymbolScopeChecker<'_> {
 impl Visitor<Infallible> for SymbolScopeChecker<'_> {
     type Value = ();
 
-    /// Opens the scope of a declaration and seeds the names that are in
-    /// scope by virtue of the declaration itself.
+    /// Tracks the scope of a declaration.
     ///
     /// The traversal calls this for every declaration marked
-    /// `#[recurse(scope)]`, so this rule states what a scope *contains*
-    /// and never which node kinds have one. The match is exhaustive on
-    /// purpose: a new kind of scope must be a compile error here rather
-    /// than a silently unseeded scope.
+    /// `#[recurse(scope)]`. The match is exhaustive on purpose: a new kind
+    /// of scope must be a compile error here rather than a scope whose own
+    /// name is silently out of reach. A function's or a method's own name
+    /// is its result variable, which the symbol environment holds.
     fn enter_scope(&mut self, node: ScopeNode<'_>) -> Result<(), Infallible> {
-        self.table.enter();
-
-        match node {
-            // A function's own name is its implicit result variable, so
-            // `FOO := ...` inside `FUNCTION FOO` resolves.
-            ScopeNode::Function(node) => {
-                self.table.add(&node.name, DummyNode {});
-            }
-            ScopeNode::Program(node) => {
-                self.table.add(&node.name, DummyNode {});
-            }
-            // A derived function block's scope also holds the fields it
-            // inherits through `EXTENDS`, so an unqualified reference to
-            // an ancestor's field resolves.
-            ScopeNode::FunctionBlock(node) => {
-                self.table.add(&node.name.name, DummyNode {});
-                if let Some(fields) = self.inherited_fields.get(&node.name).cloned() {
-                    for field in &fields {
-                        self.table
-                            .add_if(field.identifier.symbolic_id(), DummyNode {});
-                    }
-                }
-            }
-            // A method's own name is its result variable, exactly as a
-            // function's is -- but only when it declares a return type.
-            // A method without one is a procedure with no result to
-            // assign, so `Foo := ...` inside `METHOD Foo` stays
-            // undefined rather than becoming silently legal.
-            //
-            // The enclosing function block's scope stays open beneath
-            // this one, so a method still reads and writes the
-            // instance's fields, which is the point of a method.
-            ScopeNode::Method(node) => {
-                if node.return_type.is_some() {
-                    self.table.add(&node.name, DummyNode {});
-                }
-            }
-        }
-
+        self.scope.enter(&node);
+        self.units.push(match node {
+            ScopeNode::FunctionBlock(node) => Some(node.name.name.clone()),
+            ScopeNode::Program(node) => Some(node.name.clone()),
+            ScopeNode::Function(_)
+            | ScopeNode::Method(_)
+            | ScopeNode::MethodPrototype(_)
+            | ScopeNode::Interface(_) => None,
+        });
         Ok(())
     }
 
     fn exit_scope(&mut self) {
-        self.table.exit();
-    }
-
-    fn visit_var_decl(&mut self, node: &VarDecl) -> Result<Self::Value, Infallible> {
-        self.table
-            .add_if(node.identifier.symbolic_id(), DummyNode {});
-        node.recurse_visit(self)
+        self.scope.exit();
+        self.units.pop();
     }
 
     fn visit_named_variable(
         &mut self,
         node: &ironplc_dsl::textual::NamedVariable,
     ) -> Result<(), Infallible> {
-        if self.table.find(&node.name).is_some() {
+        if self.is_in_scope(&node.name) {
             // We found the variable being referred to
             return Ok(());
         }
 
+        if self.is_property(&node.name) {
+            self.diagnostics.push(
+                Diagnostic::not_implemented(Label::span(node.name.span(), "Use of a PROPERTY"))
+                    .with_context_id("property", &node.name),
+            );
+            return Ok(());
+        }
+
+        let usable = self.symbols.usable_variables(&self.scope.current());
         let suggestion = find_closest_match(
             node.name.original(),
-            self.table.keys().iter().map(|k| k.original().as_str()),
+            usable.iter().map(|(name, _)| name.original().as_str()),
         );
         let mut diagnostic = Diagnostic::problem(
             Problem::VariableUndefined,
@@ -197,8 +184,9 @@ impl Visitor<Infallible> for SymbolScopeChecker<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::semantic_context::SemanticContextBuilder;
-    use crate::test_helpers::parse_and_resolve_types;
+    use crate::test_helpers::fb_inheritance_options;
+    use crate::test_helpers::NOT_IMPLEMENTED_CODE;
+    use crate::test_helpers::{diagnostic_codes, rule_diagnostics};
 
     use super::*;
 
@@ -213,15 +201,13 @@ END_VAR
 TRIG := TRIG0.A;
 END_FUNCTION_BLOCK";
 
-        let library = parse_and_resolve_types(program);
-        let context = SemanticContextBuilder::new().build().unwrap();
-        let result = apply(&library, &context, &CompilerOptions::default());
+        let diagnostics = rule_diagnostics(apply, program, &CompilerOptions::default());
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .first()
-            .unwrap()
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code()]
+        );
+        assert!(diagnostics[0]
             .described
             .contains(&"variable=TRIG".to_owned()))
     }
@@ -291,13 +277,13 @@ END_VAR
 conter := 1;
 END_FUNCTION_BLOCK";
 
-        let library = parse_and_resolve_types(program);
-        let context = SemanticContextBuilder::new().build().unwrap();
-        let result = apply(&library, &context, &CompilerOptions::default());
+        let diagnostics = rule_diagnostics(apply, program, &CompilerOptions::default());
 
-        assert!(result.is_err());
-        let errors = result.unwrap_err();
-        let error = errors.first().unwrap();
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code()]
+        );
+        let error = &diagnostics[0];
         assert!(error.described.contains(&"variable=conter".to_owned()));
         assert!(error.described.contains(&"did you mean=counter".to_owned()));
     }
@@ -313,13 +299,13 @@ END_VAR
 completely_different := 1;
 END_FUNCTION_BLOCK";
 
-        let library = parse_and_resolve_types(program);
-        let context = SemanticContextBuilder::new().build().unwrap();
-        let result = apply(&library, &context, &CompilerOptions::default());
+        let diagnostics = rule_diagnostics(apply, program, &CompilerOptions::default());
 
-        assert!(result.is_err());
-        let errors = result.unwrap_err();
-        let error = errors.first().unwrap();
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code()]
+        );
+        let error = &diagnostics[0];
         assert!(error
             .described
             .contains(&"variable=completely_different".to_owned()));
@@ -357,15 +343,13 @@ END_VAR
 t := __SYSTEM_UP_TIME;
 END_PROGRAM";
 
-        let library = parse_and_resolve_types(program);
-        let context = SemanticContextBuilder::new().build().unwrap();
         let options = CompilerOptions {
             allow_system_uptime_global: true,
             ..CompilerOptions::default()
         };
-        let result = apply(&library, &context, &options);
+        let diagnostics = rule_diagnostics(apply, program, &options);
 
-        assert!(result.is_ok());
+        assert!(diagnostics.is_empty());
     }
 
     rule_err!(
@@ -377,23 +361,17 @@ VAR
 END_VAR
 
 t := __SYSTEM_UP_TIME;
-END_PROGRAM"
+END_PROGRAM",
+        [Problem::VariableUndefined]
     );
 
     // ---------------------------------------------------------------------
     // EXTENDS field inheritance.
     // ---------------------------------------------------------------------
 
-    fn opts_with_fb_inheritance() -> CompilerOptions {
-        CompilerOptions {
-            allow_fb_inheritance: true,
-            ..CompilerOptions::default()
-        }
-    }
-
-    #[test]
-    fn apply_when_unqualified_inherited_field_then_ok() {
-        let program = "
+    rule_ok!(
+        apply_when_unqualified_inherited_field_then_ok,
+        "
 FUNCTION_BLOCK FB_Base
 VAR
     bEnabled : BOOL;
@@ -405,20 +383,13 @@ VAR
     bRunning : BOOL;
 END_VAR
 bRunning := bEnabled;
-END_FUNCTION_BLOCK";
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
 
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_ok(), "unexpected errors: {result:?}");
-    }
-
-    #[test]
-    fn apply_when_multi_level_inherited_field_then_ok() {
-        let program = "
+    rule_ok!(
+        apply_when_multi_level_inherited_field_then_ok,
+        "
 FUNCTION_BLOCK FB_A
 VAR
     a : BOOL;
@@ -436,20 +407,13 @@ VAR
     c : BOOL;
 END_VAR
 c := a AND b;
-END_FUNCTION_BLOCK";
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
 
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_ok(), "unexpected errors: {result:?}");
-    }
-
-    #[test]
-    fn apply_when_extends_and_genuinely_undeclared_field_then_error() {
-        let program = "
+    rule_err_at!(
+        apply_when_extends_and_genuinely_undeclared_field_then_error,
+        "
 FUNCTION_BLOCK FB_Base
 VAR
     bEnabled : BOOL;
@@ -461,27 +425,22 @@ VAR
     bRunning : BOOL;
 END_VAR
 bRunning := bNotDeclaredAnywhere;
-END_FUNCTION_BLOCK";
-
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_err());
-    }
+END_FUNCTION_BLOCK",
+        Problem::VariableUndefined,
+        "bNotDeclaredAnywhere",
+        fb_inheritance_options()
+    );
 
     // ---------------------------------------------------------------------
     // METHOD scoping.
     // See https://github.com/ironplc/ironplc/issues/1439.
     // ---------------------------------------------------------------------
 
-    /// The standard way a method produces its result, and the same
-    /// spelling a `FUNCTION` body already uses.
-    #[test]
-    fn apply_when_method_assigns_own_name_then_ok() {
-        let program = "
+    rule_ok!(
+        /// The standard way a method produces its result, and the same
+        /// spelling a `FUNCTION` body already uses.
+        apply_when_method_assigns_own_name_then_ok,
+        "
 FUNCTION_BLOCK FB_Motor
 VAR
     speed : REAL;
@@ -489,16 +448,9 @@ END_VAR
 METHOD GetSpeed : REAL
     GetSpeed := speed;
 END_METHOD
-END_FUNCTION_BLOCK";
-
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_ok(), "unexpected errors: {result:?}");
-    }
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
 
     /// A method with no return type has no result to assign, so its name
     /// is not a variable and must stay undefined rather than becoming
@@ -512,17 +464,13 @@ METHOD DoThing
 END_METHOD
 END_FUNCTION_BLOCK";
 
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
+        let diagnostics = rule_diagnostics(apply, program, &fb_inheritance_options());
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .first()
-            .unwrap()
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code()]
+        );
+        assert!(diagnostics[0]
             .described
             .contains(&"variable=DoThing".to_owned()));
     }
@@ -548,27 +496,23 @@ METHOD Other
 END_METHOD
 END_FUNCTION_BLOCK";
 
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
+        let diagnostics = rule_diagnostics(apply, program, &fb_inheritance_options());
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .first()
-            .unwrap()
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code()]
+        );
+        assert!(diagnostics[0]
             .described
             .contains(&"variable=newSpeed".to_owned()));
     }
 
-    /// The method scope nests inside the function block's rather than
-    /// replacing it -- reading and writing the instance's fields is the
-    /// point of a method.
-    #[test]
-    fn apply_when_method_references_function_block_field_then_ok() {
-        let program = "
+    rule_ok!(
+        /// The method scope nests inside the function block's rather than
+        /// replacing it -- reading and writing the instance's fields is the
+        /// point of a method.
+        apply_when_method_references_function_block_field_then_ok,
+        "
 FUNCTION_BLOCK FB_Motor
 VAR
     speed : INT;
@@ -579,22 +523,15 @@ VAR_INPUT
 END_VAR
     speed := newSpeed;
 END_METHOD
-END_FUNCTION_BLOCK";
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
 
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_ok(), "unexpected errors: {result:?}");
-    }
-
-    /// Nesting reaches the whole `EXTENDS` chain, not just the immediately
-    /// enclosing function block's own fields.
-    #[test]
-    fn apply_when_method_references_inherited_field_then_ok() {
-        let program = "
+    rule_ok!(
+        /// Nesting reaches the whole `EXTENDS` chain, not just the immediately
+        /// enclosing function block's own fields.
+        apply_when_method_references_inherited_field_then_ok,
+        "
 FUNCTION_BLOCK FB_Base
 VAR
     bEnabled : BOOL;
@@ -605,22 +542,15 @@ FUNCTION_BLOCK FB_Derived EXTENDS FB_Base
 METHOD Enable
     bEnabled := TRUE;
 END_METHOD
-END_FUNCTION_BLOCK";
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
 
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_ok(), "unexpected errors: {result:?}");
-    }
-
-    /// Sibling scopes, so the same name in two methods is two variables
-    /// and not a redeclaration.
-    #[test]
-    fn apply_when_two_methods_declare_same_local_name_then_ok() {
-        let program = "
+    rule_ok!(
+        /// Sibling scopes, so the same name in two methods is two variables
+        /// and not a redeclaration.
+        apply_when_two_methods_declare_same_local_name_then_ok,
+        "
 FUNCTION_BLOCK FB_Motor
 METHOD A
 VAR
@@ -634,16 +564,9 @@ VAR
 END_VAR
     q := 2;
 END_METHOD
-END_FUNCTION_BLOCK";
-
-        let (library, context) = crate::test_helpers::parse_and_resolve_types_with_options(
-            program,
-            &opts_with_fb_inheritance(),
-        );
-        let result = apply(&library, &context, &opts_with_fb_inheritance());
-
-        assert!(result.is_ok(), "unexpected errors: {result:?}");
-    }
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
 
     /// Reproduces issue #1566: the rule used to abort at the first undefined
     /// variable, so a program with two of them reported one.
@@ -658,22 +581,22 @@ END_VAR
   x := UNDECLARED_TWO;
 END_PROGRAM";
 
-        let library = parse_and_resolve_types(program);
-        let context = SemanticContextBuilder::new().build().unwrap();
-        let diagnostics = apply(&library, &context, &CompilerOptions::default()).unwrap_err();
+        let diagnostics = rule_diagnostics(apply, program, &CompilerOptions::default());
 
-        let reported: Vec<&String> = diagnostics.iter().flat_map(|d| &d.described).collect();
-        assert!(
-            reported
-                .iter()
-                .any(|d| d.as_str() == "variable=UNDECLARED_ONE"),
-            "expected UNDECLARED_ONE, got {reported:?}"
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code(); 2]
         );
-        assert!(
-            reported
-                .iter()
-                .any(|d| d.as_str() == "variable=UNDECLARED_TWO"),
-            "expected UNDECLARED_TWO, got {reported:?}"
+
+        let reported: Vec<&str> = diagnostics
+            .iter()
+            .flat_map(|d| &d.described)
+            .map(String::as_str)
+            .filter(|d| d.starts_with("variable="))
+            .collect();
+        assert_eq!(
+            reported,
+            ["variable=UNDECLARED_ONE", "variable=UNDECLARED_TWO"]
         );
     }
 
@@ -696,18 +619,263 @@ END_VAR
   y := BBB_ONE;
 END_PROGRAM";
 
-        let library = parse_and_resolve_types(program);
-        let context = SemanticContextBuilder::new().build().unwrap();
-        let diagnostics = apply(&library, &context, &CompilerOptions::default()).unwrap_err();
+        let diagnostics = rule_diagnostics(apply, program, &CompilerOptions::default());
 
-        let reported: Vec<&String> = diagnostics.iter().flat_map(|d| &d.described).collect();
-        assert!(
-            reported.iter().any(|d| d.as_str() == "variable=AAA_ONE"),
-            "expected AAA_ONE, got {reported:?}"
+        assert_eq!(
+            diagnostic_codes(&diagnostics),
+            [Problem::VariableUndefined.code(); 2]
         );
-        assert!(
-            reported.iter().any(|d| d.as_str() == "variable=BBB_ONE"),
-            "expected BBB_ONE, got {reported:?}"
-        );
+
+        let mut reported: Vec<&str> = diagnostics
+            .iter()
+            .flat_map(|d| &d.described)
+            .map(String::as_str)
+            .filter(|d| d.starts_with("variable="))
+            .collect();
+        // Which POU is checked first is not the point; that both are is.
+        reported.sort_unstable();
+        assert_eq!(reported, ["variable=AAA_ONE", "variable=BBB_ONE"]);
     }
+
+    // ---------------------------------------------------------------------
+    // PROPERTY accessors and property use.
+    // ---------------------------------------------------------------------
+
+    rule_ok!(
+        /// Each accessor is a method (see `PropertyDeclaration`), so its body
+        /// sees the property name (GET result, SET input), its own variables,
+        /// and the function block's fields.
+        apply_when_property_accessors_use_property_name_and_fields_then_ok,
+        "
+FUNCTION_BLOCK FB_Motor
+VAR
+    _speed : REAL;
+END_VAR
+PROPERTY Speed : REAL
+GET
+VAR
+    tmp : REAL;
+END_VAR
+    tmp := _speed;
+    Speed := tmp;
+END_GET
+SET
+    _speed := Speed;
+END_SET
+END_PROPERTY
+END_FUNCTION_BLOCK",
+        fb_inheritance_options()
+    );
+
+    /// Reading a property by its bare name in the function block body is a
+    /// property access, which is not implemented yet. It must not be
+    /// reported as an undefined variable.
+    #[test]
+    fn apply_when_fb_body_uses_own_property_then_not_implemented_names_property() {
+        let program = "
+FUNCTION_BLOCK FB_Motor
+VAR
+    _speed : REAL;
+    y : REAL;
+END_VAR
+y := Running;
+PROPERTY Running : BOOL
+GET
+    Running := _speed > 0.0;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK";
+
+        let errors = rule_diagnostics(apply, program, &fb_inheritance_options());
+
+        assert_eq!(diagnostic_codes(&errors), [NOT_IMPLEMENTED_CODE]);
+        assert!(errors[0].described.contains(&"property=Running".to_owned()));
+    }
+
+    /// A method body sees the enclosing function block's properties too.
+    #[test]
+    fn apply_when_method_uses_enclosing_property_then_not_implemented() {
+        let program = "
+FUNCTION_BLOCK FB_Motor
+VAR
+    _speed : REAL;
+END_VAR
+METHOD Stop
+    Speed := 0.0;
+END_METHOD
+PROPERTY Speed : REAL
+SET
+    _speed := Speed;
+END_SET
+END_PROPERTY
+END_FUNCTION_BLOCK";
+
+        let errors = rule_diagnostics(apply, program, &fb_inheritance_options());
+
+        assert_eq!(diagnostic_codes(&errors), [NOT_IMPLEMENTED_CODE]);
+        assert!(errors[0].described.contains(&"property=Speed".to_owned()));
+    }
+
+    /// A property a block inherits through `EXTENDS` is recognised like its
+    /// own.
+    #[test]
+    fn apply_when_derived_block_uses_inherited_property_then_not_implemented() {
+        let program = "
+FUNCTION_BLOCK FB_Base
+VAR
+    _speed : REAL;
+END_VAR
+PROPERTY Speed : REAL
+GET
+    Speed := _speed;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK FB_Motor EXTENDS FB_Base
+METHOD Stop
+    Speed := 0.0;
+END_METHOD
+END_FUNCTION_BLOCK";
+
+        let errors = rule_diagnostics(apply, program, &fb_inheritance_options());
+
+        assert_eq!(diagnostic_codes(&errors), [NOT_IMPLEMENTED_CODE]);
+        assert!(errors[0].described.contains(&"property=Speed".to_owned()));
+    }
+
+    /// A property is found before a global of the same name, because the
+    /// block's scope is searched before the global scope.
+    #[test]
+    fn apply_when_property_has_name_of_global_then_property_found() {
+        let program = "
+VAR_GLOBAL
+    Speed : REAL;
+END_VAR
+FUNCTION_BLOCK FB_Motor
+METHOD Stop
+    Speed := 0.0;
+END_METHOD
+PROPERTY Speed : REAL
+GET
+    Speed := 1.0;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK";
+        let options = CompilerOptions {
+            allow_fb_inheritance: true,
+            allow_top_level_var_global: true,
+            ..CompilerOptions::default()
+        };
+
+        let errors = rule_diagnostics(apply, program, &options);
+
+        assert_eq!(diagnostic_codes(&errors), [NOT_IMPLEMENTED_CODE]);
+    }
+
+    /// Property names are visible only inside their own function block.
+    #[test]
+    fn apply_when_program_uses_name_of_some_property_then_undefined_variable() {
+        let program = "
+FUNCTION_BLOCK FB_Motor
+PROPERTY Speed : REAL
+GET
+    Speed := 1.0;
+END_GET
+END_PROPERTY
+END_FUNCTION_BLOCK
+
+PROGRAM main
+VAR
+    y : REAL;
+END_VAR
+y := Speed;
+END_PROGRAM";
+
+        let errors = rule_diagnostics(apply, program, &fb_inheritance_options());
+
+        assert_eq!(
+            diagnostic_codes(&errors),
+            [Problem::VariableUndefined.code()]
+        );
+
+        assert!(errors[0].described.contains(&"variable=Speed".to_owned()));
+    }
+
+    const CONFIG_WITH_GLOBAL: &str = "
+CONFIGURATION config
+  VAR_GLOBAL
+    g : INT;
+  END_VAR
+  RESOURCE res ON PLC
+    TASK t(INTERVAL := T#100ms, PRIORITY := 1);
+    PROGRAM inst WITH t : main;
+  END_RESOURCE
+END_CONFIGURATION
+";
+
+    const PROGRAM_USING_GLOBAL: &str = "
+PROGRAM main
+VAR
+  x : INT;
+END_VAR
+  x := g;
+END_PROGRAM
+";
+
+    fn top_level_globals() -> CompilerOptions {
+        CompilerOptions {
+            allow_top_level_var_global: true,
+            ..CompilerOptions::default()
+        }
+    }
+
+    rule_err!(
+        apply_when_global_used_without_external_after_configuration_then_error,
+        &format!("{CONFIG_WITH_GLOBAL}{PROGRAM_USING_GLOBAL}"),
+        [Problem::VariableUndefined]
+    );
+
+    rule_err!(
+        apply_when_global_used_without_external_before_configuration_then_error,
+        &format!("{PROGRAM_USING_GLOBAL}{CONFIG_WITH_GLOBAL}"),
+        [Problem::VariableUndefined]
+    );
+
+    rule_ok!(
+        apply_when_global_used_through_external_then_ok,
+        &format!(
+            "{CONFIG_WITH_GLOBAL}
+PROGRAM main
+VAR_EXTERNAL
+  g : INT;
+END_VAR
+VAR
+  x : INT;
+END_VAR
+  x := g;
+END_PROGRAM"
+        )
+    );
+
+    rule_ok!(
+        apply_when_top_level_globals_allowed_and_global_used_directly_then_ok,
+        &format!("{PROGRAM_USING_GLOBAL}{CONFIG_WITH_GLOBAL}"),
+        top_level_globals()
+    );
+
+    rule_ok!(
+        apply_when_top_level_global_used_directly_then_ok,
+        "
+VAR_GLOBAL
+  g : INT;
+END_VAR
+PROGRAM main
+VAR
+  x : INT;
+END_VAR
+  x := g;
+END_PROGRAM",
+        top_level_globals()
+    );
 }

@@ -3,7 +3,7 @@
 //! See section 3.
 use crate::common::{
     AddressAssignment, BitStringLiteral, ConstantKind, EnumeratedValue, GenericTypeName, Integer,
-    IntegerLiteral, SignedInteger, Subrange, TypeName,
+    IntegerLiteral, SignedInteger, Subrange,
 };
 use crate::core::{Id, Located, SourceSpan};
 use crate::type_id::TypeId;
@@ -363,11 +363,6 @@ pub struct FbCall {
     pub position: SourceSpan,
 }
 
-/// Method invocation, statement position only: `instance.MethodName(args);`
-/// (OOP extension, ADR-0041 Phase 1). Any return value is discarded, same
-/// restriction as `FbCall` for a plain FB invocation. Method calls in
-/// expression position (e.g. `IF fb.IsMoving() THEN`) are a follow-up
-/// slice.
 /// The instance a [`MethodCall`] is invoked on.
 #[derive(Debug, PartialEq, Clone, Recurse)]
 pub enum MethodReceiver {
@@ -395,6 +390,11 @@ impl Located for MethodReceiver {
     }
 }
 
+/// Method invocation: `instance.MethodName(args)` (OOP extension, ADR-0041
+/// Phase 1). The same node appears in both positions: as a statement
+/// ([`StmtKind::MethodCall`]), where any return value is discarded, and in
+/// an expression ([`ExprKind::MethodCall`]), where the method must declare
+/// a return type and the call's value is that return value.
 #[derive(Debug, PartialEq, Clone, Recurse, Located)]
 pub struct MethodCall {
     /// The function block instance the method is called on.
@@ -439,10 +439,55 @@ pub struct UnaryExpr {
     pub term: Expr,
 }
 
+/// A conversion the language makes without the program spelling it: the
+/// value of `value`, which keeps its own type, converted to the type of the
+/// enclosing [`Expr`].
+#[derive(Debug, Clone, PartialEq, Recurse)]
+pub struct ImplicitConversion {
+    /// The expression converted.
+    pub value: Expr,
+    /// What the conversion does with a value its type does not hold.
+    #[recurse(ignore)]
+    pub kind: ConversionKind,
+}
+
+/// What an [`ImplicitConversion`] does with a value outside the range of the
+/// type it converts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionKind {
+    /// Converts as the language converts a value of one type to another, so
+    /// an integer narrowed to a type that does not hold it wraps.
+    Ordinary,
+    /// Converts as an ordinary conversion does a value the type holds, and
+    /// traps on any other. The analyzer records one for an array subscript
+    /// whose type holds values outside the range of `DINT`, so that such a
+    /// subscript selects no element rather than another one.
+    Checked,
+}
+
 #[derive(Debug, Clone, PartialEq, Recurse)]
 pub struct Function {
     pub name: Id,
     pub param_assignment: Vec<ParamAssignmentKind>,
+}
+
+impl Function {
+    /// The expression of each input argument, positional or named, in the
+    /// order the call lists them. After analysis, a call whose arguments bind
+    /// lists one named input for each input it supplies, in the order the
+    /// function declares them.
+    pub fn inputs(&self) -> impl Iterator<Item = &Expr> {
+        self.param_assignment
+            .iter()
+            .filter_map(ParamAssignmentKind::input_expr)
+    }
+
+    /// The expression of each input argument, as [`Function::inputs`].
+    pub fn inputs_mut(&mut self) -> impl Iterator<Item = &mut Expr> {
+        self.param_assignment
+            .iter_mut()
+            .filter_map(ParamAssignmentKind::input_expr_mut)
+    }
 }
 
 impl fmt::Display for Function {
@@ -463,33 +508,57 @@ impl fmt::Display for LateBound {
 }
 
 /// The type of an expression's value, as the analyzer resolved it.
+///
+/// A type is either stated by the program, `Concrete`, or inferred from
+/// where the expression is used, `Inferred`; an expression with only a
+/// category, `Literal`, has none yet. The distinction is kept because a
+/// question about the program as written (can this operand ever equal that
+/// literal?) must not read a type the program did not state.
 #[derive(Debug, PartialEq, Clone)]
 pub enum ExprType {
-    /// A value of exactly this type.
+    /// A value of exactly this type, which the program states: a variable's
+    /// declared type, a prefixed literal's (`INT#5`), or the type an
+    /// operation on such values computes.
     Concrete(TypeId),
     /// An untyped literal, or a generic function applied only to untyped
     /// literals: its type is fixed by where it is used, within this
     /// category. ADR-0028 and ADR-0031 say which types it may take.
     Literal(GenericTypeName),
+    /// An expression the program wrote without a type, a `Literal`, that
+    /// analysis gave the type of where it is used: the `1` of `l := 1` on an
+    /// `LINT` is an `LINT`. A value of exactly this type, as a `Concrete`
+    /// one is.
+    Inferred(TypeId),
+    /// `NULL`: a reference to no variable, of whichever reference type it
+    /// is used as.
+    Null,
+}
+
+impl ExprType {
+    /// The type of the value, whether the program stated it or analysis
+    /// inferred it; `None` for a category or `NULL`.
+    pub fn type_id(&self) -> Option<TypeId> {
+        match self {
+            ExprType::Concrete(id) | ExprType::Inferred(id) => Some(*id),
+            ExprType::Literal(_) | ExprType::Null => None,
+        }
+    }
 }
 
 /// Wrapper around `ExprKind` that carries what is true of an expression but
-/// not of the operation it performs: its resolved type, and where it was
+/// not of the operation it performs: the type of its value, and where it was
 /// written.
 ///
-/// The `resolved_type` and `expr_type` fields are populated by a later
-/// analysis pass. During parsing and initial construction, they are always
-/// `None`.
+/// The `expr_type` field is populated by a later analysis pass. During
+/// parsing and initial construction, it is always `None`.
 ///
 /// `expr_type` is left out of equality (see the manual `PartialEq` below):
-/// it is derived from `resolved_type` and the declarations in scope, and a
-/// test that builds an expected expression by hand compares the type it
-/// resolved through `resolved_type`.
+/// the ids it holds are allocated per compilation, so an expected
+/// expression built by hand cannot know them. A test asserts an
+/// expression's type through the environment that allocated it.
 #[derive(Debug, Clone, Recurse, Located)]
 pub struct Expr {
     pub kind: ExprKind,
-    #[recurse(ignore)]
-    pub resolved_type: Option<TypeName>,
     /// The type of the expression's value, by identity. `None` where the
     /// analyzer could not resolve one.
     #[recurse(ignore)]
@@ -510,9 +579,7 @@ pub struct Expr {
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && self.resolved_type == other.resolved_type
-            && self.span == other.span
+        self.kind == other.kind && self.span == other.span
     }
 }
 
@@ -523,16 +590,7 @@ impl Expr {
         Expr {
             span: kind.span(),
             kind,
-            resolved_type: None,
             expr_type: None,
-        }
-    }
-
-    /// Creates a new `Expr` with a resolved type.
-    pub fn with_type(kind: ExprKind, type_name: TypeName) -> Expr {
-        Expr {
-            resolved_type: Some(type_name),
-            ..Expr::new(kind)
         }
     }
 
@@ -559,6 +617,20 @@ impl Expr {
     /// Creates an operation on a single expression.
     pub fn unary(op: UnaryOp, term: Expr) -> Expr {
         Expr::new(ExprKind::UnaryOp(Box::new(UnaryExpr { op, term })))
+    }
+
+    /// Creates the ordinary implicit conversion of `inner` to the type
+    /// `target`, written where `inner` was written.
+    pub fn implicit_conversion(inner: Expr, target: TypeId) -> Expr {
+        let span = inner.span.clone();
+        Expr {
+            kind: ExprKind::ImplicitConversion(Box::new(ImplicitConversion {
+                value: inner,
+                kind: ConversionKind::Ordinary,
+            })),
+            expr_type: Some(ExprType::Concrete(target)),
+            span,
+        }
     }
 }
 
@@ -587,9 +659,12 @@ impl Located for ExprKind {
             ExprKind::EnumeratedValue(value) => value.span(),
             ExprKind::Variable(var) => var.span(),
             ExprKind::Function(func) => func.name.span(),
+            ExprKind::MethodCall(call) => call.span(),
             ExprKind::LateBound(late) => late.value.span(),
             ExprKind::Ref(var) => var.span(),
             ExprKind::Deref(expr) => expr.span(),
+            ExprKind::ImplicitConversion(conversion) => conversion.value.span(),
+            ExprKind::CallOutput(output) => output.span(),
             ExprKind::Null(span) => span.clone(),
         }
     }
@@ -606,9 +681,24 @@ pub enum ExprKind {
     EnumeratedValue(EnumeratedValue),
     Variable(Variable),
     Function(Function),
+    MethodCall(MethodCall),
     LateBound(LateBound),
     Ref(Box<Variable>),
     Deref(Box<Expr>),
+    /// A conversion the language makes without the program spelling it.
+    ///
+    /// The parser never produces one: the analyzer inserts it after the
+    /// semantic rules, to record for the backends and the language server a
+    /// conversion the language makes. See ADR-0056.
+    ImplicitConversion(Box<ImplicitConversion>),
+    /// The value the enclosing call left in its output of this name, read
+    /// after the call returns: the value an output assignment (`q => v`)
+    /// stores in its target.
+    ///
+    /// The parser never produces one: the analyzer writes it as the value of
+    /// an output assignment ([`Output::value`]), and nowhere else. A backend
+    /// reads it from wherever the call it compiles leaves that output.
+    CallOutput(Id),
     Null(SourceSpan),
 }
 
@@ -669,9 +759,23 @@ impl fmt::Display for ExprKind {
                 }
                 write!(f, ")")
             }
+            ExprKind::MethodCall(call) => {
+                write!(f, "{}.{}(", call.receiver, call.method)?;
+                for (i, param) in call.params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{param}")?;
+                }
+                write!(f, ")")
+            }
             ExprKind::LateBound(late) => write!(f, "{}", late.value),
             ExprKind::Ref(var) => write!(f, "REF({var})"),
             ExprKind::Deref(expr) => write!(f, "{expr}^"),
+            // Not source syntax: it is written as the expression it converts.
+            ExprKind::ImplicitConversion(conversion) => write!(f, "{}", conversion.value),
+            // Not source syntax: it is written as the output it reads.
+            ExprKind::CallOutput(output) => write!(f, "{output}"),
             ExprKind::Null(_) => write!(f, "NULL"),
         }
     }
@@ -707,6 +811,27 @@ pub struct Output {
     pub not: bool,
     pub src: Id,
     pub tgt: Variable,
+    /// The value the call stores in `tgt`. The analyzer writes it for each
+    /// output of a function block call whose arguments bind, as
+    /// [`Output::read`] reads it, and records its conversion to the type of
+    /// `tgt` on it, as on the value of an assignment. The parser leaves it
+    /// `None`: it is not source syntax, and the output is written as
+    /// `src => tgt`.
+    pub value: Option<Expr>,
+}
+
+impl Output {
+    /// The value this output has after the call: the
+    /// [`ExprKind::CallOutput`] named `src`, inverted for a negated output
+    /// (`NOT q => v`), written where `src` is.
+    pub fn read(&self) -> Expr {
+        let read = Expr::new(ExprKind::CallOutput(self.src.clone()));
+        if self.not {
+            Expr::unary(UnaryOp::Not, read).with_span(self.src.span())
+        } else {
+            read
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Recurse)]
@@ -723,6 +848,16 @@ impl ParamAssignmentKind {
         match self {
             ParamAssignmentKind::PositionalInput(input) => Some(&input.expr),
             ParamAssignmentKind::NamedInput(input) => Some(&input.expr),
+            ParamAssignmentKind::Output(_) => None,
+        }
+    }
+
+    /// The expression this argument passes to the callee, as
+    /// [`ParamAssignmentKind::input_expr`].
+    pub fn input_expr_mut(&mut self) -> Option<&mut Expr> {
+        match self {
+            ParamAssignmentKind::PositionalInput(input) => Some(&mut input.expr),
+            ParamAssignmentKind::NamedInput(input) => Some(&mut input.expr),
             ParamAssignmentKind::Output(_) => None,
         }
     }
@@ -799,6 +934,25 @@ impl CompareOp {
             CompareOp::Gt => ">",
             CompareOp::LtEq => "<=",
             CompareOp::GtEq => ">=",
+        }
+    }
+
+    /// Returns `true` for the comparisons `=`, `<>`, `<`, `<=`, `>` and
+    /// `>=`, whose result is `BOOL` whatever their operands are, and `false`
+    /// for the logical and bitwise operators that share this enum.
+    pub fn is_comparison(&self) -> bool {
+        match self {
+            CompareOp::Eq
+            | CompareOp::Ne
+            | CompareOp::Lt
+            | CompareOp::Gt
+            | CompareOp::LtEq
+            | CompareOp::GtEq => true,
+            CompareOp::And
+            | CompareOp::Or
+            | CompareOp::Xor
+            | CompareOp::AndThen
+            | CompareOp::OrElse => false,
         }
     }
 }
@@ -878,6 +1032,9 @@ pub enum StmtKind {
     // Exit statement.
     #[recurse(ignore)]
     Exit(SourceSpan),
+    // Continue statement.
+    #[recurse(ignore)]
+    Continue(SourceSpan),
 }
 
 impl Located for StmtKind {
@@ -893,6 +1050,7 @@ impl Located for StmtKind {
             StmtKind::Repeat(r) => r.span(),
             StmtKind::Return => SourceSpan::default(),
             StmtKind::Exit(s) => s.clone(),
+            StmtKind::Continue(s) => s.clone(),
         }
     }
 }
@@ -1222,6 +1380,7 @@ mod tests {
             not: false,
             src: Id::from("out1"),
             tgt: Variable::named("result"),
+            value: None,
         });
         assert_eq!(format!("{pa}"), "out1 => result");
     }
@@ -1232,8 +1391,51 @@ mod tests {
             not: true,
             src: Id::from("out1"),
             tgt: Variable::named("result"),
+            value: None,
         });
         assert_eq!(format!("{pa}"), "NOT out1 => result");
+    }
+
+    fn output(not: bool) -> Output {
+        Output {
+            not,
+            src: Id::from("q").with_position(SourceSpan::range(10, 11)),
+            tgt: Variable::named("result"),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn read_when_output_then_call_output_where_output_written() {
+        let read = output(false).read();
+        assert_eq!(read.kind, ExprKind::CallOutput(Id::from("q")));
+        assert_eq!(read.span, SourceSpan::range(10, 11));
+    }
+
+    #[test]
+    fn read_when_negated_output_then_not_of_call_output() {
+        let read = output(true).read();
+        let ExprKind::UnaryOp(unary) = &read.kind else {
+            panic!("expected a NOT, got {read:?}");
+        };
+        assert_eq!(unary.op, UnaryOp::Not);
+        assert_eq!(unary.term.kind, ExprKind::CallOutput(Id::from("q")));
+        assert_eq!(read.span, SourceSpan::range(10, 11));
+    }
+
+    #[test]
+    fn display_when_call_output_then_output_name() {
+        assert_eq!(format!("{}", output(false).read()), "q");
+    }
+
+    #[test]
+    fn display_when_param_assignment_output_with_value_then_arrow() {
+        let mut out = output(false);
+        out.value = Some(out.read());
+        assert_eq!(
+            format!("{}", ParamAssignmentKind::Output(out)),
+            "q => result"
+        );
     }
 
     #[test]
@@ -1326,5 +1528,19 @@ mod tests {
             name: Id::from("foo"),
         });
         assert_eq!(format!("{svk}"), "foo");
+    }
+
+    #[test]
+    fn type_id_when_stated_or_inferred_then_the_type() {
+        let id = TypeId::from_raw(7);
+
+        assert_eq!(ExprType::Concrete(id).type_id(), Some(id));
+        assert_eq!(ExprType::Inferred(id).type_id(), Some(id));
+    }
+
+    #[test]
+    fn type_id_when_category_or_null_then_none() {
+        assert_eq!(ExprType::Literal(GenericTypeName::AnyInt).type_id(), None);
+        assert_eq!(ExprType::Null.type_id(), None);
     }
 }

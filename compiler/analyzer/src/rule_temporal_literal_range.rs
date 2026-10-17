@@ -145,12 +145,10 @@ impl Visitor<Infallible> for RuleTemporalLiteralRange {
     }
 
     fn visit_time_of_day_literal(&mut self, node: &TimeOfDayLiteral) -> Result<(), Infallible> {
-        let stored = node.stored_count();
-        let (hour, minute, second, _micro) = node.hmsm();
         self.check(
-            stored,
+            node.stored_count(),
             node.type_name(),
-            format!("{hour:02}:{minute:02}:{second:02}"),
+            node.daytime_text(),
             Problem::DurationLiteralOutOfRange,
             &node.span,
         );
@@ -171,11 +169,10 @@ impl Visitor<Infallible> for RuleTemporalLiteralRange {
 
     fn visit_date_and_time_literal(&mut self, node: &DateAndTimeLiteral) -> Result<(), Infallible> {
         let (year, month, day) = node.ymd();
-        let (hour, minute, second, _micro) = node.hmsm();
         self.check(
             node.stored_count(),
             node.type_name(),
-            format!("{year}-{month:02}-{day:02}-{hour:02}:{minute:02}:{second:02}"),
+            format!("{year}-{month:02}-{day:02}-{}", node.daytime_text()),
             Problem::DateLiteralOutOfRange,
             &node.span,
         );
@@ -185,14 +182,11 @@ impl Visitor<Infallible> for RuleTemporalLiteralRange {
 
 #[cfg(test)]
 mod tests {
-    use ironplc_parser::options::{CompilerOptions, Dialect};
+    use crate::test_helpers::edition3_options;
     use ironplc_problems::Problem;
 
-    /// The options the 64-bit members need: `LTIME`, `LDATE`, `LTOD` and `LDT`
-    /// are Edition 3 keywords, and are identifiers without them.
-    fn edition3() -> CompilerOptions {
-        CompilerOptions::from_dialect(Dialect::Iec61131_3Ed3)
-    }
+    // The 64-bit members need Edition 3: `LTIME`, `LDATE`, `LTOD` and `LDT`
+    // are Edition 3 keywords, and are identifiers without them.
 
     // --- The 32-bit boundary, from both sides ---
     //
@@ -209,7 +203,7 @@ END_VAR
 END_PROGRAM"
     );
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_date_is_past_last_representable_then_error,
         "
 PROGRAM main
@@ -231,7 +225,7 @@ END_VAR
 END_PROGRAM"
     );
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_date_is_before_epoch_then_error,
         "
 PROGRAM main
@@ -253,7 +247,7 @@ END_VAR
 END_PROGRAM"
     );
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_date_and_time_is_past_last_representable_then_error,
         "
 PROGRAM main
@@ -263,6 +257,18 @@ END_VAR
 END_PROGRAM",
         Problem::DateLiteralOutOfRange,
         "DT#2106-02-07-06:28:16"
+    );
+
+    // The fraction is below the one-second unit and is truncated, so the
+    // stored count is that of the last representable second.
+    rule_ok!(
+        apply_when_date_and_time_is_last_representable_with_fraction_then_ok,
+        "
+PROGRAM main
+VAR
+    d : DT := DT#2106-02-07-06:28:15.999;
+END_VAR
+END_PROGRAM"
     );
 
     // --- A duration is signed, so both ends are 32-bit two's complement ---
@@ -277,7 +283,7 @@ END_VAR
 END_PROGRAM"
     );
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_duration_is_past_last_representable_then_error,
         "
 PROGRAM main
@@ -289,7 +295,7 @@ END_PROGRAM",
         "T#30d"
     );
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_duration_is_below_first_representable_then_error,
         "
 PROGRAM main
@@ -305,58 +311,58 @@ END_PROGRAM",
     //     problem: each of these was reported before the literal carried the
     //     type its prefix named.
 
-    rule_ok_with!(
+    rule_ok!(
         apply_when_ldate_is_past_the_32_bit_ceiling_then_ok,
-        edition3(),
         "
 PROGRAM main
 VAR
     d : LDATE := LDATE#2200-01-01;
 END_VAR
-END_PROGRAM"
+END_PROGRAM",
+        edition3_options()
     );
 
-    rule_ok_with!(
+    rule_ok!(
         apply_when_ldt_is_past_the_32_bit_ceiling_then_ok,
-        edition3(),
         "
 PROGRAM main
 VAR
     d : LDT := LDT#2200-01-01-00:00:00;
 END_VAR
-END_PROGRAM"
+END_PROGRAM",
+        edition3_options()
     );
 
-    rule_ok_with!(
+    rule_ok!(
         apply_when_ltime_is_past_the_32_bit_ceiling_then_ok,
-        edition3(),
         "
 PROGRAM main
 VAR
     t : LTIME := LTIME#30d;
 END_VAR
-END_PROGRAM"
+END_PROGRAM",
+        edition3_options()
     );
 
     // A 64-bit date is still bounded below by the epoch: the count is
     // unsigned at both widths.
-    rule_err1_with!(
+    rule_err!(
         apply_when_ldate_is_before_epoch_then_error,
-        edition3(),
         "
 PROGRAM main
 VAR
     d : LDATE := LDATE#1969-12-31;
 END_VAR
 END_PROGRAM",
-        Problem::DateLiteralOutOfRange
+        [Problem::DateLiteralOutOfRange],
+        edition3_options()
     );
 
     // --- The literal's own type decides, not the variable's ---
 
     // `DATE#` names a `DATE` whatever it is stored into, the way `INT#40000`
     // names an `INT`. Widening the variable does not widen the literal.
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_short_literal_is_out_of_range_in_a_long_variable_then_error,
         "
 PROGRAM main
@@ -370,7 +376,7 @@ END_PROGRAM",
 
     // --- Every position a literal can be written in ---
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_out_of_range_literal_is_assigned_then_error,
         "
 PROGRAM main
@@ -383,7 +389,7 @@ END_PROGRAM",
         "T#30d"
     );
 
-    rule_err1_at!(
+    rule_err_at!(
         apply_when_out_of_range_literal_is_compared_then_error,
         "
 PROGRAM main
@@ -399,7 +405,7 @@ END_PROGRAM",
 
     // --- Every violation is reported, not just the first ---
 
-    rule_errn!(
+    rule_err!(
         apply_when_several_literals_are_out_of_range_then_reports_every_one,
         "
 PROGRAM main
@@ -408,8 +414,7 @@ VAR
     b : DATE := DATE#1969-12-31;
 END_VAR
 END_PROGRAM",
-        2,
-        Problem::DateLiteralOutOfRange
+        [Problem::DateLiteralOutOfRange; 2]
     );
 
     // --- What the rule does not report ---
@@ -429,15 +434,15 @@ END_PROGRAM"
 
     // A time of day is bounded by construction at either width, so neither
     // can be out of range.
-    rule_ok_with!(
+    rule_ok!(
         apply_when_time_of_day_is_end_of_day_then_ok,
-        edition3(),
         "
 PROGRAM main
 VAR
     t : TIME_OF_DAY := TOD#23:59:59;
     l : LTIME_OF_DAY := LTOD#23:59:59;
 END_VAR
-END_PROGRAM"
+END_PROGRAM",
+        edition3_options()
     );
 }

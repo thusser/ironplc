@@ -1,33 +1,37 @@
 //! Spec conformance tests for arithmetic operator overloads (codegen-owned
 //! requirements that compare bytecode).
 //!
-//! Each test is named for the requirement it covers. The design is not yet
-//! listed in `build.rs`, so the tests carry `#[test]`; they take
-//! `#[spec_test(REQ_AO_codegen_NNN)]` when the requirements are enforced.
+//! Each test is annotated with `#[spec_test(REQ_AO_codegen_NNN)]`, which
+//! adds `#[test]` and references a build-script-generated constant so the
+//! test fails to compile if the requirement is removed from the spec. The
+//! `all_spec_requirements_have_tests` meta-test in `spec_conformance`
+//! asserts every codegen-owned requirement has a test.
 //! The requirements checked by value run on the VM in
 //! `tests/it/end_to_end_arithmetic_overloads.rs`.
 //!
 //! See `specs/design/arithmetic-operator-overloads.md`.
 
-use ironplc_analyzer::{typed_overload, Overload};
+use ironplc_analyzer::{
+    typed_overload, BuiltinFunction, CleanAnalysis, FunctionEnvironmentBuilder, TypedOverload,
+};
 use ironplc_container::FunctionId;
 use ironplc_dsl::common::TypeName;
-use ironplc_dsl::core::FileId;
+use ironplc_dsl::core::{FileId, Id};
 use ironplc_dsl::textual::Operator;
 use ironplc_parser::options::{CompilerOptions, Dialect};
 use rstest::rstest;
+use spec_test_macro::spec_test;
 
-use crate::compile_time_arith::time_arith_for;
+use crate::compile_call::builtin_functions_by_name;
 
 /// Compiles `source` under the Edition 3 dialect, which declares the long
 /// types, and returns the bytecode of its program body.
 fn program_bytecode(source: &str) -> Vec<u8> {
     let options = CompilerOptions::from_dialect(Dialect::Iec61131_3Ed3);
     let library = ironplc_parser::parse_program(source, &FileId::default(), &options).unwrap();
-    let (analyzed, ctx) = ironplc_analyzer::stages::resolve_types(&[&library], &options).unwrap();
+    let (analyzed, ctx) = ironplc_analyzer::stages::analyze(&[&library], &options).unwrap();
     let container = crate::compile(
-        &analyzed,
-        &ctx,
+        CleanAnalysis::new(&analyzed, &ctx).unwrap(),
         &crate::CodegenOptions::default(),
         &crate::EmptyLookup,
     )
@@ -57,6 +61,7 @@ END_PROGRAM"
 
 /// REQ-AO-codegen-001: an operator expression on a Table 30 pair compiles to
 /// the same bytecode as the call to its typed name, at both widths.
+#[spec_test(REQ_AO_codegen_001)]
 #[rstest]
 #[case("TIME", "TIME", "TIME", "a + b", "ADD_TIME(a, b)")]
 #[case("TIME_OF_DAY", "TIME", "TIME_OF_DAY", "a + b", "ADD_TOD_TIME(a, b)")]
@@ -135,6 +140,7 @@ fn codegen_spec_req_ao_001_operator_on_table_30_pair_compiles_as_typed_call(
 /// REQ-AO-codegen-009: an extensible call on a Table 30 pair folds through
 /// the typed routine from the left, so `ADD(a, b, c)` compiles to what
 /// `a + b + c` compiles to.
+#[spec_test(REQ_AO_codegen_009)]
 #[rstest]
 #[case("TIME", "TIME", "TIME", "ADD(a, b, c)", "a + b + c")]
 #[case("TIME_OF_DAY", "TIME", "TIME_OF_DAY", "ADD(a, b, c)", "a + b + c")]
@@ -156,10 +162,16 @@ fn codegen_spec_req_ao_009_extensible_call_folds_through_typed_routine(
     );
 }
 
-/// Every typed name the analyzer's typed step can answer with has a codegen
-/// routine, at both widths: the dispatch in `compile_arith` relies on it.
+/// Every typed name the analyzer's typed step can answer with is registered
+/// as a time function, at both widths: `compile_arith` compiles the pair
+/// through the routine of the function it is registered as.
 #[test]
-fn time_arith_for_when_any_typed_overload_then_has_routine() {
+fn typed_overload_when_any_pair_then_names_a_registered_time_function() {
+    let intrinsics = builtin_functions_by_name(
+        &FunctionEnvironmentBuilder::new()
+            .with_stdlib_functions()
+            .build(),
+    );
     let types = [
         "TIME",
         "LTIME",
@@ -181,10 +193,13 @@ fn time_arith_for_when_any_typed_overload_then_has_routine() {
         for left in types {
             for right in types {
                 let answer = typed_overload(&op, &TypeName::from(left), &TypeName::from(right));
-                if let Some(Overload::Typed { name, .. }) = answer {
+                if let Some(TypedOverload { name, .. }) = answer {
                     assert!(
-                        time_arith_for(&name.to_ascii_lowercase()).is_some(),
-                        "{name} has no routine"
+                        matches!(
+                            intrinsics.get(&Id::from(name)),
+                            Some(BuiltinFunction::Time { .. })
+                        ),
+                        "{name} is not a time function"
                     );
                     names.insert(name);
                 }

@@ -19,44 +19,64 @@
 //! # Example
 //!
 //! ```ignore
+//! use ironplc_analyzer::CleanAnalysis;
 //! use ironplc_codegen::{compile, CodegenOptions, EmptyLookup};
 //! use ironplc_parser::parse_program;
 //!
 //! let source = "PROGRAM main VAR x : INT; END_VAR x := 42; END_PROGRAM";
 //! let library = parse_program(source, &FileId::default(), &CompilerOptions::default()).unwrap();
-//! let (analyzed, ctx) = ironplc_analyzer::stages::resolve_types(&[&library]).unwrap();
-//! let container = compile(&analyzed, &ctx, &CodegenOptions::default(), &EmptyLookup).unwrap();
+//! let (analyzed, ctx) = ironplc_analyzer::stages::analyze(&[&library], &CompilerOptions::default()).unwrap();
+//! let analysis = CleanAnalysis::new(&analyzed, &ctx).unwrap();
+//! let container = compile(analysis, &CodegenOptions::default(), &EmptyLookup).unwrap();
 //! ```
 
+mod call_args;
 mod call_graph;
 mod compile;
 mod compile_aggregate;
 mod compile_arith;
 mod compile_array;
 mod compile_array_struct;
+mod compile_assign;
+mod compile_builtin;
 mod compile_call;
+mod compile_call_output;
+mod compile_comparison;
 mod compile_enum;
 mod compile_expr;
+mod compile_fb_call;
 mod compile_fb_init;
 mod compile_fn;
+mod compile_initial_value;
+mod compile_loop;
 mod compile_method;
+mod compile_partial_access;
+mod compile_place;
 mod compile_reference;
 mod compile_setup;
 mod compile_short_circuit;
 mod compile_stmt;
 mod compile_string;
+mod compile_string_place;
 mod compile_struct;
 mod compile_struct_init;
+mod compile_subscript;
 mod compile_time_arith;
+mod compile_user_call;
 mod data_region;
 mod emit;
+mod execution;
+mod initial_value;
+mod lowered;
 mod optimize;
+mod scope;
 mod source_lookup;
 mod stack_balance;
 mod string_width;
 mod type_info;
 
-pub use compile::{compile, CodegenOptions, StringToNumPolicies};
+pub use compile::{compile, compile_with_route_counts, CodegenOptions, StringToNumPolicies};
+pub use lowered::{Route, RouteCounts};
 pub use source_lookup::{EmptyLookup, SourceLookup};
 
 // Spec conformance testing infrastructure (test-only)
@@ -74,5 +94,7 @@ mod spec_conformance_arithmetic_operator_overloads;
 mod spec_conformance_behavior_policies;
 #[cfg(test)]
 mod spec_conformance_container_format;
+#[cfg(test)]
+mod spec_conformance_inline_enumeration;
 #[cfg(test)]
 mod spec_conformance_keyword_function_forms;

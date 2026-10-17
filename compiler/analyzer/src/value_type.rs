@@ -1,0 +1,478 @@
+//! What the type checks compare about a value: the type an expression's
+//! value has, and whether it may be used where a given type is required.
+//!
+//! [`type_compat::are_types_compatible`] states the relation between two
+//! type *names*: exact matches, the generic categories, literal inference and
+//! implicit widening. That relation is about scalars. A value whose type is
+//! not a scalar -- a whole array, a structure, an enumeration, a function
+//! block instance -- is only ever the type it is, and it may have no name at
+//! all (`a : ARRAY[1..2] OF DINT`). This module classifies a value by its
+//! [`ExprType`] so each check asks one question of it, [`check`], and a
+//! composite value reaching a scalar position is a mismatch rather than
+//! something to skip.
+//!
+//! ```ignore
+//! VAR a : ARRAY[1..2] OF DINT; n : DINT; END_VAR
+//!     n := LEN(a);   (* P4026: ANY_STRING is not ARRAY[1..2] OF DINT *)
+//!     n := a;        (* P4035 *)
+//! ```
+
+use ironplc_dsl::common::{GenericTypeName, TypeName};
+use ironplc_dsl::textual::{Expr, ExprType};
+use ironplc_dsl::type_id::TypeId;
+use ironplc_parser::options::CompilerOptions;
+
+use crate::semantic_type::SemanticType;
+use crate::type_compat::are_types_compatible;
+use crate::type_environment::TypeEnvironment;
+use crate::type_id::elementary_debug_tag;
+
+/// The type of a value, as the checks compare it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ValueType {
+    /// A scalar, named as [`are_types_compatible`] understands it: an
+    /// elementary type or a user-defined one it compares by name, a generic
+    /// category for an untyped literal, or the base type of a subrange.
+    Scalar(TypeName),
+    /// A value that is not a scalar: a whole array, a structure, an
+    /// enumeration or a function block instance.
+    Composite(TypeId),
+}
+
+/// A value used where its type is not accepted.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Mismatch {
+    /// The value's type as a diagnostic shows it.
+    pub(crate) actual: String,
+}
+
+/// The name the name-based type relations -- [`are_types_compatible`] and
+/// the arithmetic overloads -- know a value of type `expr_type` by.
+///
+/// An expression's type is its [`ExprType`]; this name is derived from it
+/// each time it is asked for, so the two cannot disagree:
+///
+/// - an untyped literal is its generic category (`ANY_INT`);
+/// - an elementary type, or an alias of one, is the elementary type's name;
+/// - a string is `STRING` or `WSTRING`, sized or not;
+/// - a reference is known by the type it references, behind `REF_TO`
+///   ([`reference_name`]): `REF_TO INT`, so that it is neither a value of
+///   that type nor a reference to another;
+/// - a subrange is its base type's name, as it is operated at its base type:
+///   `s + l` on a subrange of `INT` and an `LINT` adds as `LINT`;
+/// - any other type is its own name, and has none when it is anonymous.
+///
+/// `None` for `NULL`, which is not of one type.
+pub fn operand_type_name(types: &TypeEnvironment, expr_type: &ExprType) -> Option<TypeName> {
+    match expr_type {
+        ExprType::Literal(generic) => Some(generic.clone().into()),
+        ExprType::Null => None,
+        ExprType::Concrete(id) | ExprType::Inferred(id) => operand_name_of(types, *id),
+    }
+}
+
+fn operand_name_of(types: &TypeEnvironment, id: TypeId) -> Option<TypeName> {
+    let representation = &types.get_by_id(id)?.representation;
+    match representation {
+        SemanticType::Bool
+        | SemanticType::Int { .. }
+        | SemanticType::UInt { .. }
+        | SemanticType::Real { .. }
+        | SemanticType::Bytes { .. }
+        | SemanticType::Time { .. }
+        | SemanticType::Date { .. }
+        | SemanticType::TimeOfDay { .. }
+        | SemanticType::DateAndTime { .. } => types.elementary_type_name_for(representation),
+        SemanticType::String { char_width, .. } => Some(TypeName::from(if char_width.is_wide() {
+            "wstring"
+        } else {
+            "string"
+        })),
+        SemanticType::Reference { .. } => {
+            operand_name_of(types, types.referenced_type(id)?).map(|name| reference_name(&name))
+        }
+        SemanticType::Subrange { .. } => {
+            types.elementary_type_name_for(representation.operated_as())
+        }
+        SemanticType::Enumeration { .. }
+        | SemanticType::Structure { .. }
+        | SemanticType::Array { .. }
+        | SemanticType::FunctionBlock { .. } => types.name_of(id).cloned(),
+    }
+}
+
+/// The name a reference to a value known as `referenced` is known by:
+/// `REF_TO INT` for a reference to an `INT`.
+///
+/// A reference used to be known by the referenced type's own name, so a
+/// `REF_TO REAL` was taken for a `REAL` by everything that asks for an
+/// operand's name: the code generator read the variable index it holds as
+/// float bits, and a `REF_TO INT` assigned to an `INT` passed as an `INT`.
+pub(crate) fn reference_name(referenced: &TypeName) -> TypeName {
+    TypeName::from(format!("REF_TO {referenced}").as_str())
+}
+
+/// The name the value of a parameter declared with the type `declared` is
+/// known by, as [`operand_type_name`] knows an argument's: an alias by the
+/// type it names, a subrange by its base type, and a `REF_TO` parameter,
+/// whose `declared` is the type it references, by [`reference_name`].
+///
+/// A subrange parameter so takes a value of its base type, as a subrange
+/// variable does when assigned: `f(s + 1)` on a subrange of `INT` passes the
+/// `INT` sum.
+pub(crate) fn parameter_type_name(
+    types: &TypeEnvironment,
+    declared: &TypeName,
+    is_reference: bool,
+) -> TypeName {
+    let known = || {
+        types
+            .id_of(declared)
+            .and_then(|id| operand_name_of(types, id))
+            .unwrap_or_else(|| declared.clone())
+    };
+    if is_reference {
+        return reference_name(&known());
+    }
+    match types
+        .get(declared)
+        .map(|attributes| &attributes.representation)
+    {
+        Some(SemanticType::Subrange { .. }) => known(),
+        _ => declared.clone(),
+    }
+}
+
+/// Classifies the value of `expr`, or `None` when the analyzer resolved no
+/// type for it.
+pub(crate) fn of(types: &TypeEnvironment, expr: &Expr) -> Option<ValueType> {
+    let expr_type = expr.expr_type.as_ref()?;
+    let by_name = || operand_type_name(types, expr_type).map(ValueType::Scalar);
+    let id = match expr_type {
+        ExprType::Concrete(id) | ExprType::Inferred(id) => id,
+        // `NULL` is accepted for any reference, so there is nothing to
+        // compare it with.
+        ExprType::Null => return None,
+        ExprType::Literal(_) => return by_name(),
+    };
+    let Some(attributes) = types.get_by_id(*id) else {
+        return by_name();
+    };
+    match &attributes.representation {
+        SemanticType::Array { .. }
+        | SemanticType::Structure { .. }
+        | SemanticType::Enumeration { .. }
+        | SemanticType::FunctionBlock { .. } => Some(ValueType::Composite(*id)),
+        SemanticType::Subrange { base_type, .. } => types
+            .elementary_type_name_for(base_type)
+            .map(ValueType::Scalar)
+            .or_else(by_name),
+        // Compared by name (see `operand_type_name`): an elementary type by
+        // its own name, a string by `STRING` or `WSTRING`, a reference by
+        // the name of the type it references. A function is not the type of
+        // any value, so it never gets here with a name that matters.
+        SemanticType::Bool
+        | SemanticType::Int { .. }
+        | SemanticType::UInt { .. }
+        | SemanticType::Real { .. }
+        | SemanticType::Bytes { .. }
+        | SemanticType::Time { .. }
+        | SemanticType::Date { .. }
+        | SemanticType::TimeOfDay { .. }
+        | SemanticType::DateAndTime { .. }
+        | SemanticType::String { .. }
+        | SemanticType::Reference { .. } => by_name(),
+    }
+}
+
+/// Checks that the value of `expr` may be used where `expected` is
+/// required. `Ok` when it may, and when the analyzer resolved no type for
+/// the value, since there is nothing to compare.
+pub(crate) fn check(
+    types: &TypeEnvironment,
+    expected: &TypeName,
+    expr: &Expr,
+    options: &CompilerOptions,
+) -> Result<(), Mismatch> {
+    if let Some(id) = expr.expr_type.as_ref().and_then(ExprType::type_id) {
+        if types.id_of(expected) == Some(id) {
+            return Ok(());
+        }
+    }
+    match of(types, expr) {
+        None => Ok(()),
+        Some(ValueType::Scalar(actual)) => {
+            if are_types_compatible(expected, &actual, options) {
+                Ok(())
+            } else {
+                Err(Mismatch {
+                    actual: actual.to_string(),
+                })
+            }
+        }
+        Some(ValueType::Composite(id)) => {
+            if composite_accepted(types, expected, id) {
+                Ok(())
+            } else {
+                Err(Mismatch {
+                    actual: describe(types, id),
+                })
+            }
+        }
+    }
+}
+
+/// Whether a composite value of type `id` is accepted where `expected` is
+/// required, when `expected` is not `id` itself.
+///
+/// An array or a structure is accepted where an array or structure of the
+/// same shape is, as a whole-aggregate assignment is (P2037): an inline
+/// `ARRAY[1..2] OF DINT` passes for a parameter declared with a named array
+/// type of that shape. An enumeration or a function block instance is only
+/// ever its own type. Every composite is accepted for `ANY`, the category
+/// of every data type (`SIZEOF(a)`), and none for a narrower generic
+/// category such as `ANY_NUM`.
+fn composite_accepted(types: &TypeEnvironment, expected: &TypeName, id: TypeId) -> bool {
+    match GenericTypeName::try_from(&expected.name) {
+        Ok(GenericTypeName::Any) => return true,
+        Ok(_) => return false,
+        Err(_) => {}
+    }
+    let (Some(expected), Some(actual)) = (types.get(expected), types.get_by_id(id)) else {
+        return false;
+    };
+    matches!(
+        actual.representation,
+        SemanticType::Array { .. } | SemanticType::Structure { .. }
+    ) && expected.representation == actual.representation
+}
+
+/// The type `id` identifies, as a diagnostic shows it: its name when it
+/// has one, else its shape (`ARRAY[1..2] OF DINT`).
+pub(crate) fn describe(types: &TypeEnvironment, id: TypeId) -> String {
+    if let Some(name) = types.name_of(id) {
+        return name.to_string();
+    }
+    match types.get_by_id(id) {
+        Some(attributes) => describe_representation(types, &attributes.representation),
+        None => "an unknown type".to_string(),
+    }
+}
+
+/// The type `id` identifies, as Structured Text writes it: a type named by
+/// an elementary type in upper case (`DINT`, and `STRING` for a
+/// `STRING[10]`), any other named type by its declared name, and an
+/// anonymous type by its shape, as [`describe`] gives it.
+///
+/// [`describe`] names an elementary type as the environment registered it
+/// (`dint`), which is how diagnostics show it. This is for output read as
+/// source, such as the annotated rendering of `ironplcc echo --types`.
+pub fn spelling(types: &TypeEnvironment, id: TypeId) -> String {
+    let described = describe(types, id);
+    let named_by_elementary = types
+        .name_of(id)
+        .and_then(|name| types.id_of(name))
+        .is_some_and(|named| elementary_debug_tag(named).is_some());
+    if named_by_elementary {
+        return described.to_uppercase();
+    }
+    described
+}
+
+fn describe_representation(types: &TypeEnvironment, representation: &SemanticType) -> String {
+    if let Some(name) = types.elementary_type_name_for(representation) {
+        return name.to_string().to_uppercase();
+    }
+    match representation {
+        SemanticType::Array {
+            element_type,
+            dimensions,
+        } => {
+            let element = describe_representation(types, element_type);
+            if dimensions.is_empty() {
+                return format!("ARRAY OF {element}");
+            }
+            let bounds: Vec<String> = dimensions
+                .iter()
+                .map(|dimension| format!("{}..{}", dimension.lower, dimension.upper))
+                .collect();
+            format!("ARRAY[{}] OF {element}", bounds.join(", "))
+        }
+        SemanticType::String {
+            max_len,
+            char_width,
+        } => {
+            let keyword = if char_width.is_wide() {
+                "WSTRING"
+            } else {
+                "STRING"
+            };
+            match max_len {
+                Some(len) => format!("{keyword}[{len}]"),
+                None => keyword.to_string(),
+            }
+        }
+        SemanticType::Structure { .. } => "a structure".to_string(),
+        SemanticType::Enumeration { .. } => "an enumeration".to_string(),
+        SemanticType::FunctionBlock { name, .. } => name.clone(),
+        SemanticType::Reference { target_type } => {
+            format!("REF_TO {}", describe_representation(types, target_type))
+        }
+        SemanticType::Subrange { base_type, .. } => {
+            format!(
+                "a subrange of {}",
+                describe_representation(types, base_type)
+            )
+        }
+        // Every elementary representation is named above; these only reach
+        // here in a representation the elementary table does not list.
+        SemanticType::Bool
+        | SemanticType::Int { .. }
+        | SemanticType::UInt { .. }
+        | SemanticType::Real { .. }
+        | SemanticType::Bytes { .. }
+        | SemanticType::Time { .. }
+        | SemanticType::Date { .. }
+        | SemanticType::TimeOfDay { .. }
+        | SemanticType::DateAndTime { .. } => "an elementary type".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic_type::{ArrayDimension, ByteSized};
+    use crate::type_attributes::TypeAttributes;
+    use crate::type_environment::TypeEnvironmentBuilder;
+    use ironplc_container::CharWidth;
+    use spec_test_macro::spec_test;
+
+    fn anonymous(types: &mut TypeEnvironment, representation: SemanticType) -> TypeId {
+        types.insert_anonymous(TypeAttributes::new(representation))
+    }
+
+    fn environment() -> TypeEnvironment {
+        TypeEnvironmentBuilder::new()
+            .with_elementary_types()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn describe_when_named_type_then_name() {
+        let types = environment();
+        let dint = types.id_of(&TypeName::from("DINT")).unwrap();
+
+        assert_eq!(describe(&types, dint), "dint");
+    }
+
+    #[test]
+    fn describe_when_anonymous_array_then_bounds_and_element() {
+        let mut types = environment();
+        let id = anonymous(
+            &mut types,
+            SemanticType::Array {
+                element_type: Box::new(SemanticType::Int {
+                    size: ByteSized::B32,
+                }),
+                dimensions: vec![
+                    ArrayDimension { lower: 1, upper: 2 },
+                    ArrayDimension { lower: 0, upper: 3 },
+                ],
+            },
+        );
+
+        assert_eq!(describe(&types, id), "ARRAY[1..2, 0..3] OF DINT");
+    }
+
+    #[test]
+    fn describe_when_array_of_sized_strings_then_string_length() {
+        let mut types = environment();
+        let id = anonymous(
+            &mut types,
+            SemanticType::Array {
+                element_type: Box::new(SemanticType::String {
+                    max_len: Some(8),
+                    char_width: CharWidth::Wide,
+                }),
+                dimensions: vec![ArrayDimension { lower: 1, upper: 2 }],
+            },
+        );
+
+        assert_eq!(describe(&types, id), "ARRAY[1..2] OF WSTRING[8]");
+    }
+
+    #[test]
+    fn describe_when_anonymous_enumeration_then_kind() {
+        let mut types = environment();
+        let id = anonymous(
+            &mut types,
+            SemanticType::Enumeration {
+                members: crate::enumeration_members::EnumerationMembers::default(),
+            },
+        );
+
+        assert_eq!(describe(&types, id), "an enumeration");
+    }
+
+    #[spec_test(REQ_ETR_analyzer_001)]
+    fn spelling_when_elementary_named_or_anonymous_then_as_written() {
+        let mut types = environment();
+        let dint = types.id_of(&TypeName::from("DINT")).unwrap();
+        let color = TypeName::from("Color");
+        types.insert_type(
+            &color,
+            TypeAttributes::new(SemanticType::Enumeration {
+                members: crate::enumeration_members::EnumerationMembers::default(),
+            }),
+        );
+        let named = types.id_of(&color).unwrap();
+        let array = anonymous(
+            &mut types,
+            SemanticType::Array {
+                element_type: Box::new(SemanticType::Int {
+                    size: ByteSized::B32,
+                }),
+                dimensions: vec![ArrayDimension { lower: 1, upper: 2 }],
+            },
+        );
+
+        assert_eq!(spelling(&types, dint), "DINT");
+        assert_eq!(spelling(&types, named), "Color");
+        assert_eq!(spelling(&types, array), "ARRAY[1..2] OF DINT");
+    }
+
+    #[test]
+    fn spelling_when_sized_string_then_upper_case_elementary() {
+        let mut types = environment();
+        let string = types.id_of(&TypeName::from("STRING")).unwrap();
+        let sized = types.insert_sized_string(
+            string,
+            TypeAttributes::new(SemanticType::String {
+                max_len: Some(20),
+                char_width: CharWidth::Narrow,
+            }),
+        );
+
+        assert_eq!(spelling(&types, sized), "STRING");
+    }
+
+    #[test]
+    fn spelling_when_reference_then_ref_to_upper_case_target() {
+        let mut types = environment();
+        let int = types.id_of(&TypeName::from("INT")).unwrap();
+        let reference = types.reference_to(int).unwrap();
+
+        assert_eq!(spelling(&types, reference), "REF_TO INT");
+    }
+
+    #[test]
+    fn describe_when_id_unknown_then_unknown_type() {
+        let types = environment();
+
+        assert_eq!(
+            describe(&types, TypeId::from_raw(100_000)),
+            "an unknown type"
+        );
+    }
+}

@@ -3,29 +3,22 @@
 //! This module handles creating array types from array specifications,
 //! including validation of array bounds and element types.
 
-use crate::intermediate_type::{ArrayDimension, IntermediateType};
+use crate::semantic_type::{ArrayDimension, SemanticType};
 use crate::type_environment::{TypeAttributes, TypeEnvironment};
-use ironplc_container::CharWidth;
+
 use ironplc_dsl::common::*;
 use ironplc_dsl::core::Located;
 use ironplc_dsl::diagnostic::*;
 use ironplc_problems::Problem;
 
-/// Result of processing an array specification
-#[derive(Debug, Clone, PartialEq)]
-pub enum IntermediateResult {
-    /// Create a new array type with the given attributes
-    Type(TypeAttributes),
-    /// Create an alias to an existing type
-    Alias(TypeName),
-}
+use super::{string, TypeResolution};
 
-/// Try to create the intermediate type information from the array specification.
+/// Try to create the semantic type information from the array specification.
 pub fn try_from(
     node_name: &TypeName,
     spec: &ArraySpecificationKind,
     type_environment: &TypeEnvironment,
-) -> Result<IntermediateResult, Diagnostic> {
+) -> Result<TypeResolution, Diagnostic> {
     match spec {
         SpecificationKind::Inline(array_subranges) => {
             // Array with explicit subranges: MY_ARRAY : ARRAY [1..10, 1..5] OF INT;
@@ -33,20 +26,9 @@ pub fn try_from(
 
             // Resolve the element type representation based on the element type kind
             let element_repr = match &array_subranges.type_name {
-                ArrayElementType::String(spec) => IntermediateType::String {
-                    max_len: spec
-                        .length
-                        .as_ref()
-                        .and_then(|len| len.as_integer().map(|i| i.value)),
-                    char_width: CharWidth::Narrow,
-                },
-                ArrayElementType::WString(spec) => IntermediateType::String {
-                    max_len: spec
-                        .length
-                        .as_ref()
-                        .and_then(|len| len.as_integer().map(|i| i.value)),
-                    char_width: CharWidth::Wide,
-                },
+                ArrayElementType::String(spec) | ArrayElementType::WString(spec) => {
+                    string::from_spec(spec).representation
+                }
                 ArrayElementType::Named(_) => {
                     let element_type =
                         type_environment.get(&element_type_name).ok_or_else(|| {
@@ -79,16 +61,15 @@ pub fn try_from(
             // Wrap in Reference if the element type is a reference
             // (REF_TO or REFERENCE TO — the surface syntax is immaterial here).
             let resolved_element_type = if array_subranges.ref_to.is_some() {
-                IntermediateType::Reference {
+                SemanticType::Reference {
                     target_type: Box::new(element_repr),
                 }
             } else {
                 element_repr
             };
 
-            Ok(IntermediateResult::Type(TypeAttributes::new(
-                node_name.span(),
-                IntermediateType::Array {
+            Ok(TypeResolution::Type(TypeAttributes::new(
+                SemanticType::Array {
                     element_type: Box::new(resolved_element_type),
                     dimensions,
                 },
@@ -104,7 +85,7 @@ pub fn try_from(
                 .with_secondary(Label::span(base_type_name.span(), "Base type")));
             }
 
-            Ok(IntermediateResult::Alias(base_type_name.clone()))
+            Ok(TypeResolution::Alias(base_type_name.clone()))
         }
     }
 }
@@ -208,8 +189,9 @@ pub fn validate_array_bounds(ranges: &[Subrange], type_name: &TypeName) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intermediate_type::{ByteSized, IntermediateType};
+    use crate::semantic_type::{ByteSized, SemanticType};
     use crate::type_environment::TypeEnvironmentBuilder;
+    use ironplc_container::CharWidth;
     use ironplc_dsl::common::TypeName;
     use ironplc_dsl::core::SourceSpan;
     use ironplc_test::{cast, cast_struct};
@@ -273,8 +255,8 @@ mod tests {
 
     #[test]
     fn array_total_elements_with_single_dimension_then_correct_size() {
-        let array = IntermediateType::Array {
-            element_type: Box::new(IntermediateType::Int {
+        let array = SemanticType::Array {
+            element_type: Box::new(SemanticType::Int {
                 size: ByteSized::B16,
             }),
             dimensions: vec![ArrayDimension {
@@ -287,8 +269,8 @@ mod tests {
 
     #[test]
     fn array_total_elements_with_multiple_dimensions_then_correct_size() {
-        let array = IntermediateType::Array {
-            element_type: Box::new(IntermediateType::Int {
+        let array = SemanticType::Array {
+            element_type: Box::new(SemanticType::Int {
                 size: ByteSized::B16,
             }),
             dimensions: vec![
@@ -304,8 +286,8 @@ mod tests {
 
     #[test]
     fn array_total_elements_with_negative_ranges_then_correct_size() {
-        let array = IntermediateType::Array {
-            element_type: Box::new(IntermediateType::Int {
+        let array = SemanticType::Array {
+            element_type: Box::new(SemanticType::Int {
                 size: ByteSized::B16,
             }),
             dimensions: vec![ArrayDimension {
@@ -335,18 +317,18 @@ mod tests {
         let spec = SpecificationKind::Inline(array_subranges);
         let result = try_from(&TypeName::from("MY_ARRAY"), &spec, &env).unwrap();
 
-        let attrs = cast!(result, IntermediateResult::Type);
+        let attrs = cast!(result, TypeResolution::Type);
 
         let (element_type, dimensions) = cast_struct!(
             attrs.representation,
-            IntermediateType::Array {
+            SemanticType::Array {
                 element_type,
                 dimensions
             }
         );
         assert_eq!(
             *element_type,
-            IntermediateType::Int {
+            SemanticType::Int {
                 size: ByteSized::B16
             }
         );
@@ -362,24 +344,21 @@ mod tests {
         // First create a base array type
         env.insert_type(
             &TypeName::from("BASE_ARRAY"),
-            TypeAttributes::new(
-                SourceSpan::default(),
-                IntermediateType::Array {
-                    element_type: Box::new(IntermediateType::Int {
-                        size: ByteSized::B16,
-                    }),
-                    dimensions: vec![ArrayDimension {
-                        lower: 1,
-                        upper: 10,
-                    }],
-                },
-            ),
+            TypeAttributes::new(SemanticType::Array {
+                element_type: Box::new(SemanticType::Int {
+                    size: ByteSized::B16,
+                }),
+                dimensions: vec![ArrayDimension {
+                    lower: 1,
+                    upper: 10,
+                }],
+            }),
         );
 
         let spec = SpecificationKind::Named(TypeName::from("BASE_ARRAY"));
         let result = try_from(&TypeName::from("ALIAS_ARRAY"), &spec, &env).unwrap();
 
-        let base_name = cast!(result, IntermediateResult::Alias);
+        let base_name = cast!(result, TypeResolution::Alias);
         assert_eq!(base_name, TypeName::from("BASE_ARRAY"));
     }
 
@@ -439,19 +418,19 @@ mod tests {
         let spec = SpecificationKind::Inline(array_subranges);
         let result = try_from(&TypeName::from("MATRIX"), &spec, &env).unwrap();
 
-        let attrs = cast!(result, IntermediateResult::Type);
+        let attrs = cast!(result, TypeResolution::Type);
 
         // Check total elements before destructuring
         assert_eq!(attrs.representation.array_total_elements(), Some(12)); // 3 * 4
 
         let (element_type, dimensions) = cast_struct!(
             attrs.representation,
-            IntermediateType::Array {
+            SemanticType::Array {
                 element_type,
                 dimensions
             }
         );
-        assert_eq!(*element_type, IntermediateType::Bool);
+        assert_eq!(*element_type, SemanticType::Bool);
         assert_eq!(dimensions.len(), 2);
         assert_eq!(dimensions[0].lower, 1);
         assert_eq!(dimensions[0].upper, 3);
@@ -478,11 +457,11 @@ mod tests {
         let spec = SpecificationKind::Inline(array_subranges);
         let result = try_from(&TypeName::from("MY_REF_ARRAY"), &spec, &env).unwrap();
 
-        let attrs = cast!(result, IntermediateResult::Type);
+        let attrs = cast!(result, TypeResolution::Type);
 
         let (element_type, dimensions) = cast_struct!(
             attrs.representation,
-            IntermediateType::Array {
+            SemanticType::Array {
                 element_type,
                 dimensions
             }
@@ -490,7 +469,7 @@ mod tests {
         assert!(element_type.is_reference());
         assert_eq!(
             element_type.referenced_type().unwrap(),
-            &IntermediateType::Bytes {
+            &SemanticType::Bytes {
                 size: ByteSized::B8
             }
         );
@@ -527,18 +506,18 @@ mod tests {
         assert!(result.is_ok());
 
         let attrs = match result.unwrap() {
-            IntermediateResult::Type(attrs) => attrs,
+            TypeResolution::Type(attrs) => attrs,
             _ => unreachable!("Expected Type result"),
         };
 
-        if let IntermediateType::Array {
+        if let SemanticType::Array {
             element_type,
             dimensions,
         } = attrs.representation
         {
             assert_eq!(
                 *element_type,
-                IntermediateType::String {
+                SemanticType::String {
                     max_len: Some(10),
                     char_width: CharWidth::Narrow,
                 }
@@ -576,18 +555,18 @@ mod tests {
         assert!(result.is_ok());
 
         let attrs = match result.unwrap() {
-            IntermediateResult::Type(attrs) => attrs,
+            TypeResolution::Type(attrs) => attrs,
             _ => unreachable!("Expected Type result"),
         };
 
-        if let IntermediateType::Array {
+        if let SemanticType::Array {
             element_type,
             dimensions,
         } = attrs.representation
         {
             assert_eq!(
                 *element_type,
-                IntermediateType::String {
+                SemanticType::String {
                     max_len: None,
                     char_width: CharWidth::Narrow,
                 }

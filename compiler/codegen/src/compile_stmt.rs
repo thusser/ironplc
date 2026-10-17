@@ -1,36 +1,33 @@
 //! Statement and control flow compilation for IEC 61131-3 code generation.
 //!
-//! Contains statement dispatch, control flow (IF, CASE, FOR, WHILE, REPEAT),
-//! and function block call compilation. Separated from compile.rs to
-//! keep module sizes within the 1000-line guideline.
+//! Contains statement dispatch, control flow (IF, CASE), and function block
+//! call compilation; the loops (FOR, WHILE, REPEAT) are in `compile_loop`.
+//! Separated from compile.rs to keep module sizes within the 1000-line
+//! guideline.
 
 use ironplc_dsl::common::{
-    BitStringLiteral, ConstantKind, FunctionBlockBodyKind, Integer, IntegerRef, SignedInteger,
-    SignedIntegerRef, StringInitializer, StringSpecification,
+    BitStringLiteral, FunctionBlockBodyKind, Integer, IntegerRef, SignedInteger, SignedIntegerRef,
+    StringInitializer, StringSpecification,
 };
 use ironplc_dsl::core::{Located, SourceSpan};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
 use ironplc_dsl::textual::{
-    CaseSelectionKind, Expr, ExprKind, FbCall, ParamAssignmentKind, Statements, StmtKind,
-    SymbolicVariableKind, UnaryOp, Variable,
+    CaseSelectionKind, Expr, FbCall, ParamAssignmentKind, Statements, StmtKind,
 };
-use ironplc_problems::Problem;
 
 use super::compile::{
-    CompileContext, CurrentFunctionReturn, OpType, OpWidth, Signedness, VarTypeInfo,
-    DEFAULT_OP_TYPE, DEFAULT_STRING_MAX_LENGTH,
+    CompileContext, CurrentFunctionReturn, OpType, OpWidth, Signedness, DEFAULT_STRING_MAX_LENGTH,
 };
+use super::compile_assign::compile_assignment;
+use super::compile_call_output::{store_outputs, CallOutputs};
 use super::compile_expr::{
-    compile_bit_access_assignment, compile_expr, compile_partial_access_assignment,
-    condition_op_type, emit_add, emit_classified_cmp_br, emit_eq, emit_ge, emit_le, emit_load_var,
-    emit_store_var, emit_truncation, extract_bit_access_target, extract_partial_access_target,
-    op_type, resolve_variable, resolve_variable_name, signed_integer_to_i64, try_classify_cmp,
-    variable_span, ClassifiedCmp,
+    compile_condition, compile_expr, emit_classified_cmp_br, emit_eq, emit_ge, emit_le,
+    emit_load_var, op_type, try_classify_cmp,
 };
-use super::compile_fb_init::{compile_fb_field_store, resolve_fb_field_op_type};
+use super::compile_fb_call::FbCallSite;
+use super::compile_loop::{compile_for, compile_repeat, compile_while};
+use super::compile_method::compile_method_call_statement;
 use crate::emit::Emitter;
-use crate::string_width::compile_string_value;
-use ironplc_container::opcode;
 
 /// Compiles a function block body.
 ///
@@ -62,7 +59,11 @@ pub(crate) fn compile_statements(
     statements: &Statements,
 ) -> Result<(), Diagnostic> {
     for stmt in &statements.body {
-        compile_statement(emitter, ctx, stmt)?;
+        // A top-level statement takes the lowered route where the route asks
+        // for it and lowering supports it.
+        if !crate::lowered::try_compile_statement(emitter, ctx, stmt)? {
+            compile_statement(emitter, ctx, stmt)?;
+        }
     }
     Ok(())
 }
@@ -77,12 +78,21 @@ pub(crate) fn compile_statements(
 /// source bytes for it (the [`crate::EmptyLookup`] case), no entry is
 /// recorded — there's no useful (line, column) to surface, and a
 /// `file_id` without a position would only confuse a debugger.
-fn record_statement_position(
+pub(crate) fn record_statement_position(
     emitter: &mut crate::emit::Emitter,
     ctx: &CompileContext,
     stmt: &StmtKind,
 ) {
-    let span = stmt.span();
+    record_position(emitter, ctx, &stmt.span());
+}
+
+/// Records `span` as the source position of the opcodes that follow, as
+/// [`record_statement_position`] does for a statement.
+pub(crate) fn record_position(
+    emitter: &mut crate::emit::Emitter,
+    ctx: &CompileContext,
+    span: &SourceSpan,
+) {
     let Some(file_id) = ctx.debug_source_files.get(&span.file_id) else {
         return;
     };
@@ -113,325 +123,32 @@ fn compile_statement(
 ) -> Result<(), Diagnostic> {
     record_statement_position(emitter, ctx, stmt);
     match stmt {
-        StmtKind::Assignment(assignment) => {
-            // TwinCAT/CODESYS `S=`/`R=` set/reset binding: parsed and
-            // analyzed like any other BOOL assignment, but codegen has no
-            // lowering for "write only when true, otherwise leave
-            // unchanged" yet (unlike `ref_bind`, which reuses the ordinary
-            // `ExprKind::Ref` value and needs no special case here at all).
-            // Refuse explicitly rather than emit the unconditional store a
-            // naive fallthrough would produce. See issue #1680.
-            if assignment.set_bind || assignment.reset_bind {
-                return Err(Diagnostic::todo_with_span(assignment.span()));
-            }
-
-            // Dereference assignment: myRef^ := expr
-            // Compile the RHS, load the reference variable, emit STORE_INDIRECT.
-            if assignment.deref {
-                let target_name = resolve_variable_name(&assignment.target);
-                let target_index = target_name
-                    .and_then(|name| ctx.variables.get(name).copied())
-                    .ok_or_else(|| {
-                        Diagnostic::not_implemented(Label::span(
-                            assignment.target.span(),
-                            "Dereferenced assignment target is not a plain variable",
-                        ))
-                    })?;
-
-                // Compile the value expression (use DEFAULT_OP_TYPE; the referenced
-                // type determines the actual width at runtime).
-                compile_expr(emitter, ctx, &assignment.value, DEFAULT_OP_TYPE)?;
-
-                // Load the reference (variable index stored in the ref variable).
-                emitter.emit_load_var_i64(target_index);
-
-                // STORE_INDIRECT pops both value and ref.
-                emitter.emit_store_indirect();
-                return Ok(());
-            }
-
-            // Check if the target is a bit access variable (read-modify-write).
-            if let Some(bit_access) = extract_bit_access_target(&assignment.target) {
-                return compile_bit_access_assignment(emitter, ctx, bit_access, &assignment.value);
-            }
-
-            // Check if the target is a partial access variable (read-modify-write).
-            if let Some(partial_access) = extract_partial_access_target(&assignment.target) {
-                return compile_partial_access_assignment(
-                    emitter,
-                    ctx,
-                    partial_access,
-                    &assignment.value,
-                );
-            }
-
-            // Check if the target is a structured variable (struct field write).
-            // Excludes `s.arr[i].field := ...`, whose record is an array
-            // element rather than a fixed-offset struct field. That shape
-            // falls through to the `resolve_access` dispatch below.
-            let fixed_offset_field = match &assignment.target {
-                Variable::Symbolic(SymbolicVariableKind::Structured(structured))
-                    if !matches!(structured.record.as_ref(), SymbolicVariableKind::Array(_)) =>
-                {
-                    Some(structured)
-                }
-                _ => None,
-            };
-            if let Some(structured) = fixed_offset_field {
-                // Function block instance field write (e.g. `timer.IN := TRUE`).
-                // FB instances live in `ctx.fb_instances` rather than
-                // `ctx.struct_vars`, and their fields are stored in the data
-                // region addressed via FB_STORE_PARAM.
-                if let SymbolicVariableKind::Named(named) = structured.record.as_ref() {
-                    if compile_fb_field_store(
-                        emitter,
-                        ctx,
-                        &named.name,
-                        &structured.field,
-                        &assignment.value,
-                    )? {
-                        return Ok(());
-                    }
-                }
-
-                // STRING fields are composite (multi-slot) and handled via the
-                // data region, so we intercept before resolve_struct_field_access
-                // which only supports single-slot (primitive/enum) fields.
-                let (root_name, slot_offset, field_type) =
-                    crate::compile_struct::walk_struct_chain(
-                        ctx,
-                        &structured.record,
-                        &structured.field,
-                        0,
-                    )?;
-                if let ironplc_analyzer::intermediate_type::IntermediateType::String {
-                    char_width,
-                    ..
-                } = &field_type
-                {
-                    let char_width = *char_width;
-                    let struct_info = ctx.struct_vars.get(&root_name).ok_or_else(|| {
-                        Diagnostic::not_implemented(Label::span(
-                            structured.span(),
-                            format!("Variable '{}' is not a structure", root_name),
-                        ))
-                    })?;
-                    let byte_offset = struct_info.data_offset + slot_offset.raw() * 8;
-                    // Produce the RHS at the field's declared encoding, the
-                    // same as any other string destination (ADR-0034).
-                    compile_string_value(emitter, ctx, &assignment.value, char_width)?;
-                    emitter.emit_str_store_var(byte_offset);
-                    return Ok(());
-                }
-
-                let (var_index, desc_index, slot_offset, op_type, field_type) =
-                    crate::compile_struct::resolve_struct_field_access(ctx, structured)?;
-                compile_expr(emitter, ctx, &assignment.value, op_type)?;
-                crate::compile_struct::emit_truncation_for_field(emitter, &field_type);
-                let idx_const = ctx.add_i32_constant(slot_offset.raw() as i32);
-                emitter.emit_load_const_i32(idx_const);
-                emitter.emit_store_array(var_index, desc_index);
-                return Ok(());
-            }
-
-            // Whole-aggregate assignment (`x := y` where x is an array or a
-            // structure). Emits COPY_REGION, which moves the bytes rather
-            // than the data-region offset the scalar arm below would copy.
-            if crate::compile_aggregate::try_compile_whole_assignment(emitter, ctx, assignment)? {
-                return Ok(());
-            }
-
-            // Look up the target variable's type info.
-            let target_name = resolve_variable_name(&assignment.target);
-
-            // Check if the target is a STRING variable (stored in data region).
-            let string_info = target_name
-                .and_then(|name| ctx.string_vars.get(name))
-                .map(|info| (info.data_offset, info.char_width));
-
-            if let Some((data_offset, char_width)) = string_info {
-                // String target: produce the RHS as a temp buffer at the
-                // target's encoding, then STR_STORE_VAR (ADR-0034).
-                compile_string_value(emitter, ctx, &assignment.value, char_width)?;
-                emitter.emit_str_store_var(data_offset);
-            } else {
-                match crate::compile_array::resolve_access(ctx, &assignment.target)? {
-                    crate::compile_array::ResolvedAccess::Scalar { var_index } => {
-                        let type_info = target_name.and_then(|name| ctx.var_type_info(name));
-                        let op_type = type_info
-                            .map(|ti| (ti.op_width, ti.signedness))
-                            .unwrap_or(DEFAULT_OP_TYPE);
-                        compile_expr(emitter, ctx, &assignment.value, op_type)?;
-                        if let Some(ti) = type_info {
-                            emit_truncation(emitter, ti);
-                        }
-                        emit_store_var(emitter, var_index, op_type);
-                    }
-                    crate::compile_array::ResolvedAccess::ArrayElement { info, subscripts } => {
-                        // Copy scalar fields from info (borrows ctx) before using ctx mutably.
-                        let element_vti = info.element_var_type_info;
-                        let arr_var_index = info.var_index;
-                        let arr_desc_index = info.desc_index;
-                        let is_string_elem = info.is_string_element;
-                        let element_char_width = info.string_char_width;
-                        let dim_info: Vec<_> = info
-                            .dimensions
-                            .iter()
-                            .map(|d| crate::compile_array::DimensionInfo {
-                                lower_bound: d.lower_bound,
-                                size: d.size,
-                                stride: d.stride,
-                            })
-                            .collect();
-                        // info is no longer used; subscripts borrows from AST, not ctx.
-                        let target_span = variable_span(&assignment.target);
-
-                        if is_string_elem {
-                            // String array: produce the RHS as a temp buffer at
-                            // the element's encoding, then the flat index, then
-                            // STR_STORE_ARRAY_ELEM (ADR-0034).
-                            compile_string_value(
-                                emitter,
-                                ctx,
-                                &assignment.value,
-                                element_char_width,
-                            )?;
-                            crate::compile_array::emit_flat_index(
-                                emitter,
-                                ctx,
-                                &subscripts,
-                                &dim_info,
-                                &target_span,
-                            )?;
-                            emitter.emit_str_store_array_elem(arr_var_index, arr_desc_index);
-                        } else {
-                            let element_op_type = (element_vti.op_width, element_vti.signedness);
-                            // 1. Compile the RHS value.
-                            compile_expr(emitter, ctx, &assignment.value, element_op_type)?;
-                            // 2. Truncate for sub-32-bit types.
-                            emit_truncation(emitter, element_vti);
-                            // 3. Compute the flat index.
-                            crate::compile_array::emit_flat_index(
-                                emitter,
-                                ctx,
-                                &subscripts,
-                                &dim_info,
-                                &target_span,
-                            )?;
-                            // Stack: [..., value, index]. STORE_ARRAY pops both.
-                            emitter.emit_store_array(arr_var_index, arr_desc_index);
-                        }
-                    }
-                    crate::compile_array::ResolvedAccess::DerefArrayElement {
-                        info,
-                        subscripts,
-                    } => {
-                        let element_vti = info.element_var_type_info;
-                        let ref_var_index = info.var_index;
-                        let arr_desc_index = info.desc_index;
-                        let dim_info: Vec<_> = info
-                            .dimensions
-                            .iter()
-                            .map(|d| crate::compile_array::DimensionInfo {
-                                lower_bound: d.lower_bound,
-                                size: d.size,
-                                stride: d.stride,
-                            })
-                            .collect();
-                        let element_op_type = (element_vti.op_width, element_vti.signedness);
-                        let target_span = variable_span(&assignment.target);
-
-                        compile_expr(emitter, ctx, &assignment.value, element_op_type)?;
-                        emit_truncation(emitter, element_vti);
-                        crate::compile_array::emit_flat_index(
-                            emitter,
-                            ctx,
-                            &subscripts,
-                            &dim_info,
-                            &target_span,
-                        )?;
-                        emitter.emit_store_array_deref(ref_var_index, arr_desc_index);
-                    }
-                    crate::compile_array::ResolvedAccess::StructFieldArrayElement {
-                        var_index,
-                        desc_index,
-                        field_slot_offset,
-                        ref dimensions,
-                        subscripts,
-                        element_op_type,
-                        ref element_type,
-                    } => {
-                        let target_span = variable_span(&assignment.target);
-                        compile_expr(emitter, ctx, &assignment.value, element_op_type)?;
-                        crate::compile_struct::emit_truncation_for_field(emitter, element_type);
-                        crate::compile_array::emit_flat_index(
-                            emitter,
-                            ctx,
-                            &subscripts,
-                            dimensions,
-                            &target_span,
-                        )?;
-                        let offset_const = ctx.add_i64_constant(field_slot_offset.raw() as i64);
-                        emitter.emit_load_const_i64(offset_const);
-                        emitter.emit_add_i64();
-                        emitter.emit_store_array(var_index, desc_index);
-                    }
-                    crate::compile_array::ResolvedAccess::StructFieldStringArrayElement(
-                        element,
-                    ) => {
-                        // The RHS produces, at the element's encoding, the
-                        // temp buffer index the store consumes (ADR-0034).
-                        compile_string_value(emitter, ctx, &assignment.value, element.char_width)?;
-                        element.emit_base_and_index(
-                            emitter,
-                            ctx,
-                            &variable_span(&assignment.target),
-                        )?;
-                        emitter.emit_str_store_array_elem(
-                            element.scratch_var_index,
-                            element.string_desc_index,
-                        );
-                    }
-                }
-            }
-            Ok(())
-        }
+        StmtKind::Assignment(assignment) => compile_assignment(emitter, ctx, assignment),
         StmtKind::FbCall(fb_call) => compile_fb_call(emitter, ctx, fb_call),
-        StmtKind::MethodCall(method_call) => compile_method_call(emitter, ctx, method_call),
+        StmtKind::MethodCall(method_call) => {
+            compile_method_call_statement(emitter, ctx, method_call)
+        }
         StmtKind::If(if_stmt) => compile_if(emitter, ctx, if_stmt),
         StmtKind::Case(case_stmt) => compile_case(emitter, ctx, case_stmt),
         StmtKind::For(for_stmt) => compile_for(emitter, ctx, for_stmt),
         StmtKind::While(while_stmt) => compile_while(emitter, ctx, while_stmt),
         StmtKind::Repeat(repeat_stmt) => compile_repeat(emitter, ctx, repeat_stmt),
         StmtKind::Return => {
-            // Inside a function with a return value, an early RETURN must
-            // first push the current return-value variable so the caller
-            // sees a value on the stack (matching the trailing load+RET
-            // emitted at the end of the function body).
-            match ctx.current_function_return {
-                Some(CurrentFunctionReturn::Scalar { var_index, op_type }) => {
-                    emit_load_var(emitter, var_index, op_type);
-                    emitter.emit_ret();
-                }
-                Some(CurrentFunctionReturn::String { data_offset }) => {
-                    emitter.emit_str_load_var(data_offset);
-                    emitter.emit_ret();
-                }
-                None => {
-                    emitter.emit_ret_void();
-                }
-            }
+            emit_return(emitter, ctx);
             Ok(())
         }
+        // Analysis rejects an EXIT or CONTINUE outside a loop
+        // (`rule_loop_control_inside_loop`, P4021 and P4065).
         StmtKind::Exit(span) => {
             let label = ctx.current_loop_exit().ok_or_else(|| {
-                Diagnostic::problem(
-                    Problem::ExitOutsideLoop,
-                    Label::span(
-                        span.clone(),
-                        "EXIT must be inside a FOR, WHILE, or REPEAT loop",
-                    ),
-                )
+                Diagnostic::internal_error_at(Label::span(span.clone(), "EXIT outside a loop"))
+            })?;
+            emitter.emit_jmp(label);
+            Ok(())
+        }
+        StmtKind::Continue(span) => {
+            let label = ctx.current_loop_next().ok_or_else(|| {
+                Diagnostic::internal_error_at(Label::span(span.clone(), "CONTINUE outside a loop"))
             })?;
             emitter.emit_jmp(label);
             Ok(())
@@ -439,182 +156,70 @@ fn compile_statement(
     }
 }
 
+/// Emits a `RETURN` from the current body.
+///
+/// Inside a function with a return value, an early RETURN must first push
+/// the current return-value variable so the caller sees a value on the stack
+/// (matching the trailing load+RET emitted at the end of the function body).
+pub(crate) fn emit_return(emitter: &mut Emitter, ctx: &CompileContext) {
+    match ctx.current_function_return {
+        Some(CurrentFunctionReturn::Scalar { var_index, op_type }) => {
+            emit_load_var(emitter, var_index, op_type);
+            emitter.emit_ret();
+        }
+        Some(CurrentFunctionReturn::String { data_offset }) => {
+            emitter.emit_str_load_var(data_offset);
+            emitter.emit_ret();
+        }
+        None => {
+            emitter.emit_ret_void();
+        }
+    }
+}
+
 /// Compiles a function block invocation: stores inputs, calls FB, reads outputs.
+///
+/// The analyzer has written the call's arguments in normal form
+/// (`specs/design/call-binding.md`): one named input for each input the call
+/// supplies, in the order the block declares them, then its outputs in
+/// declaration order. They are compiled in that order, which is the order
+/// they are evaluated in. An input the call omits keeps its value.
 fn compile_fb_call(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     fb_call: &FbCall,
 ) -> Result<(), Diagnostic> {
-    let fb_info = ctx
-        .fb_instances
-        .get(&fb_call.var_name)
-        .ok_or_else(|| Diagnostic::todo_with_span(fb_call.span()))?;
-    let type_id = fb_info.type_id;
-    let field_indices = fb_info.field_indices.clone();
-    let var_index = fb_info.var_index;
-
-    // Push FB instance reference.
-    emitter.emit_fb_load_instance(var_index);
-
-    // Store input parameters.
+    let call = FbCallSite::open(emitter, ctx, &fb_call.var_name, &fb_call.span())?;
     for param in &fb_call.params {
-        if let ParamAssignmentKind::NamedInput(input) = param {
-            let field_name = input.name.to_string().to_lowercase();
-            let field_idx = field_indices
-                .get(&field_name)
-                .ok_or_else(|| Diagnostic::todo_with_span(input.name.span()))?;
-            let op_type = resolve_fb_field_op_type(ctx, type_id, &field_name);
-            compile_expr(emitter, ctx, &input.expr, op_type)?;
-            emitter.emit_fb_store_param(*field_idx);
-        }
-    }
-
-    // Call the function block. Record a call-graph edge for user-defined
-    // FBs (intrinsic FBs have no PLC body and never recurse into the
-    // dispatch loop, so they contribute no frames).
-    emitter.emit_fb_call(type_id);
-    if let Some(user_fb) = ctx
-        .user_fb_types
-        .values()
-        .find(|info| info.type_id == type_id)
-    {
-        ctx.record_call_edge(user_fb.function_id);
-    }
-
-    // Read output parameters.
-    for param in &fb_call.params {
-        if let ParamAssignmentKind::Output(output) = param {
-            let field_name = output.src.to_string().to_lowercase();
-            let field_idx = field_indices
-                .get(&field_name)
-                .ok_or_else(|| Diagnostic::todo_with_span(output.src.span()))?;
-            emitter.emit_fb_load_param(*field_idx);
-            let target_index = resolve_variable(ctx, &output.tgt)?;
-            let op_type = resolve_fb_field_op_type(ctx, type_id, &field_name);
-            emit_store_var(emitter, target_index, op_type);
-        }
-    }
-
-    // Discard fb_ref.
-    emitter.emit_pop();
-    Ok(())
-}
-
-/// Compiles a method call (`instance.MethodName(args)`, OOP extension,
-/// ADR-0041 Phase 1 static dispatch). See `METHOD_CALL`'s doc comment in
-/// `ironplc_container::opcode` for the calling convention.
-///
-/// Scoped to methods declared directly on the instance's own function
-/// block type. A method reached only via the instance type's `EXTENDS`
-/// chain (already accepted by `rule_method_call_declared` at the
-/// semantic-analysis level) is not yet supported here: a derived type's
-/// data-region layout doesn't currently reserve storage for a base
-/// type's fields at all (`compile_user_function_block`'s field list
-/// comes from `fb_decl.variables` only, never flattened with inherited
-/// fields), so there is nothing correct to copy-in/copy-out from.
-fn compile_method_call(
-    emitter: &mut Emitter,
-    ctx: &mut CompileContext,
-    call: &ironplc_dsl::textual::MethodCall,
-) -> Result<(), Diagnostic> {
-    // `THIS^.M()` / `SUPER^.M()` receivers parse but are rejected earlier by
-    // `rule_method_call_declared`, so codegen only ever sees a named instance.
-    let instance = match &call.receiver {
-        ironplc_dsl::textual::MethodReceiver::Instance(id) => id,
-        ironplc_dsl::textual::MethodReceiver::SelfRef(self_ref) => {
-            return Err(Diagnostic::todo_with_span(self_ref.span()))
-        }
-    };
-
-    let fb_info = ctx
-        .fb_instances
-        .get(instance)
-        .ok_or_else(|| Diagnostic::todo_with_span(call.span()))?;
-    let type_id = fb_info.type_id;
-    let var_index = fb_info.var_index;
-
-    let fb_name = ctx
-        .user_fb_types
-        .iter()
-        .find(|(_, info)| info.type_id == type_id)
-        .map(|(name, _)| name.clone())
-        .ok_or_else(|| Diagnostic::todo_with_span(call.span()))?;
-    let fb_type_info = &ctx.user_fb_types[&fb_name];
-
-    let method_name = call.method.to_string().to_lowercase();
-    let method_info = fb_type_info
-        .methods
-        .get(&method_name)
-        .ok_or_else(|| Diagnostic::todo_with_span(call.span()))?;
-
-    let function_id = method_info.function_id;
-    let field_var_off = ironplc_container::VarIndex::new(fb_type_info.var_offset);
-    let num_fields = fb_type_info.num_fields as u8;
-    let param_var_off = ironplc_container::VarIndex::new(method_info.param_var_off);
-    let num_params = method_info.num_params;
-    let param_names_in_order = method_info.param_names_in_order.clone();
-    let param_op_types = method_info.param_op_types.clone();
-    let has_return_value = method_info.has_return_value;
-    let max_stack_depth = method_info.max_stack_depth;
-
-    emitter.emit_fb_load_instance(var_index);
-
-    // Resolve named/positional args to the method's declared VAR_INPUT
-    // order (arity and name validity already checked by
-    // rule_method_call_declared, so any argument that doesn't line up
-    // here indicates a codegen bug, not a user error -- hence `todo`
-    // rather than a user-facing diagnostic).
-    let mut ordered_args: Vec<Option<&Expr>> = vec![None; param_names_in_order.len()];
-    for param in &call.params {
         match param {
-            ParamAssignmentKind::PositionalInput(p) => {
-                if let Some(slot) = ordered_args.iter_mut().find(|s| s.is_none()) {
-                    *slot = Some(&p.expr);
-                }
+            ParamAssignmentKind::NamedInput(input) => {
+                compile_expr(emitter, ctx, &input.expr)?;
+                call.store_input(emitter, &input.name)?;
             }
-            ParamAssignmentKind::NamedInput(n) => {
-                let name = n.name.to_string().to_lowercase();
-                if let Some(idx) = param_names_in_order.iter().position(|p| *p == name) {
-                    ordered_args[idx] = Some(&n.expr);
-                }
+            // The binding pass names every input of a call that binds, and
+            // the rules reject one that does not.
+            ParamAssignmentKind::PositionalInput(input) => {
+                return Err(Diagnostic::internal_error_at(Label::span(
+                    input.expr.span(),
+                    "Positional input of a function block call the analyzer did not bind",
+                )));
             }
-            ParamAssignmentKind::Output(_) => {
-                // Methods have no VAR_OUTPUT `=>` call syntax in this slice.
-            }
+            ParamAssignmentKind::Output(_) => {}
         }
     }
+    call.close(emitter, ctx);
 
-    for (i, arg) in ordered_args.iter().enumerate() {
-        let expr = arg.ok_or_else(|| Diagnostic::todo_with_span(call.span()))?;
-        let op_type = param_op_types.get(i).copied().unwrap_or(DEFAULT_OP_TYPE);
-        compile_expr(emitter, ctx, expr, op_type)?;
-    }
-
-    // Record a call-graph edge; unlike FB_CALL, a method call is always
-    // user-defined (no intrinsic-FB branch), so this is unconditional.
-    ctx.record_call_edge(function_id);
-
-    emitter.emit_method_call(
-        function_id,
-        field_var_off,
-        num_fields,
-        param_var_off,
-        num_params,
-        has_return_value,
-        max_stack_depth,
-    );
-
-    // Statement-position call: discard any return value, then fb_ref.
-    if has_return_value {
-        emitter.emit_pop();
-    }
-    emitter.emit_pop();
-
-    Ok(())
+    // An output of a function block is a field of its instance.
+    store_outputs(
+        emitter,
+        ctx,
+        CallOutputs::Instance(fb_call.var_name.clone()),
+        &fb_call.params,
+    )
 }
 
 /// Compiles a slice of statements.
-fn compile_stmts(
+pub(crate) fn compile_stmts(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
     stmts: &[StmtKind],
@@ -646,10 +251,9 @@ fn compile_if(
     // JMP_IF_NOT with a single `CMP_BR_*` using the negated comparison.
     let next_label = emitter.create_label();
     if let Some(classified) = try_classify_cmp(ctx, &if_stmt.expr) {
-        emit_classified_cmp_br(emitter, classified, false, next_label);
+        emit_classified_cmp_br(emitter, classified, false, next_label)?;
     } else {
-        let cond_type = condition_op_type(ctx, &if_stmt.expr)?;
-        compile_expr(emitter, ctx, &if_stmt.expr, cond_type)?;
+        compile_condition(emitter, ctx, &if_stmt.expr)?;
         emitter.emit_jmp_if_not(next_label);
     }
 
@@ -657,8 +261,8 @@ fn compile_if(
     compile_stmts(emitter, ctx, &if_stmt.body)?;
 
     // If there are more branches, jump to end.
-    if needs_end_label {
-        emitter.emit_jmp(end_label.unwrap());
+    if let Some(end) = end_label {
+        emitter.emit_jmp(end);
     }
 
     emitter.bind_label(next_label);
@@ -667,16 +271,17 @@ fn compile_if(
     for elsif in &if_stmt.else_ifs {
         let elsif_next = emitter.create_label();
         if let Some(classified) = try_classify_cmp(ctx, &elsif.expr) {
-            emit_classified_cmp_br(emitter, classified, false, elsif_next);
+            emit_classified_cmp_br(emitter, classified, false, elsif_next)?;
         } else {
-            let elsif_op_type = condition_op_type(ctx, &elsif.expr)?;
-            compile_expr(emitter, ctx, &elsif.expr, elsif_op_type)?;
+            compile_condition(emitter, ctx, &elsif.expr)?;
             emitter.emit_jmp_if_not(elsif_next);
         }
 
         compile_stmts(emitter, ctx, &elsif.body)?;
 
-        emitter.emit_jmp(end_label.unwrap());
+        // `end_label` exists whenever there is an ELSIF clause.
+        let end = end_label.ok_or_else(Diagnostic::internal_error)?;
+        emitter.emit_jmp(end);
 
         emitter.bind_label(elsif_next);
     }
@@ -717,12 +322,11 @@ fn compile_case(
     case_stmt: &ironplc_dsl::textual::Case,
 ) -> Result<(), Diagnostic> {
     let end_label = emitter.create_label();
-    // Enum selectors have a resolved type that is the enum name (e.g. "COLOR"),
-    // which resolve_type_name doesn't handle. Fall back to W32/Signed (DINT)
-    // since all enums use DINT at codegen level (REQ-EN-codegen-003).
+    // An enumeration selector operates as a DINT (REQ-EN-codegen-003), which
+    // `op_type` answers from its type.
     let selector = CaseSelector {
         expr: &case_stmt.selector,
-        op_type: op_type(ctx, &case_stmt.selector).unwrap_or(crate::compile::DEFAULT_OP_TYPE),
+        op_type: op_type(ctx, &case_stmt.selector)?,
     };
 
     for group in &case_stmt.statement_groups {
@@ -776,14 +380,14 @@ impl CaseSelector<'_> {
         label: CaseLabelValue<'_>,
         cmp: fn(&mut Emitter, OpType),
     ) -> Result<(), Diagnostic> {
-        compile_expr(emitter, ctx, self.expr, self.op_type)?;
+        compile_expr(emitter, ctx, self.expr)?;
         match self.op_type.0 {
             OpWidth::W32 => {
-                let pool_index = ctx.add_i32_constant(label.to_i32()?);
+                let pool_index = ctx.add_i32_constant(label.to_i32(self.op_type.1)?);
                 emitter.emit_load_const_i32(pool_index);
             }
             OpWidth::W64 => {
-                let pool_index = ctx.add_i64_constant(label.to_i64()?);
+                let pool_index = ctx.add_i64_constant(label.to_i64(self.op_type.1)?);
                 emitter.emit_load_const_i64(pool_index);
             }
             // CASE with float types is not meaningful in IEC 61131-3.
@@ -796,43 +400,73 @@ impl CaseSelector<'_> {
     }
 }
 
-/// How a `CASE` label's value narrows to the selector's width.
-enum CaseLabelValue<'a> {
-    /// A decimal literal (`5:`, or a bound of `-3..7:`): a magnitude that
-    /// must fit the signed range of the width.
-    Signed(&'a SignedInteger),
-    /// A radix-prefixed literal (`16#D012:`, `2#1010:`): a bit pattern that
-    /// must fit the unsigned range of the width, the same narrowing as
-    /// `ConstantKind::BitStringLiteral` in compile_expr.rs.
-    Pattern(&'a BitStringLiteral),
+/// A `CASE` label's value, whatever radix it was written in.
+///
+/// A label is a value, not a bit pattern: `16#FFFFFFFF` and `4294967295` are
+/// the same label, and both narrow to the selector's width by the value they
+/// state. Analysis rejects a label outside the selector's type
+/// (`rule_constant_range`, P2026), including the type it records for an
+/// untyped literal selector (`CASE 5 OF ...`), and the selector's storage is
+/// at least that wide. So every label fits by the time it arrives here, and
+/// one that does not is a broken invariant, reported as an internal error.
+struct CaseLabelValue<'a> {
+    is_neg: bool,
+    magnitude: &'a Integer,
 }
 
-impl CaseLabelValue<'_> {
-    fn to_i32(&self) -> Result<i32, Diagnostic> {
-        match self {
-            CaseLabelValue::Signed(si) => signed_integer_to_i32(si),
-            CaseLabelValue::Pattern(lit) => u32::try_from(lit.value.value)
-                .map(|value| value as i32)
-                .map_err(|_| bit_string_overflow(lit)),
+impl<'a> CaseLabelValue<'a> {
+    fn signed(value: &'a SignedInteger) -> Self {
+        Self {
+            is_neg: value.is_neg,
+            magnitude: &value.value,
         }
     }
 
-    fn to_i64(&self) -> Result<i64, Diagnostic> {
-        match self {
-            CaseLabelValue::Signed(si) => signed_integer_to_i64(si),
-            CaseLabelValue::Pattern(lit) => u64::try_from(lit.value.value)
-                .map(|value| value as i64)
-                .map_err(|_| bit_string_overflow(lit)),
+    fn radix(literal: &'a BitStringLiteral) -> Self {
+        Self {
+            is_neg: false,
+            magnitude: &literal.value,
         }
     }
-}
 
-fn bit_string_overflow(lit: &BitStringLiteral) -> Diagnostic {
-    Diagnostic::problem(
-        Problem::ConstantOverflow,
-        Label::span(lit.value.span(), "Bit string literal"),
-    )
-    .with_context("value", &lit.value.value.to_string())
+    /// The label's value at the selector's 32-bit width. An unsigned
+    /// selector holds its value's bit pattern in the slot, so a label for one
+    /// is stored the same way.
+    fn to_i32(&self, signedness: Signedness) -> Result<i32, Diagnostic> {
+        let value = self.value()?;
+        match signedness {
+            Signedness::Signed => i32::try_from(value).ok(),
+            Signedness::Unsigned => u32::try_from(value).ok().map(|value| value as i32),
+        }
+        .ok_or_else(|| self.overflow())
+    }
+
+    /// The label's value at the selector's 64-bit width, stored the way
+    /// [`Self::to_i32`] stores it.
+    fn to_i64(&self, signedness: Signedness) -> Result<i64, Diagnostic> {
+        let value = self.value()?;
+        match signedness {
+            Signedness::Signed => i64::try_from(value).ok(),
+            Signedness::Unsigned => u64::try_from(value).ok().map(|value| value as i64),
+        }
+        .ok_or_else(|| self.overflow())
+    }
+
+    fn value(&self) -> Result<i128, Diagnostic> {
+        let magnitude = i128::try_from(self.magnitude.value).map_err(|_| self.overflow())?;
+        Ok(if self.is_neg { -magnitude } else { magnitude })
+    }
+
+    fn overflow(&self) -> Diagnostic {
+        let sign = if self.is_neg { "-" } else { "" };
+        Diagnostic::internal_error_at(Label::span(
+            self.magnitude.span(),
+            format!(
+                "CASE label {sign}{} does not fit the selector's storage",
+                self.magnitude.value
+            ),
+        ))
+    }
 }
 
 /// Compiles a single case selector, leaving a boolean result on the stack.
@@ -849,27 +483,29 @@ fn compile_case_selector(
 ) -> Result<(), Diagnostic> {
     match selection {
         CaseSelectionKind::SignedInteger(si) => {
-            selector.cmp_label(emitter, ctx, CaseLabelValue::Signed(si), emit_eq)
+            selector.cmp_label(emitter, ctx, CaseLabelValue::signed(si), emit_eq)
         }
         CaseSelectionKind::Subrange(sr) => {
             let start = resolve_signed_integer_ref(&sr.start)?;
-            selector.cmp_label(emitter, ctx, CaseLabelValue::Signed(start), emit_ge)?;
+            selector.cmp_label(emitter, ctx, CaseLabelValue::signed(start), emit_ge)?;
             let end = resolve_signed_integer_ref(&sr.end)?;
-            selector.cmp_label(emitter, ctx, CaseLabelValue::Signed(end), emit_le)?;
+            selector.cmp_label(emitter, ctx, CaseLabelValue::signed(end), emit_le)?;
             emitter.emit_bool_and();
             Ok(())
         }
         CaseSelectionKind::EnumeratedValue(ev) => {
             // REQ-EN-codegen-040: Load selector, load ordinal constant, compare with EQ_I32.
-            compile_expr(emitter, ctx, selector.expr, selector.op_type)?;
-            let ordinal = crate::compile_enum::resolve_enum_ordinal(&ctx.enum_map, ev)?;
+            // The label is a value of the selector's type.
+            compile_expr(emitter, ctx, selector.expr)?;
+            let members = crate::compile_enum::members_of_expr(ctx, selector.expr);
+            let ordinal = crate::compile_enum::ordinal_in(members, ev)?;
             let pool_index = ctx.add_i32_constant(ordinal);
             emitter.emit_load_const_i32(pool_index);
             emitter.emit_eq_i32();
             Ok(())
         }
         CaseSelectionKind::BitStringLiteral(lit) => {
-            selector.cmp_label(emitter, ctx, CaseLabelValue::Pattern(lit), emit_eq)
+            selector.cmp_label(emitter, ctx, CaseLabelValue::radix(lit), emit_eq)
         }
     }
 }
@@ -887,7 +523,6 @@ fn non_integer_case_selector(selector_expr: &Expr) -> Diagnostic {
     ))
 }
 
-/// Converts a `SignedInteger` AST node to an `i32` value.
 /// Extracts the max length from a `StringInitializer`, returning a
 /// not-implemented diagnostic if the length is an unresolved constant reference.
 pub(crate) fn resolve_string_max_length(
@@ -938,404 +573,4 @@ fn resolve_signed_integer_ref(sir: &SignedIntegerRef) -> Result<&SignedInteger, 
         SignedIntegerRef::Literal(si) => Ok(si),
         SignedIntegerRef::Constant(id) => Err(Diagnostic::todo_with_id(id)),
     }
-}
-
-pub(crate) fn signed_integer_to_i32(si: &SignedInteger) -> Result<i32, Diagnostic> {
-    if si.is_neg {
-        let unsigned = si.value.value as i128;
-        let signed = -unsigned;
-        i32::try_from(signed).map_err(|_| {
-            Diagnostic::problem(
-                Problem::ConstantOverflow,
-                Label::span(si.value.span(), "Integer literal"),
-            )
-            .with_context("value", &signed.to_string())
-        })
-    } else {
-        i32::try_from(si.value.value).map_err(|_| {
-            Diagnostic::problem(
-                Problem::ConstantOverflow,
-                Label::span(si.value.span(), "Integer literal"),
-            )
-            .with_context("value", &si.value.value.to_string())
-        })
-    }
-}
-
-/// Compiles a WHILE statement.
-///
-/// ```text
-/// LOOP:
-///   compile(condition)
-///   JMP_IF_NOT → END
-///   compile(body)
-///   JMP → LOOP
-/// END:
-/// ```
-fn compile_while(
-    emitter: &mut Emitter,
-    ctx: &mut CompileContext,
-    while_stmt: &ironplc_dsl::textual::While,
-) -> Result<(), Diagnostic> {
-    // Fast path: when the condition is a fusable `var <cmp> const`, emit a
-    // do-while shape so the per-iteration overhead collapses to a single
-    // `CMP_BR_*` (zero-trip head + back-edge tail).
-    //
-    // ```text
-    //   CMP_BR_<t>  NEG(cmp), var, k, END     ; zero-trip: exit if !cond
-    // BODY:
-    //   ...body...
-    //   CMP_BR_<t>  cmp,      var, k, BODY    ; back-edge: continue if cond
-    // END:
-    // ```
-    if let Some(classified) = try_classify_cmp(ctx, &while_stmt.condition) {
-        let body_label = emitter.create_label();
-        let end_label = emitter.create_label();
-        emit_classified_cmp_br(emitter, classified, false, end_label);
-        emitter.bind_label(body_label);
-        ctx.loop_exit_labels.push(end_label);
-        compile_stmts(emitter, ctx, &while_stmt.body)?;
-        ctx.loop_exit_labels.pop();
-        emit_classified_cmp_br(emitter, classified, true, body_label);
-        emitter.bind_label(end_label);
-        return Ok(());
-    }
-
-    // Fallback: complex condition. Today's emission, unchanged.
-    let loop_label = emitter.create_label();
-    let end_label = emitter.create_label();
-
-    emitter.bind_label(loop_label);
-    let cond_type = condition_op_type(ctx, &while_stmt.condition)?;
-    compile_expr(emitter, ctx, &while_stmt.condition, cond_type)?;
-    emitter.emit_jmp_if_not(end_label);
-    ctx.loop_exit_labels.push(end_label);
-    compile_stmts(emitter, ctx, &while_stmt.body)?;
-    ctx.loop_exit_labels.pop();
-    emitter.emit_jmp(loop_label);
-    emitter.bind_label(end_label);
-
-    Ok(())
-}
-
-/// Compiles a REPEAT statement.
-///
-/// ```text
-/// LOOP:
-///   compile(body)
-///   compile(condition)
-///   JMP_IF_NOT → LOOP
-/// ```
-fn compile_repeat(
-    emitter: &mut Emitter,
-    ctx: &mut CompileContext,
-    repeat_stmt: &ironplc_dsl::textual::Repeat,
-) -> Result<(), Diagnostic> {
-    let loop_label = emitter.create_label();
-    let end_label = emitter.create_label();
-
-    // Fast path: when `until` is a fusable `var <cmp> const`, replace the
-    // tail `compile(cond) + JMP_IF_NOT LOOP` (4 dispatches) with a single
-    // `CMP_BR_*` using the negated comparison (continue while NOT cond).
-    let classified_until = try_classify_cmp(ctx, &repeat_stmt.until);
-
-    emitter.bind_label(loop_label);
-    ctx.loop_exit_labels.push(end_label);
-    compile_stmts(emitter, ctx, &repeat_stmt.body)?;
-    ctx.loop_exit_labels.pop();
-    if let Some(classified) = classified_until {
-        emit_classified_cmp_br(emitter, classified, false, loop_label);
-    } else {
-        let cond_type = condition_op_type(ctx, &repeat_stmt.until)?;
-        compile_expr(emitter, ctx, &repeat_stmt.until, cond_type)?;
-        emitter.emit_jmp_if_not(loop_label);
-    }
-    emitter.bind_label(end_label);
-
-    Ok(())
-}
-
-/// Whether a compile-time constant step is positive or negative.
-#[derive(Clone, Copy)]
-enum StepSign {
-    Positive,
-    Negative,
-}
-
-/// Inspects an expression and returns its sign if it is a compile-time constant
-/// integer literal (positive or negative). Returns `None` for non-constant
-/// expressions.
-fn try_constant_sign(expr: &Expr) -> Option<StepSign> {
-    match try_constant_i64(expr)? {
-        v if v > 0 => Some(StepSign::Positive),
-        v if v < 0 => Some(StepSign::Negative),
-        _ => None,
-    }
-}
-
-/// Returns the `i64` value of an expression if it is a compile-time constant
-/// integer literal (positive, negative, or unary-negated). Returns `None`
-/// for non-constant expressions or values outside the `i64` range.
-fn try_constant_i64(expr: &Expr) -> Option<i64> {
-    match &expr.kind {
-        ExprKind::Const(ConstantKind::IntegerLiteral(lit)) => {
-            signed_integer_to_i64(&lit.value).ok()
-        }
-        ExprKind::UnaryOp(unary) if unary.op == UnaryOp::Neg => match &unary.term.kind {
-            ExprKind::Const(ConstantKind::IntegerLiteral(lit)) => signed_integer_to_i64(&lit.value)
-                .ok()
-                .and_then(i64::checked_neg),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Returns the `(min, max)` value range for a narrow integer type, or `None`
-/// for 32- and 64-bit types where `emit_truncation` is already a no-op.
-///
-/// The bounds come from `value_range`, which is where the range a type can
-/// hold is stated; "narrow" is this caller's own concern.
-fn narrow_type_range(type_info: VarTypeInfo) -> Option<(i64, i64)> {
-    match type_info.storage_bits {
-        bits @ (8 | 16) => {
-            let (minimum, maximum) = ironplc_analyzer::value_range::for_integer(
-                u32::from(bits),
-                type_info.signedness == Signedness::Signed,
-            );
-            Some((minimum as i64, maximum as i64))
-        }
-        _ => None,
-    }
-}
-
-/// Returns `true` when both `TRUNC` sites in a FOR loop can safely be elided
-/// because every value the control variable will hold (initial, body-visible,
-/// and post-final-increment) is provably within the declared narrow type's
-/// range. Conservative: any non-constant bound, or any boundary that could
-/// trigger wrap-around, returns `false` and preserves the existing TRUNC.
-fn for_loop_trunc_can_be_elided(
-    from: &Expr,
-    to: &Expr,
-    step: Option<&Expr>,
-    type_info: VarTypeInfo,
-) -> bool {
-    let Some((t_min, t_max)) = narrow_type_range(type_info) else {
-        // Wide type: emit_truncation is already a no-op; flag is irrelevant.
-        return true;
-    };
-    let Some(from_v) = try_constant_i64(from) else {
-        return false;
-    };
-    let Some(to_v) = try_constant_i64(to) else {
-        return false;
-    };
-    let step_v = match step {
-        None => 1,
-        Some(expr) => match try_constant_i64(expr) {
-            Some(v) => v,
-            None => return false,
-        },
-    };
-    if from_v < t_min || from_v > t_max {
-        return false;
-    }
-    match step_v {
-        s if s > 0 => {
-            // Body sees values in [from, to]; post-final stored value is to + step.
-            if to_v > t_max {
-                return false;
-            }
-            match to_v.checked_add(s) {
-                Some(post) => post <= t_max,
-                None => false,
-            }
-        }
-        s if s < 0 => {
-            if to_v < t_min {
-                return false;
-            }
-            match to_v.checked_add(s) {
-                Some(post) => post >= t_min,
-                None => false,
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Attempts to fuse a FOR loop's head test into a single `CMP_BR_*`
-/// instruction. Returns `Some(ClassifiedCmp)` representing the
-/// continuation predicate (`i <= to` for positive step, `i >= to` for
-/// negative step) when the control variable is a 32- or 64-bit signed
-/// integer and `to` is a constant integer literal that fits the
-/// variable's width. Returns `None` otherwise so the caller falls back to
-/// the unfused emission.
-fn try_classify_for_head(
-    ctx: &mut CompileContext,
-    var_index: ironplc_container::VarIndex,
-    op_type: OpType,
-    to: &Expr,
-    step_sign: StepSign,
-) -> Option<ClassifiedCmp> {
-    if op_type.1 != Signedness::Signed {
-        return None;
-    }
-    let to_value = try_constant_i64(to)?;
-    let cmp_op_byte = match step_sign {
-        StepSign::Positive => opcode::cmp_op::LE_S,
-        StepSign::Negative => opcode::cmp_op::GE_S,
-    };
-    match op_type.0 {
-        OpWidth::W32 => {
-            let v32 = i32::try_from(to_value).ok()?;
-            let const_idx = ctx.add_i32_constant(v32);
-            Some(ClassifiedCmp {
-                cmp_op_byte,
-                var_index,
-                const_idx,
-                op_width: OpWidth::W32,
-            })
-        }
-        OpWidth::W64 => {
-            let const_idx = ctx.add_i64_constant(to_value);
-            Some(ClassifiedCmp {
-                cmp_op_byte,
-                var_index,
-                const_idx,
-                op_width: OpWidth::W64,
-            })
-        }
-        OpWidth::F32 | OpWidth::F64 => None,
-    }
-}
-
-/// Compiles a FOR statement.
-///
-/// ```text
-///   compile(from)
-///   STORE_VAR control
-/// LOOP:
-///   LOAD_VAR control
-///   compile(to)
-///   LE_I32 (or GE_I32 for negative step)  // continuation predicate
-///   JMP_IF_NOT → END                       // exit when continuation fails
-///   compile(body)
-///   LOAD_VAR control
-///   compile(step)  // default: LOAD_CONST 1
-///   ADD_I32
-///   STORE_VAR control
-///   JMP → LOOP
-/// END:
-/// ```
-///
-/// The continuation predicate is `i <= to` (positive step) / `i >= to`
-/// (negative step). Inverting the predicate lets the body fall through
-/// from the conditional branch, eliminating one `JMP` dispatch per
-/// iteration.
-fn compile_for(
-    emitter: &mut Emitter,
-    ctx: &mut CompileContext,
-    for_stmt: &ironplc_dsl::textual::For,
-) -> Result<(), Diagnostic> {
-    let var_index = ctx.var_index(&for_stmt.control)?;
-    let op_type = ctx.var_op_type(&for_stmt.control);
-    let type_info = ctx.var_type_info(&for_stmt.control);
-
-    // Determine step sign.
-    let step_sign = match &for_stmt.step {
-        None => StepSign::Positive,
-        Some(step_expr) => match try_constant_sign(step_expr) {
-            Some(sign) => sign,
-            None => {
-                return Err(Diagnostic::not_implemented(Label::span(
-                    for_stmt.control.span(),
-                    "FOR loop step must be a constant expression",
-                )))
-            }
-        },
-    };
-
-    // Decide whether the per-loop TRUNC can be elided based on a local interval
-    // check over the constant bounds. See `specs/design/vm-performance.md`
-    // §13 "Layer 1: Abstract Interpretation with Richer Domains".
-    let elide_trunc = match type_info {
-        Some(ti) => {
-            for_loop_trunc_can_be_elided(&for_stmt.from, &for_stmt.to, for_stmt.step.as_ref(), ti)
-        }
-        None => true,
-    };
-
-    // Initialize: compile(from), STORE_VAR control
-    compile_expr(emitter, ctx, &for_stmt.from, op_type)?;
-    if let Some(ti) = type_info {
-        if !elide_trunc {
-            emit_truncation(emitter, ti);
-        }
-    }
-    emit_store_var(emitter, var_index, op_type);
-
-    let loop_label = emitter.create_label();
-    let end_label = emitter.create_label();
-
-    // LOOP: check continuation condition; exit straight to END when it
-    // fails so the body falls through without an extra JMP dispatch.
-    emitter.bind_label(loop_label);
-    if let Some(classified) =
-        try_classify_for_head(ctx, var_index, op_type, &for_stmt.to, step_sign)
-    {
-        // Fused path: one CMP_BR replacing LOAD_VAR + LOAD_CONST + LE/GE + JMP_IF_NOT.
-        // Branch to END when the continuation predicate is FALSE.
-        emit_classified_cmp_br(emitter, classified, false, end_label);
-    } else {
-        emit_load_var(emitter, var_index, op_type);
-        compile_expr(emitter, ctx, &for_stmt.to, op_type)?;
-        match step_sign {
-            StepSign::Positive => emit_le(emitter, op_type),
-            StepSign::Negative => emit_ge(emitter, op_type),
-        }
-        emitter.emit_jmp_if_not(end_label);
-    }
-
-    // BODY:
-    ctx.loop_exit_labels.push(end_label);
-    compile_stmts(emitter, ctx, &for_stmt.body)?;
-    ctx.loop_exit_labels.pop();
-
-    // Increment: LOAD_VAR control, compile(step), ADD, truncate, STORE_VAR control
-    emit_load_var(emitter, var_index, op_type);
-    match &for_stmt.step {
-        Some(step_expr) => compile_expr(emitter, ctx, step_expr, op_type)?,
-        None => match op_type.0 {
-            OpWidth::W32 => {
-                let one_index = ctx.add_i32_constant(1);
-                emitter.emit_load_const_i32(one_index);
-            }
-            OpWidth::W64 => {
-                let one_index = ctx.add_i64_constant(1);
-                emitter.emit_load_const_i64(one_index);
-            }
-            OpWidth::F32 => {
-                let one_index = ctx.add_f32_constant(1.0);
-                emitter.emit_load_const_f32(one_index);
-            }
-            OpWidth::F64 => {
-                let one_index = ctx.add_f64_constant(1.0);
-                emitter.emit_load_const_f64(one_index);
-            }
-        },
-    }
-    emit_add(emitter, op_type);
-    if let Some(ti) = type_info {
-        if !elide_trunc {
-            emit_truncation(emitter, ti);
-        }
-    }
-    emit_store_var(emitter, var_index, op_type);
-    emitter.emit_jmp(loop_label);
-
-    // END:
-    emitter.bind_label(end_label);
-
-    Ok(())
 }
