@@ -4,57 +4,96 @@
 //! including variable setup, body compilation, and metadata registration.
 //! Separated from compile.rs to keep module sizes within the 1000-line guideline.
 
-use std::collections::HashMap;
-
-use ironplc_container::debug_section::{iec_type_tag, var_section, VarNameEntry};
-use ironplc_container::{ContainerBuilder, FunctionId, VarIndex};
+use ironplc_container::debug_section::{iec_type_tag, VarNameEntry};
+use ironplc_container::{CharWidth, FunctionId, VarIndex};
 use ironplc_dsl::common::{
-    FunctionBlockDeclaration, FunctionDeclaration, FunctionReturnType, InitialValueAssignmentKind,
-    StringInitializer, VarDecl, VariableType,
+    FunctionBlockDeclaration, FunctionDeclaration, InitialValueAssignmentKind, VarDecl,
+    VariableType,
 };
-use ironplc_dsl::core::{Id, Located};
+use ironplc_dsl::core::{Id, Located, SourceSpan};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
+use ironplc_dsl::type_id::TypeId;
 
-use ironplc_analyzer::TypeEnvironment;
+use ironplc_analyzer::{SemanticType, TypeEnvironment};
 
 use super::compile::{
     char_width_for_string_type, finalize_function, string_region_size, CompileContext,
-    CompiledFunction, CurrentBody, CurrentFunctionReturn, ParamPassing, StringParamInfo,
-    StringReturnInfo, StringVarInfo, UserFunctionInfo, VarTypeInfo, DEFAULT_OP_TYPE,
-    NARROW_CHAR_WIDTH, WIDE_CHAR_WIDTH,
+    CompiledFunction, CurrentFunctionReturn, ParamPassing, StringParamInfo, StringVarInfo,
+    VarTypeInfo, DEFAULT_STRING_MAX_LENGTH,
 };
 use super::compile_expr::emit_load_var;
-use super::compile_setup::{
-    debug_type_for_decl, debug_type_for_return, emit_function_local_prologue, map_var_section,
-};
-use super::compile_stmt::{
-    compile_body, compile_statements, resolve_string_max_length, resolve_string_spec_max_length,
-};
-use super::scope::Scope;
-use super::type_info::{decl_type_info, named_type_info, resolve_type_name};
+use super::compile_setup::emit_function_local_prologue;
+use super::compile_stmt::{compile_body, compile_statements, resolve_string_max_length};
+use super::layout::names::ScopeId;
+use super::layout::{debug_type_for_decl, map_var_section, FunctionLayout};
+use super::type_info::resolve_type_name;
 use crate::emit::Emitter;
 
 /// Reserves the run of the data region the string variable `id`, which
-/// `string_init` declares, is held in, and records it in `ctx.string_vars`.
-/// Every declared string of a function, function block or method is held
-/// in a run of its own, sized to its declared capacity.
+/// `decl` declares, is held in, and records it in `ctx.string_vars`, when
+/// `decl` declares a string. Every declared string of a function, function
+/// block or method is held in a run of its own, sized to its declared
+/// capacity.
 #[track_caller]
-pub(crate) fn register_string_variable(
+pub(crate) fn register_declared_string(
     ctx: &mut CompileContext,
     id: &Id,
-    string_init: &StringInitializer,
+    decl: &VarDecl,
 ) -> Result<(), Diagnostic> {
-    let max_length = resolve_string_max_length(string_init)?;
-    let char_width = char_width_for_string_type(&string_init.width);
+    let (max_length, char_width, span) =
+        if let InitialValueAssignmentKind::String(string_init) = &decl.initializer {
+            (
+                resolve_string_max_length(string_init)?,
+                char_width_for_string_type(&string_init.width),
+                string_init.span(),
+            )
+        } else if let Some((max_length, char_width)) = aliased_string(ctx, decl.type_id) {
+            (max_length, char_width, decl.identifier.span())
+        } else {
+            return Ok(());
+        };
+    register_string(ctx, id, max_length, char_width, &span)?;
+    Ok(())
+}
 
+/// The capacity and character width of the string type `type_id` names,
+/// when it is a type alias of a string (`TYPE Name : STRING[20]; END_TYPE`),
+/// which the analyzer resolves to the string type it names. `None` for any
+/// other type.
+pub(crate) fn aliased_string(
+    ctx: &CompileContext,
+    type_id: Option<TypeId>,
+) -> Option<(u16, CharWidth)> {
+    let Some(SemanticType::String {
+        max_len,
+        char_width,
+    }) = type_id.and_then(|id| ctx.types.get(&id))
+    else {
+        return None;
+    };
+    let max_length = max_len.map_or(DEFAULT_STRING_MAX_LENGTH, |len| len as u16);
+    Some((max_length, *char_width))
+}
+
+/// Reserves a run of the data region for a string of `max_length` code
+/// units of `char_width`, records it in `ctx.string_vars` as `id`'s, and
+/// returns its offset.
+pub(crate) fn register_string(
+    ctx: &mut CompileContext,
+    id: &Id,
+    max_length: u16,
+    char_width: CharWidth,
+    span: &SourceSpan,
+) -> Result<u32, Diagnostic> {
     let total_bytes = string_region_size(max_length, char_width);
-    let data_offset = crate::data_region::reserve(ctx, total_bytes, &string_init.span())?;
+    let data_offset = crate::data_region::reserve(ctx, total_bytes, span)?;
 
     if max_length > ctx.max_string_capacity {
         ctx.max_string_capacity = max_length;
     }
 
     ctx.string_vars.insert(
+        ctx.scope,
         id.clone(),
         StringVarInfo {
             data_offset,
@@ -62,7 +101,7 @@ pub(crate) fn register_string_variable(
             char_width,
         },
     );
-    Ok(())
+    Ok(data_offset)
 }
 
 /// How a call site passes an argument to the input parameter `decl`
@@ -73,13 +112,12 @@ pub(crate) fn param_passing(ctx: &CompileContext, decl: &VarDecl) -> ParamPassin
     if decl.var_type == VariableType::InOut {
         return ParamPassing::Reference;
     }
-    let string = match &decl.initializer {
-        InitialValueAssignmentKind::String(_) => decl
-            .identifier
-            .symbolic_id()
-            .and_then(|id| ctx.string_vars.get(id)),
-        _ => None,
-    };
+    let declares_string = matches!(decl.initializer, InitialValueAssignmentKind::String(_))
+        || aliased_string(ctx, decl.type_id).is_some();
+    let string = declares_string
+        .then(|| decl.identifier.symbolic_id())
+        .flatten()
+        .and_then(|id| ctx.string_var(id));
     string.map_or(ParamPassing::Value, |info| {
         ParamPassing::String(StringParamInfo {
             data_offset: info.data_offset,
@@ -91,10 +129,10 @@ pub(crate) fn param_passing(ctx: &CompileContext, decl: &VarDecl) -> ParamPassin
 
 /// Records a debug [`VarNameEntry`] for a function- or FB-local variable
 /// (parameter or local) owned by `function_id`. Mirrors the program/global
-/// emission in `compile_setup::assign_variables`, but tags the entry with
+/// emission in `layout::storage::assign_variables`, but tags the entry with
 /// the owning function so a debugger can filter a frame's variables to the
 /// current stack frame (plus globals).
-fn push_local_var_name(
+pub(crate) fn push_local_var_name(
     ctx: &mut CompileContext,
     var_index: VarIndex,
     function_id: FunctionId,
@@ -127,7 +165,7 @@ fn push_local_var_name(
 /// only elementary types are supported. A string, array, structure,
 /// reference or function block instance lives in the data region (or is
 /// itself a reference), and passing one by reference is not implemented.
-fn in_out_value_type(decl: &VarDecl) -> Result<VarTypeInfo, Diagnostic> {
+pub(crate) fn in_out_value_type(decl: &VarDecl) -> Result<VarTypeInfo, Diagnostic> {
     if let InitialValueAssignmentKind::Simple(simple) = &decl.initializer {
         if let Some(type_info) = resolve_type_name(&simple.type_name.name) {
             return Ok(type_info);
@@ -139,204 +177,25 @@ fn in_out_value_type(decl: &VarDecl) -> Result<VarTypeInfo, Diagnostic> {
     )))
 }
 
-/// Compiles a single user-defined function body.
-///
-/// Saves and restores the context's variable mappings so that function-local
-/// variables don't interfere with the program's namespace.
-///
-/// Variable layout within the function's region (starting at `var_offset`):
-/// - Input parameters (in declaration order)
-/// - Local variables (VAR)
-/// - Return value variable (named same as function)
-#[allow(clippy::too_many_arguments)]
+/// Compiles the body of the user function `func_decl`, which `layout` lays
+/// out, in the function's scope; the caller's is current again once the
+/// body is compiled.
 pub(crate) fn compile_user_function(
     func_decl: &FunctionDeclaration,
-    function_id: FunctionId,
-    var_offset: VarIndex,
+    layout: FunctionLayout,
     ctx: &mut CompileContext,
-    builder: &mut ContainerBuilder,
-    types: &TypeEnvironment,
-    num_globals: u16,
 ) -> Result<CompiledFunction, Diagnostic> {
-    // Swap the program's variable mappings for the function's own; the
-    // program's are put back once the function is compiled.
-    let program_scope = ctx.swap_scope(Scope::default());
-    ctx.swap_scope(Scope::for_function_body(&program_scope, num_globals));
-
-    // Assign variable slots for the function's parameters and locals,
-    // starting at var_offset. Input parameters come first (declaration order),
-    // then local variables.
-    let mut current_index = var_offset;
-    let mut num_params: u16 = 0;
-
-    // First pass: input-compatible parameters (VAR_INPUT and VAR_IN_OUT)
-    // must come first for CALL arg passing.
-    for decl in &func_decl.variables {
-        if !decl.var_type.is_input_compatible() {
-            continue;
-        }
-        if let Some(id) = decl.identifier.symbolic_id() {
-            ctx.variables.insert(id.clone(), current_index);
-            push_local_var_name(ctx, current_index, function_id, decl, id, types);
-            if decl.var_type == VariableType::InOut {
-                // The slot holds a reference to the caller's variable; its
-                // type info is the referenced value's, for reads and writes.
-                let type_info = in_out_value_type(decl)?;
-                ctx.var_types.insert(id.clone(), type_info);
-                ctx.in_out_params.insert(id.clone());
-                current_index = VarIndex::new(current_index.raw() + 1);
-                num_params += 1;
-                continue;
-            }
-            // A parameter operates at its declared type, whatever kind of
-            // declaration declares it: a subrange at its base type, an
-            // enumeration as a `DINT`, a reference as its 64-bit index.
-            if let Some(type_info) = decl_type_info(ctx, decl) {
-                ctx.var_types.insert(id.clone(), type_info);
-            }
-            match &decl.initializer {
-                InitialValueAssignmentKind::String(string_init) => {
-                    register_string_variable(ctx, id, string_init)?;
-                }
-                InitialValueAssignmentKind::Reference(ref_init) => {
-                    crate::compile_reference::register_reference_variable(
-                        ctx,
-                        builder,
-                        types,
-                        id,
-                        current_index,
-                        ref_init,
-                    )?;
-                }
-                _ => {}
-            }
-            current_index = VarIndex::new(current_index.raw() + 1);
-            num_params += 1;
-        }
-    }
-
-    // Second pass: local variables (VAR, VAR_TEMP) and outputs (VAR_OUTPUT),
-    // which start again on every call as a local does.
-    let mut outputs = HashMap::new();
-    for decl in &func_decl.variables {
-        if !decl.var_type.is_local() && decl.var_type != VariableType::Output {
-            continue;
-        }
-        if let Some(id) = decl.identifier.symbolic_id() {
-            ctx.variables.insert(id.clone(), current_index);
-            if decl.var_type == VariableType::Output {
-                outputs.insert(id.clone(), current_index);
-            }
-            push_local_var_name(ctx, current_index, function_id, decl, id, types);
-            // A local operates at its declared type, as a parameter does.
-            if let Some(type_info) = decl_type_info(ctx, decl) {
-                ctx.var_types.insert(id.clone(), type_info);
-            }
-            match &decl.initializer {
-                InitialValueAssignmentKind::String(string_init) => {
-                    register_string_variable(ctx, id, string_init)?;
-                }
-                InitialValueAssignmentKind::Reference(ref_init) => {
-                    crate::compile_reference::register_reference_variable(
-                        ctx,
-                        builder,
-                        types,
-                        id,
-                        current_index,
-                        ref_init,
-                    )?;
-                }
-                _ => {}
-            }
-            current_index = VarIndex::new(current_index.raw() + 1);
-        }
-    }
-
-    // Assign the return variable (named same as the function).
-    let return_var_index = current_index;
-    let return_id = func_decl.name.clone();
-    ctx.variables.insert(return_id.clone(), return_var_index);
-
-    // Debug entry for the return value. The result has no IEC variable
-    // section; it is modeled as VAR_OUTPUT so a debugger surfaces it in the
-    // "Outputs" scope (per the section->DAP-scope table in
-    // specs/design/debugger-support.md).
-    let (return_tag, return_type_name_str) = debug_type_for_return(&func_decl.return_type, types);
-    ctx.debug_var_names.push(VarNameEntry {
-        var_index: return_var_index,
+    let FunctionLayout {
         function_id,
-        var_section: var_section::VAR_OUTPUT,
-        iec_type_tag: return_tag,
-        name: return_id.to_string(),
-        type_name: return_type_name_str,
-    });
+        scope,
+        num_locals,
+        num_params,
+        return_var_index,
+        return_op_type,
+        return_string_info,
+    } = layout;
+    let caller = std::mem::replace(&mut ctx.scope, scope);
 
-    // Check if this function returns a STRING/WSTRING.
-    let return_string_info = match &func_decl.return_type {
-        FunctionReturnType::String(spec) | FunctionReturnType::WString(spec) => {
-            let max_length = resolve_string_spec_max_length(spec)?;
-            let char_width = match &func_decl.return_type {
-                FunctionReturnType::WString(_) => WIDE_CHAR_WIDTH,
-                _ => NARROW_CHAR_WIDTH,
-            };
-
-            let total_bytes = string_region_size(max_length, char_width);
-            let data_offset = crate::data_region::reserve(ctx, total_bytes, &spec.keyword_span)?;
-
-            if max_length > ctx.max_string_capacity {
-                ctx.max_string_capacity = max_length;
-            }
-
-            ctx.string_vars.insert(
-                return_id.clone(),
-                StringVarInfo {
-                    data_offset,
-                    max_length,
-                    char_width,
-                },
-            );
-            Some(StringReturnInfo {
-                data_offset,
-                max_length,
-                char_width,
-            })
-        }
-        FunctionReturnType::Named(_) => {
-            let return_type_name = func_decl.return_type.to_type_name();
-            if let Some(struct_type) = types.resolve_struct_type(&return_type_name) {
-                // Return type is a struct — allocate data region space and
-                // register the return variable so field assignments
-                // (e.g. FUNC.X := val) work inside the function body.
-                crate::compile_struct::allocate_struct_variable(
-                    ctx,
-                    builder,
-                    struct_type,
-                    &return_id,
-                    return_var_index,
-                    &func_decl.name.span(),
-                )?;
-            } else if let Some(type_info) = named_type_info(ctx, types, &return_type_name) {
-                ctx.var_types.insert(return_id.clone(), type_info);
-            }
-            None
-        }
-    };
-    // Captured here because `ctx.struct_vars` is restored to the caller's
-    // scope at the end of this function, losing the return variable's entry.
-    let return_struct_desc_index = ctx.struct_vars.get(&return_id).map(|info| info.desc_index);
-    current_index = VarIndex::new(current_index.raw() + 1);
-
-    let num_locals = current_index.raw() - var_offset.raw();
-
-    // The type the return value is loaded at: the declared return type, a
-    // subrange at its base type. A string or structure return lives in the
-    // data region, and its slot holds a data offset at the default type.
-    let return_type_name = func_decl.return_type.to_type_name();
-    let return_op_type = named_type_info(ctx, types, &return_type_name)
-        .map(|info| (info.op_width, info.signedness))
-        .unwrap_or(DEFAULT_OP_TYPE);
-
-    // Compile the function body.
     let mut func_emitter = Emitter::new();
 
     // Emit initialization prologue: IEC 61131-3 functions are stateless, so
@@ -378,11 +237,7 @@ pub(crate) fn compile_user_function(
     let saved_current_fn = ctx.current_function_id.take();
     ctx.current_function_id = Some(function_id);
 
-    let saved_body = ctx
-        .current_body
-        .replace(CurrentBody::Pou(func_decl.name.clone()));
     compile_statements(&mut func_emitter, ctx, &body)?;
-    ctx.current_body = saved_body;
 
     ctx.current_function_id = saved_current_fn;
     ctx.current_function_return = saved_return_ctx;
@@ -399,40 +254,11 @@ pub(crate) fn compile_user_function(
 
     let finalized = finalize_function(&mut func_emitter, ctx)?;
 
-    // Record function metadata for use at call sites.
-    let func_name = func_decl.name.lower_case();
+    // The most a call of the function adds to its caller's stack.
+    ctx.function_stack_depths
+        .insert(function_id, finalized.max_stack_depth);
 
-    // Record how a call site passes each parameter: by value, into the
-    // parameter's string space, or by reference.
-    let params: Vec<ParamPassing> = func_decl
-        .variables
-        .iter()
-        .filter(|decl| decl.var_type.is_input_compatible())
-        .map(|decl| param_passing(ctx, decl))
-        .collect();
-
-    let string_outputs = outputs
-        .keys()
-        .filter_map(|id| Some((id.clone(), ctx.string_vars.get(id)?.clone())))
-        .collect();
-
-    ctx.user_functions.insert(
-        func_name.to_string(),
-        UserFunctionInfo {
-            function_id,
-            var_offset,
-            num_params,
-            params,
-            return_string_info,
-            return_struct_desc_index,
-            max_stack_depth: finalized.max_stack_depth,
-            outputs,
-            string_outputs,
-        },
-    );
-
-    // Restore the program's variable mappings.
-    ctx.swap_scope(program_scope);
+    ctx.scope = caller;
 
     Ok(CompiledFunction {
         function_id,
@@ -441,85 +267,24 @@ pub(crate) fn compile_user_function(
         max_temp_depth: finalized.max_temp_depth,
         num_locals,
         num_params,
-        name: func_name.to_string(),
+        name: func_decl.name.lower_case().to_string(),
         line_map: finalized.line_map,
     })
 }
 
-/// Compiles a single user-defined function block body.
-///
-/// Saves and restores the context's variable mappings so that FB-local
-/// variables don't interfere with the program's namespace.
-///
-/// All FB fields (VAR_INPUT, VAR_OUTPUT, VAR) are mapped to contiguous
-/// variable table slots starting at `var_offset`, in declaration order.
-/// The VM's copy-in/copy-out logic mirrors this ordering.
+/// Compiles the body of the user function block `fb_decl`, whose id is
+/// `function_id` and whose `num_locals` copy slots the layout gave it, in
+/// the block's scope, `scope`; the caller's is current again once the body
+/// is compiled.
 pub(crate) fn compile_user_function_block(
     fb_decl: &FunctionBlockDeclaration,
     function_id: FunctionId,
-    var_offset: u16,
+    scope: ScopeId,
+    num_locals: u16,
     ctx: &mut CompileContext,
-    builder: &mut ContainerBuilder,
-    types: &TypeEnvironment,
-    num_globals: u16,
-) -> Result<(CompiledFunction, Scope), Diagnostic> {
+) -> Result<CompiledFunction, Diagnostic> {
     let fb_name = fb_decl.name.name.to_string().to_uppercase();
-
-    // Collect fields in a stable order: inputs first, then outputs, then locals.
-    // This matches the data-region layout used by the VM's copy-in/copy-out.
-    let mut field_decls: Vec<&VarDecl> = Vec::new();
-    for decl in &fb_decl.variables {
-        if decl.var_type == VariableType::Input {
-            field_decls.push(decl);
-        }
-    }
-    for decl in &fb_decl.variables {
-        if decl.var_type == VariableType::Output {
-            field_decls.push(decl);
-        }
-    }
-    for decl in &fb_decl.variables {
-        if decl.var_type == VariableType::Var {
-            field_decls.push(decl);
-        }
-    }
-
-    // Swap the program's variable mappings for the FB type's own.
-    let program_scope = ctx.swap_scope(Scope::default());
-    ctx.swap_scope(Scope::for_fb_body(&program_scope, num_globals));
-
-    // Assign variable slots for all FB fields, in the same order as field_decls.
-    let mut current_index = VarIndex::new(var_offset);
-    for decl in &field_decls {
-        if let Some(id) = decl.identifier.symbolic_id() {
-            ctx.variables.insert(id.clone(), current_index);
-            push_local_var_name(ctx, current_index, function_id, decl, id, types);
-            // A field operates at its declared type, as a function's local
-            // does.
-            if let Some(type_info) = decl_type_info(ctx, decl) {
-                ctx.var_types.insert(id.clone(), type_info);
-            }
-            match &decl.initializer {
-                InitialValueAssignmentKind::Reference(ref_init) => {
-                    crate::compile_reference::register_reference_variable(
-                        ctx,
-                        builder,
-                        types,
-                        id,
-                        current_index,
-                        ref_init,
-                    )?;
-                }
-                InitialValueAssignmentKind::String(string_init) => {
-                    register_string_variable(ctx, id, string_init)?;
-                }
-                _ => {}
-            }
-            current_index = VarIndex::new(current_index.raw() + 1);
-        }
-    }
-
-    let num_locals = current_index.raw() - var_offset;
+    let caller = std::mem::replace(&mut ctx.scope, scope);
 
     // Compile the FB body.
     // Mark this FB's body as the current caller so nested CALL / FB_CALL
@@ -529,36 +294,23 @@ pub(crate) fn compile_user_function_block(
     ctx.current_function_id = Some(function_id);
 
     let mut fb_emitter = Emitter::new();
-    let saved_body = ctx
-        .current_body
-        .replace(CurrentBody::Pou(fb_decl.name.name.clone()));
     compile_body(&mut fb_emitter, ctx, &fb_decl.body, &fb_decl.name.span())?;
-    ctx.current_body = saved_body;
     fb_emitter.emit_ret_void();
 
     ctx.current_function_id = saved_current_fn;
 
     let finalized = finalize_function(&mut fb_emitter, ctx)?;
 
-    // Note: `ctx`'s variable mappings are intentionally NOT restored
-    // here (unlike `compile_user_function`). This type's METHODs (OOP
-    // extension, ADR-0041 Phase 1) are compiled next, right after this
-    // function returns, and need `ctx.variables` to still hold this
-    // type's field mappings for `self` access. The program-level scope is
-    // returned instead, and the caller (`compile_program_with_functions`)
-    // swaps it back in once both this body and its methods are compiled.
+    ctx.scope = caller;
 
-    Ok((
-        CompiledFunction {
-            function_id,
-            bytecode: finalized.bytecode,
-            max_stack_depth: finalized.max_stack_depth,
-            max_temp_depth: finalized.max_temp_depth,
-            num_locals,
-            num_params: 0,
-            name: fb_name,
-            line_map: finalized.line_map,
-        },
-        program_scope,
-    ))
+    Ok(CompiledFunction {
+        function_id,
+        bytecode: finalized.bytecode,
+        max_stack_depth: finalized.max_stack_depth,
+        max_temp_depth: finalized.max_temp_depth,
+        num_locals,
+        num_params: 0,
+        name: fb_name,
+        line_map: finalized.line_map,
+    })
 }

@@ -16,17 +16,18 @@
 //! differ. A type's representation never changes once it is entered; the
 //! fields of a block are looked up by the block's id.
 //!
-//! A block's fields, the names of its properties, the signatures of its
-//! methods and the block it `EXTENDS` are recorded together, once (see
+//! A block's fields, the signatures of its properties and of its methods,
+//! and the block it `EXTENDS` are recorded together, once (see
 //! [`TypeEnvironment::record_block`]), so they cannot come from two
 //! declarations. Everything that follows `EXTENDS` after the environment is
 //! built follows the base recorded here.
 
-use ironplc_dsl::common::TypeName;
+use ironplc_dsl::common::{AddressAssignment, DeclarationQualifier, TypeName};
 use ironplc_dsl::core::Id;
 use ironplc_dsl::type_id::TypeId;
 
 use super::methods::MethodSignature;
+use super::properties::PropertySignature;
 use super::TypeEnvironment;
 use crate::intermediates::stdlib_function_block::StandardField;
 use crate::semantic_type::FunctionBlockVarType;
@@ -43,6 +44,11 @@ pub struct BlockField {
     /// not resolve, which a rule reports. The variable is a field all the
     /// same, so that a call still names it.
     pub field_type: Option<TypeId>,
+    /// The qualifier the variable is declared with, such as `RETAIN`;
+    /// `Unspecified` for a field of a standard block.
+    pub qualifier: DeclarationQualifier,
+    /// The direct address the variable is declared at (`AT %I*`), if any.
+    pub address: Option<AddressAssignment>,
 }
 
 /// What the environment records about a function block.
@@ -50,10 +56,10 @@ pub struct BlockField {
 pub(super) struct BlockRecord {
     /// The fields the block declares, in the order it declares them.
     fields: Vec<BlockField>,
-    /// The names of the properties the block declares. A selection on an
-    /// instance may name one as it names a field; property access is not
-    /// implemented, so nothing records a property's type.
-    properties: Vec<Id>,
+    /// The signatures of the properties the block declares, in the order it
+    /// declares them. A selection on an instance may name one as it names a
+    /// field; property access is not implemented.
+    properties: Vec<PropertySignature>,
     /// The signatures of the methods the block declares, in the order it
     /// declares them; not those it inherits.
     methods: Vec<MethodSignature>,
@@ -89,8 +95,8 @@ impl TypeEnvironment {
     }
 
     /// Records the fields of the function block `block`, in the order it
-    /// declares them, the names of its properties, the signatures of its
-    /// methods, and the block it `EXTENDS`.
+    /// declares them, the signatures of its properties and of its methods,
+    /// and the block it `EXTENDS`.
     ///
     /// A block is recorded once: a later call for the same block, such as
     /// for a repeated declaration of its name (P4013) or a library block
@@ -107,7 +113,7 @@ impl TypeEnvironment {
         &mut self,
         block: TypeId,
         fields: Vec<BlockField>,
-        properties: Vec<Id>,
+        properties: Vec<PropertySignature>,
         methods: Vec<MethodSignature>,
         base: Option<TypeId>,
     ) {
@@ -144,6 +150,8 @@ impl TypeEnvironment {
                     name: field.name.clone(),
                     var_type: field.var_type,
                     field_type: Some(self.id_of(&elementary)?),
+                    qualifier: DeclarationQualifier::Unspecified,
+                    address: None,
                 })
             })
             .collect();
@@ -169,8 +177,19 @@ impl TypeEnvironment {
     /// `block`: one the block declares, or one it inherits through
     /// `EXTENDS`.
     pub fn has_property(&self, block: TypeId, name: &Id) -> bool {
-        self.inherited_records(block)
-            .any(|record| record.properties.contains(name))
+        self.property(block, name).is_some()
+    }
+
+    /// The property `name` of an instance of the function block `block`:
+    /// one the block declares, else the one the nearest block it inherits
+    /// from through `EXTENDS` declares.
+    pub(crate) fn property(&self, block: TypeId, name: &Id) -> Option<&PropertySignature> {
+        self.inherited_records(block).find_map(|record| {
+            record
+                .properties
+                .iter()
+                .find(|property| property.name == *name)
+        })
     }
 
     /// The method `name` of an instance of the function block `block`, and
@@ -359,6 +378,18 @@ mod tests {
             name: Id::from(name),
             var_type,
             field_type: env.id_of(&TypeName::from("INT")),
+            qualifier: DeclarationQualifier::Unspecified,
+            address: None,
+        }
+    }
+
+    /// A property `name` whose type is not recorded, with a `GET` accessor.
+    fn property(name: &str) -> PropertySignature {
+        PropertySignature {
+            name: Id::from(name),
+            property_type: None,
+            get: true,
+            set: false,
         }
     }
 
@@ -400,14 +431,14 @@ mod tests {
         env.record_block(
             derived,
             vec![a.clone()],
-            vec![Id::from("Kept")],
+            vec![property("Kept")],
             vec![],
             Some(first),
         );
         env.record_block(
             derived,
             vec![b],
-            vec![Id::from("Dropped")],
+            vec![property("Dropped")],
             vec![],
             Some(second),
         );
@@ -677,5 +708,26 @@ END_FUNCTION_BLOCK";
         let env = context.types();
 
         assert_eq!(env.has_property(id(env, block), &Id::from(name)), expected);
+    }
+
+    #[rstest]
+    #[case::own("Mode", "INT")]
+    #[case::inherited("Speed", "REAL")]
+    fn property_when_block_or_base_declares_it_then_its_type_and_accessors(
+        #[case] name: &str,
+        #[case] property_type: &str,
+    ) {
+        let context = selections();
+        let env = context.types();
+
+        assert_eq!(
+            env.property(id(env, "Derived"), &Id::from(name)),
+            Some(&PropertySignature {
+                name: Id::from(name),
+                property_type: Some(id(env, property_type)),
+                get: true,
+                set: false,
+            })
+        );
     }
 }

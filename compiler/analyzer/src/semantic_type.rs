@@ -99,6 +99,11 @@ pub enum SemanticType {
         /// The members, their ordinals and the default. Not compared by
         /// `PartialEq` (see [`EnumerationMembers`]).
         members: EnumerationMembers,
+        /// The integer or bit string type the declaration names for its
+        /// values (`(A, B) WORD`, behind `--allow-enum-base-type`), if it
+        /// names one. It gives `SIZEOF` its size, and changes neither how
+        /// the enumeration is stored nor how it is operated on.
+        underlying_type: Option<Box<SemanticType>>,
     },
     /// Structure type containing named fields
     Structure {
@@ -131,6 +136,14 @@ pub enum SemanticType {
     /// here would be a copy that could go stale.
     FunctionBlock {
         /// Name of the function block type
+        name: String,
+    },
+    /// Interface type (OOP extension). A value of this type refers to a
+    /// function block instance that implements the interface. Its runtime
+    /// representation is not decided yet (ADR-0041 Phase 2), so it has no
+    /// size and cannot be laid out.
+    Interface {
+        /// Name of the interface type
         name: String,
     },
     /// Reference type (REF_TO) pointing to a target type.
@@ -187,6 +200,11 @@ impl SemanticType {
             SemanticType::Subrange { base_type, .. } => base_type,
             other => other,
         }
+    }
+
+    /// Returns if the type is an interface.
+    pub fn is_interface(&self) -> bool {
+        matches!(self, SemanticType::Interface { .. })
     }
 
     /// Returns if the type is a function block.
@@ -279,6 +297,7 @@ impl SemanticType {
             | SemanticType::Array { .. }
             | SemanticType::Subrange { .. }
             | SemanticType::FunctionBlock { .. }
+            | SemanticType::Interface { .. }
             | SemanticType::Reference { .. } => None,
         }
     }
@@ -464,7 +483,9 @@ impl SemanticType {
             }
 
             // Not yet supported in data region
-            SemanticType::FunctionBlock { .. } => Err(SlotCountError::UnsupportedFieldType),
+            SemanticType::FunctionBlock { .. } | SemanticType::Interface { .. } => {
+                Err(SlotCountError::UnsupportedFieldType)
+            }
         }
     }
 }
@@ -843,6 +864,7 @@ mod tests {
         assert_eq!(
             SemanticType::Enumeration {
                 members: crate::enumeration_members::EnumerationMembers::default(),
+                underlying_type: None,
             }
             .slot_count(),
             Ok(1)

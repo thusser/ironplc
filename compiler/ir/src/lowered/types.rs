@@ -17,15 +17,65 @@ use super::invariant::broken;
 use super::scalar::{ScalarType, Signedness};
 use crate::execution::DebugName;
 
-/// The section a field of a function block or program is declared in.
-/// A field lowering synthesizes is `Internal`.
+/// The section a variable or a field is declared in.
+///
+/// A field of a function block or program is an `Input`, `Output`, `InOut`
+/// or `Local`, or `Internal` when lowering synthesizes it. A variable is one
+/// of those but `Internal`, or a `Global`, a `Temporary` (a `VAR_TEMP`, or a
+/// temporary lowering makes), or an `Instance`: the instance parameter of a
+/// body, or the instance of a program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
+    Global,
     Input,
     Output,
     InOut,
     Local,
+    Temporary,
+    Instance,
     Internal,
+}
+
+/// Where a variable's or a field's value comes from, as its declaration
+/// states it: `x AT %IX0.1 : BOOL` (REQ-LOW-lowering-023).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectAddress {
+    pub area: AddressArea,
+    pub size: AddressSize,
+    /// The numbers of the address, `[0, 1]` for `%IX0.1`.
+    pub path: Vec<u32>,
+}
+
+/// The area a direct address is in: `%I`, `%Q` or `%M`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressArea {
+    Input,
+    Output,
+    Memory,
+}
+
+/// The size a direct address names: a bit (`%IX0.1` or `%I0.1`), a byte, a
+/// word, a double word or a long word, or `Unspecified` (`%I*`), which the
+/// configuration assigns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressSize {
+    Bit,
+    Byte,
+    Word,
+    DoubleWord,
+    LongWord,
+    Unspecified,
+}
+
+/// Whether a variable or a field keeps its value through a warm restart, as
+/// its declaration states (REQ-LOW-lowering-024).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// The declaration states none.
+    None,
+    Retain,
+    NonRetain,
+    Persistent,
 }
 
 /// Whether a reference can hold `NULL`.
@@ -140,6 +190,11 @@ pub struct Field {
     /// of a structure.
     pub section: Option<Section>,
     pub ty: TypeId,
+    /// The direct address the field's declaration gives it, if any: a
+    /// program's located variable is a field of its instance.
+    pub location: Option<DirectAddress>,
+    /// The retention the field's declaration states.
+    pub retention: Retention,
 }
 
 /// One value of an enumeration.
@@ -175,6 +230,11 @@ pub enum TypeKind {
     /// enumeration is operated at the operation type of a `DINT`, as the
     /// bytecode backend does today (REQ-EN-codegen-003).
     Enumeration {
+        /// The integer or bit string type its values are declared in
+        /// (REQ-LOW-ir-192), which gives `SIZEOF` its size and changes
+        /// neither how a backend stores nor how it operates on the
+        /// enumeration.
+        underlying: TypeId,
         values: Vec<EnumerationValue>,
     },
     /// The integers from `min` to `max` of the integer type `base`.
@@ -226,7 +286,9 @@ pub struct TypeEntry {
 #[derive(Clone, Debug)]
 pub struct TypeTable {
     stamp: Stamp,
-    entries: Vec<TypeEntry>,
+    /// Each type's entry, by index; `None` for a type declared and not
+    /// defined (REQ-LOW-ir-194).
+    entries: Vec<Option<TypeEntry>>,
 }
 
 impl TypeTable {
@@ -239,13 +301,15 @@ impl TypeTable {
 
     /// Adds `entry` and returns the id that names it.
     ///
-    /// Every type the entry refers to is already in the table. A subrange's
-    /// base is an integer type whose range holds `min` to `max`, an array has
-    /// at least one dimension and each lower bound is at most its upper
-    /// bound, a structure's fields have no section, a function block's or
-    /// program's fields each have one, and a function block that extends
-    /// another begins with that block's fields (REQ-LOW-ir-176). An entry
-    /// that breaks one of these is a P9998 and is not added.
+    /// Every type the entry refers to is already in the table, defined, but
+    /// for a reference's target, which may be declared and not defined yet
+    /// (REQ-LOW-ir-194). A subrange's base is an integer type whose range
+    /// holds `min` to `max`, an array has at least one dimension and each
+    /// lower bound is at most its upper bound, a structure's fields have no
+    /// section, a function block's or program's fields each have one, and a
+    /// function block that extends another begins with that block's fields
+    /// (REQ-LOW-ir-176). An entry that breaks one of these is a P9998 and is
+    /// not added.
     pub(crate) fn push(
         &mut self,
         entry: TypeEntry,
@@ -254,14 +318,64 @@ impl TypeTable {
         self.check(&entry.kind)
             .map_err(|what| broken("TypeTable::push", span, what))?;
         let id = TypeId::new(self.stamp, self.entries.len() as u32);
-        self.entries.push(entry);
+        self.entries.push(Some(entry));
         Ok(id)
+    }
+
+    /// Declares a type that [`TypeTable::define`] gives its entry later, and
+    /// returns the id that names it, so that a reference can refer to it
+    /// first: a function block that refers to itself through a reference
+    /// field (REQ-LOW-ir-194). Until it is defined the type has no entry.
+    pub(crate) fn declare(&mut self) -> TypeId {
+        let id = TypeId::new(self.stamp, self.entries.len() as u32);
+        self.entries.push(None);
+        id
+    }
+
+    /// Gives the type `id` declares its entry, which is one
+    /// [`TypeTable::push`] would add. An id the table did not declare, or
+    /// one already defined, is a P9998, as is an entry `push` would refuse.
+    pub(crate) fn define(
+        &mut self,
+        id: TypeId,
+        entry: TypeEntry,
+        span: &SourceSpan,
+    ) -> Result<(), Diagnostic> {
+        if !matches!(self.slot(id), Some(None)) {
+            return Err(broken(
+                "TypeTable::define",
+                span,
+                format!("{id} is not a type declared and not defined"),
+            ));
+        }
+        self.check(&entry.kind)
+            .map_err(|what| broken("TypeTable::define", span, what))?;
+        self.entries[id.index() as usize] = Some(entry);
+        Ok(())
+    }
+
+    /// The slot of `id`: `Some(None)` for a type declared and not defined,
+    /// and `None` for an id the table does not hold.
+    fn slot(&self, id: TypeId) -> Option<&Option<TypeEntry>> {
+        if id.stamp() != self.stamp {
+            return None;
+        }
+        self.entries.get(id.index() as usize)
     }
 
     /// Why `kind` cannot be added to the table, if it cannot.
     fn check(&self, kind: &TypeKind) -> Result<(), String> {
         let known = |id: &TypeId| {
             if self.get(*id).is_some() {
+                Ok(())
+            } else {
+                Err(format!("{id} is not in the table"))
+            }
+        };
+        // A reference may refer to a type that is declared and not defined
+        // yet (REQ-LOW-ir-194); every other part of a type is defined.
+        let declared = |id: &TypeId| {
+            if self.slot(*id).is_some() {
                 Ok(())
             } else {
                 Err(format!("{id} is not in the table"))
@@ -283,8 +397,16 @@ impl TypeTable {
             | TypeKind::BitString { .. }
             | TypeKind::Real { .. }
             | TypeKind::Temporal { .. }
-            | TypeKind::Enumeration { .. }
             | TypeKind::String(_) => Ok(()),
+            TypeKind::Enumeration { underlying, .. } => {
+                known(underlying)?;
+                match self.kind(*underlying) {
+                    Some(TypeKind::Integer { .. } | TypeKind::BitString { .. }) => Ok(()),
+                    _ => Err(format!(
+                        "enumeration underlying {underlying} is not an integer or bit string"
+                    )),
+                }
+            }
             TypeKind::Subrange { base, min, max } => {
                 known(base)?;
                 let Some(TypeKind::Integer { .. }) = self.kind(*base) else {
@@ -321,7 +443,7 @@ impl TypeTable {
                 }
             }
             TypeKind::Program { fields, .. } => sections(fields, true),
-            TypeKind::Reference { target, .. } => known(target),
+            TypeKind::Reference { target, .. } => declared(target),
         }
     }
 
@@ -365,7 +487,7 @@ impl TypeTable {
 
     /// Whether the function block type `block` is `base`, or extends it
     /// directly or through the blocks it extends (REQ-LOW-ir-176). The walk
-    /// ends, since a block's base is in the table before the block is.
+    /// ends, since a block's base is defined before the block is.
     pub fn extends(&self, block: TypeId, base: TypeId) -> bool {
         let mut block = block;
         loop {
@@ -383,12 +505,9 @@ impl TypeTable {
     }
 
     /// The entry of `id`, or `None` if the table has none, as for an id
-    /// another program's table allocated.
+    /// another program's table allocated, or one declared and not defined.
     pub fn get(&self, id: TypeId) -> Option<&TypeEntry> {
-        if id.stamp() != self.stamp {
-            return None;
-        }
-        self.entries.get(id.index() as usize)
+        self.slot(id)?.as_ref()
     }
 
     /// What `id` is, or `None` if the table has no entry `id`.
@@ -396,12 +515,15 @@ impl TypeTable {
         self.get(id).map(|entry| &entry.kind)
     }
 
-    /// Every type, with its id, in the order they were added.
+    /// Every type that has an entry, with its id, in the order they were
+    /// added or declared.
     pub fn iter(&self) -> impl Iterator<Item = (TypeId, &TypeEntry)> {
         self.entries
             .iter()
             .enumerate()
-            .map(|(index, entry)| (TypeId::new(self.stamp, index as u32), entry))
+            .filter_map(|(index, entry)| {
+                Some((TypeId::new(self.stamp, index as u32), entry.as_ref()?))
+            })
     }
 
     /// The type a value of `id` is operated at; `None` for a type that is
@@ -486,7 +608,7 @@ impl TypeTable {
     /// when `id` is not an enumeration or has no value there.
     pub fn enumeration_ordinal(&self, id: TypeId, position: usize) -> Option<i32> {
         match self.kind(id)? {
-            TypeKind::Enumeration { values } => values.get(position).map(|value| value.ordinal),
+            TypeKind::Enumeration { values, .. } => values.get(position).map(|value| value.ordinal),
             TypeKind::Bool
             | TypeKind::Integer { .. }
             | TypeKind::BitString { .. }
@@ -701,12 +823,23 @@ fn wide_integer(width: WideWidth, signedness: Signedness) -> ScalarType {
 }
 
 impl Field {
-    /// A field named `name`, declared at `span`.
+    /// A field named `name`, declared at `span`, with no direct address and
+    /// no retention.
     pub fn new(name: &str, span: SourceSpan, section: Option<Section>, ty: TypeId) -> Self {
         Self {
             name: DebugName::new(name, span),
             section,
             ty,
+            location: None,
+            retention: Retention::None,
         }
+    }
+
+    /// This field, at the direct address `location`, with the retention
+    /// `retention`, as its declaration states them.
+    pub fn declared(mut self, location: Option<DirectAddress>, retention: Retention) -> Self {
+        self.location = location;
+        self.retention = retention;
+        self
     }
 }

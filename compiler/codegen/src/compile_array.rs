@@ -37,7 +37,7 @@ pub(crate) struct ArraySpec {
 
 /// Metadata for a single dimension of an array, used for index computation.
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DimensionInfo {
     pub lower_bound: i32,
     pub size: u32,
@@ -46,6 +46,7 @@ pub(crate) struct DimensionInfo {
 
 /// Metadata for an array variable, stored in CompileContext.
 #[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ArrayVarInfo {
     pub var_index: VarIndex,
     pub desc_index: u16,
@@ -186,11 +187,11 @@ pub(crate) fn resolve_symbolic_access<'ctx, 'ast>(
                     SymbolicVariableKind::Named(named) => {
                         levels.reverse();
                         let all_subscripts: Vec<&Expr> = levels.into_iter().flatten().collect();
-                        let info = ctx.array_vars.get(&named.name).ok_or_else(|| {
+                        let info = ctx.array_var(&named.name).ok_or_else(|| {
                             // An element of an array of structures spans
                             // several slots, so it has no single-value load or
                             // store; only its fields are addressable.
-                            if ctx.struct_array_vars.contains_key(&named.name) {
+                            if ctx.struct_array_var(&named.name).is_some() {
                                 Diagnostic::not_implemented(Label::span(
                                     named.name.span(),
                                     format!(
@@ -220,8 +221,7 @@ pub(crate) fn resolve_symbolic_access<'ctx, 'ast>(
                                 let all_subscripts: Vec<&Expr> =
                                     levels.into_iter().flatten().collect();
                                 let info = ctx
-                                    .array_vars
-                                    .get(&named.name)
+                                    .array_var(&named.name)
                                     .ok_or_else(|| Diagnostic::todo_with_span(named.name.span()))?;
                                 return Ok(ResolvedAccess::DerefArrayElement {
                                     info,
@@ -303,7 +303,7 @@ pub(crate) fn resolve_struct_field_array<'ctx, 'ast>(
         )));
     };
 
-    let struct_info = ctx.struct_vars.get(&root_name).ok_or_else(|| {
+    let struct_info = ctx.struct_var(&root_name).ok_or_else(|| {
         Diagnostic::not_implemented(Label::span(
             structured.span(),
             format!("Variable '{}' is not a structure", root_name),
@@ -648,11 +648,7 @@ pub(crate) fn register_array_variable(
 
     // 4. Register descriptor in the container and get its index
     let (element_type_byte, element_extra) = if is_string {
-        let element_field_type = if string_char_width.is_wide() {
-            ironplc_container::FieldType::WString
-        } else {
-            ironplc_container::FieldType::String
-        };
+        let element_field_type = ironplc_container::FieldType::string(string_char_width);
         (element_field_type as u8, string_max_len)
     } else {
         (var_type_info_to_type_byte(&element_vti), 0)
@@ -669,6 +665,7 @@ pub(crate) fn register_array_variable(
 
     // 6. Store in context
     ctx.array_vars.insert(
+        ctx.scope,
         id.clone(),
         ArrayVarInfo {
             var_index,

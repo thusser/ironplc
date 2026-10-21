@@ -57,8 +57,7 @@ fn lower_statement_when_method_called_then_call_with_receiver_first() {
 
 /// REQ-LOW-lowering-092, REQ-LOW-lowering-172: a method's outputs are
 /// passed as references to temporaries, and assigned from them after the
-/// call: after a `Call` statement, or between the call and the assignment
-/// of its result.
+/// call: after a `Call` statement, or as the stores of an in-place call.
 #[test]
 fn lower_statement_when_method_with_outputs_called_then_outputs_after_call() {
     let outcome = lower(
@@ -76,9 +75,8 @@ fn lower_statement_when_method_with_outputs_called_then_outputs_after_call() {
         [
             "call pou2 (ref v0^.f0) (const i32s 2) (ref v6) (ref v7)\n\
              assign v0^.f1 (read i32s v6)",
-            "assign v10 (call pou2 i32s (ref v0^.f0) (const i32s 3) (ref v8) (ref v9))\n\
-             assign v0^.f2 (bool_not bool (read bool v9))\n\
-             assign v0^.f3 (convert i64s (read i32s v10))",
+            "assign v0^.f3 (convert i64s (call-in-place pou2 i32s (ref v0^.f0) (const i32s 3) \
+             (ref v8) (ref v9) {assign v0^.f2 (bool_not bool (read bool v9))}))",
         ]
     );
 }
@@ -204,10 +202,12 @@ fn lower_statement_when_method_inherited_from_base_without_fields_then_call_of_b
 
 /// REQ-LOW-lowering-177: a block whose type does not begin with the fields
 /// of the block it extends, as one that extends a block with a field does
-/// while inherited fields are not in its type, extends no block in the
-/// lowered program, so a call of a method it inherits is not lowered.
+/// while inherited fields are not in its type, records as its base the
+/// nearest block above that declares none. So a call of a method it
+/// inherits from that block, through the block with the field, is a call
+/// of that block's method.
 #[test]
-fn lower_statement_when_method_inherited_through_block_with_fields_then_unsupported() {
+fn lower_statement_when_method_inherited_through_block_with_fields_then_call_of_base_method() {
     let outcome = lower(
         &format!(
             "{INHERITED}
@@ -217,5 +217,37 @@ fn lower_statement_when_method_inherited_through_block_with_fields_then_unsuppor
         ),
         "main",
     );
-    assert_eq!(outcome.statements, ["unsupported"]);
+    assert_eq!(
+        outcome.statements,
+        ["assign v0^.f1 (call pou4 i32s (ref v0^.f0) (const i32s 1))"]
+    );
+}
+
+/// REQ-LOW-lowering-187: a method whose result is a structure or an array
+/// is declared without a result, so a call of it, which only a statement
+/// can make, is a `Call` statement, followed by the stores of its outputs.
+#[test]
+fn lower_statement_when_method_result_is_aggregate_then_call_statement() {
+    let outcome = lower(
+        "TYPE P : STRUCT x : DINT; END_STRUCT; END_TYPE
+         TYPE A3 : ARRAY[1..3] OF DINT; END_TYPE
+         FUNCTION_BLOCK BP VAR n : DINT; END_VAR
+           METHOD MKP : P VAR_INPUT v : DINT; END_VAR n := n + v; END_METHOD
+           METHOD MKA : A3 VAR_INPUT v : DINT; END_VAR VAR_OUTPUT k : DINT; END_VAR
+             k := n;
+           END_METHOD
+         END_FUNCTION_BLOCK
+         PROGRAM main VAR b : BP; r : DINT; END_VAR
+           b.MKP(v := 3);
+           b.MKA(v := 2, k => r);
+         END_PROGRAM",
+        "main",
+    );
+    assert_eq!(
+        outcome.statements,
+        [
+            "call pou2 (ref v0^.f0) (const i32s 3)",
+            "call pou3 (ref v0^.f0) (const i32s 2) (ref v8)\nassign v0^.f1 (read i32s v8)",
+        ]
+    );
 }

@@ -3,7 +3,7 @@
 
 use rstest::rstest;
 
-use crate::compile_route_lowered::{assert_same_code, run_lowered};
+use crate::compile_route_lowered::{assert_same_code, run_lowered, run_lowered_agreeing};
 
 /// Functions the tests call: one of three `DINT`s, two returning an `INT`,
 /// one that calls another, and one whose local starts from its initial value
@@ -149,4 +149,181 @@ fn compile_when_in_out_call_lowered_then_same_code_as_ast(#[case] statement: &st
          END_PROGRAM"
     );
     assert_same_code(&source);
+}
+
+/// REQ-LOW-lowering-075: a structure or array input of a function or method
+/// is passed as the route that reads the AST passes it, the offset of the
+/// argument's region, so each call compiles to the same code and leaves
+/// every variable as that route leaves it. Neither route compiles a read of
+/// such an input in the callee's body.
+#[test]
+fn run_when_aggregate_input_passed_then_same_code_as_ast() {
+    let source = "
+        TYPE P : STRUCT x : DINT; y : DINT; END_STRUCT; END_TYPE
+        TYPE A3 : ARRAY[1..3] OF DINT; END_TYPE
+        FUNCTION SUMP : DINT VAR_INPUT q : P; n : DINT; END_VAR SUMP := n; END_FUNCTION
+        FUNCTION SUMA : DINT
+          VAR_INPUT q : A3; END_VAR VAR_OUTPUT o : DINT; END_VAR
+          SUMA := 8;
+          o := 1;
+        END_FUNCTION
+        FUNCTION_BLOCK BP METHOD M : DINT VAR_INPUT q : P; END_VAR M := 5; END_METHOD
+        END_FUNCTION_BLOCK
+        PROGRAM main
+          VAR pt : P := (x := 1, y := 2); a3 : A3; f : BP; r1 : DINT; r2 : DINT; r3 : DINT;
+              k : DINT; END_VAR
+          r1 := SUMP(q := pt, n := 7);
+          r2 := SUMA(q := a3, o => k) + 1;
+          r3 := f.M(q := pt);
+        END_PROGRAM";
+    assert_same_code(source);
+    let snapshot = run_lowered_agreeing(source);
+    assert_eq!(snapshot.read_as::<i32>("r1"), 7);
+    assert_eq!(snapshot.read_as::<i32>("r2"), 9);
+    assert_eq!(snapshot.read_as::<i32>("k"), 1);
+    assert_eq!(snapshot.read_as::<i32>("r3"), 5);
+}
+
+/// Blocks with methods whose results are a structure and an array, which a
+/// call can only discard.
+const AGGREGATE_RESULTS: &str = "
+    TYPE P : STRUCT x : DINT; y : DINT; END_STRUCT; END_TYPE
+    TYPE A3 : ARRAY[1..3] OF DINT; END_TYPE
+    FUNCTION_BLOCK BP VAR n : DINT; END_VAR VAR_OUTPUT o : DINT; END_VAR
+      METHOD MKP : P VAR_INPUT v : DINT; END_VAR n := n + v; END_METHOD
+      METHOD MKA : A3 VAR_INPUT v : DINT; END_VAR VAR_OUTPUT k : DINT; END_VAR
+        n := n * v; k := n;
+      END_METHOD
+    END_FUNCTION_BLOCK";
+
+/// REQ-LOW-lowering-187: a call of a method whose result is a structure or
+/// an array, which a statement discards, compiles to the same code as by the
+/// route that reads the AST, with an output stored after it, and the call
+/// changes the instance's fields as on that route.
+#[rstest]
+#[case::structure_result("b.MKP(v := 3);")]
+#[case::array_result_with_output("b.MKA(v := 2, k => r);")]
+fn compile_when_method_aggregate_result_discarded_then_same_code_as_ast(#[case] statement: &str) {
+    let source = format!(
+        "{AGGREGATE_RESULTS}
+         PROGRAM main VAR b : BP; r : DINT; END_VAR
+           {statement}
+         END_PROGRAM"
+    );
+    assert_same_code(&source);
+}
+
+/// REQ-LOW-lowering-187: calls of methods whose results are a structure and
+/// an array leave every variable as the route that reads the AST leaves
+/// them.
+#[test]
+fn run_when_method_aggregate_result_discarded_then_routes_agree() {
+    let snapshot = run_lowered_agreeing(&format!(
+        "{AGGREGATE_RESULTS}
+         PROGRAM main VAR b : BP; r : DINT; END_VAR
+           b.MKP(v := 3);
+           b.MKA(v := 2, k => r);
+         END_PROGRAM"
+    ));
+    assert_eq!(snapshot.read_as::<i32>("r"), 6);
+}
+
+/// Functions with a `VAR_IN_OUT` of a `DINT` and of a type declared as
+/// `DINT`.
+const IN_OUT_ALIASES: &str = "
+    TYPE MyInt : DINT; END_TYPE
+    FUNCTION F : DINT VAR_IN_OUT x : DINT; END_VAR x := x + 1; F := x; END_FUNCTION
+    FUNCTION G : DINT VAR_IN_OUT x : MyInt; END_VAR x := x * 2; G := x; END_FUNCTION";
+
+/// REQ-LOW-lowering-072: a variable of a type declared as `DINT` passed for
+/// a `VAR_IN_OUT` of a `DINT`, and the reverse, compile to the same code as
+/// by the route that reads the AST.
+#[rstest]
+#[case::argument_of_alias_type("r := F(x := a);")]
+#[case::parameter_of_alias_type("r := G(x := d);")]
+fn compile_when_in_out_argument_type_is_alias_then_same_code_as_ast(#[case] statement: &str) {
+    let source = format!(
+        "{IN_OUT_ALIASES}
+         PROGRAM main VAR a : MyInt := 4; d : DINT := 5; r : DINT; END_VAR
+           {statement}
+         END_PROGRAM"
+    );
+    assert_same_code(&source);
+}
+
+/// REQ-LOW-lowering-072: the callee writes the caller's variable through a
+/// `VAR_IN_OUT` whose type is an alias of the variable's, or the reverse.
+#[test]
+fn run_when_in_out_argument_type_is_alias_then_callee_writes_it() {
+    let snapshot = run_lowered_agreeing(&format!(
+        "{IN_OUT_ALIASES}
+         PROGRAM main VAR a : MyInt := 4; d : DINT := 5; r1 : DINT; r2 : DINT; END_VAR
+           r1 := F(x := a);
+           r2 := G(x := d);
+         END_PROGRAM"
+    ));
+    assert_eq!(snapshot.read_as::<i32>("a"), 5);
+    assert_eq!(snapshot.read_as::<i32>("r1"), 5);
+    assert_eq!(snapshot.read_as::<i32>("d"), 10);
+    assert_eq!(snapshot.read_as::<i32>("r2"), 10);
+}
+
+/// Blocks and a function whose inputs are an instance of a block, a standard
+/// block and a structure, none of which their bodies call or read.
+const INSTANCE_INPUTS: &str = "
+    TYPE P : STRUCT x : DINT; END_STRUCT; END_TYPE
+    FUNCTION_BLOCK INNER VAR_INPUT v : DINT; END_VAR VAR_OUTPUT q : DINT; END_VAR q := v; END_FUNCTION_BLOCK
+    FUNCTION_BLOCK OUTER VAR_INPUT inner : INNER; p : P; END_VAR END_FUNCTION_BLOCK
+    FUNCTION SUMP : DINT VAR_INPUT q : P; END_VAR SUMP := 6; END_FUNCTION
+    FUNCTION_BLOCK BP
+      METHOD Go : DINT VAR_INPUT i : INNER; d : DINT; END_VAR Go := d * 2; END_METHOD
+      METHOD Tm : DINT VAR_INPUT t : TON; END_VAR Tm := 3; END_METHOD
+    END_FUNCTION_BLOCK";
+
+/// REQ-LOW-lowering-075: a method's input of a function block type, of a
+/// user-defined or a standard block, and an input taken from a field of
+/// another instance, are passed as the route that reads the AST passes
+/// them: the slot of the instance or of the field, which holds the data
+/// offset of the instance's fields or of the field's value.
+#[rstest]
+#[case::instance("r := b.Go(i := f, d := 5);")]
+#[case::standard_instance("r := b.Tm(t := t);")]
+#[case::field_of_instance("r := b.Go(i := g.inner, d := 1);")]
+#[case::structure_field_of_instance("r := SUMP(q := g.p);")]
+fn compile_when_instance_or_field_input_lowered_then_same_code_as_ast(#[case] statement: &str) {
+    let source = format!(
+        "{INSTANCE_INPUTS}
+         PROGRAM main
+           VAR f : INNER; g : OUTER; b : BP; t : TON; r : DINT; END_VAR
+           {statement}
+         END_PROGRAM"
+    );
+    assert_same_code(&source);
+}
+
+/// Instances and fields of instances passed as inputs leave every variable
+/// as the route that reads the AST leaves it: the instance keeps its own
+/// fields, and the methods and the function return what their scalar inputs
+/// give. Neither route compiles a call or a read of such an input in the
+/// callee's body (issue 1553).
+#[test]
+fn run_when_instance_or_field_input_passed_then_routes_agree() {
+    let snapshot = run_lowered_agreeing(&format!(
+        "{INSTANCE_INPUTS}
+         PROGRAM main
+           VAR f : INNER; g : OUTER; b : BP; t : TON;
+               r1 : DINT; r2 : DINT; r3 : DINT; r4 : DINT; q : DINT; END_VAR
+           f(v := 4);
+           r1 := b.Go(i := f, d := 5);
+           r2 := b.Tm(t := t);
+           r3 := b.Go(i := g.inner, d := 2);
+           r4 := SUMP(q := g.p);
+           q := f.q;
+         END_PROGRAM"
+    ));
+    assert_eq!(snapshot.read_as::<i32>("r1"), 10);
+    assert_eq!(snapshot.read_as::<i32>("r2"), 3);
+    assert_eq!(snapshot.read_as::<i32>("r3"), 4);
+    assert_eq!(snapshot.read_as::<i32>("r4"), 6);
+    assert_eq!(snapshot.read_as::<i32>("q"), 4);
 }

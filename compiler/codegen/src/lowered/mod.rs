@@ -1,11 +1,13 @@
 //! Compiles a statement from the lowered program rather than from the AST
 //! (`specs/design/lowered-program.md`, "Delivery Constraints").
 //!
-//! While both routes exist, codegen asks lowering for each top-level
-//! statement of a body. When lowering supports the statement and everything
-//! inside it, the statement is emitted from the lowered program; otherwise it
-//! is compiled from the AST, as before. Both routes emit into the same body
-//! through the same emitter.
+//! While both routes exist, lowering lowers the whole library once, before
+//! codegen emits anything ([`ironplc_lowering::Lowering::lower_program`]),
+//! and codegen reads what each top-level statement of a body lowered to, by
+//! the body's POU and the statement's index. When lowering supports the
+//! statement and everything inside it, the statement is emitted from the
+//! lowered program; otherwise it is compiled from the AST, as before. Both
+//! routes emit into the same body through the same emitter.
 //!
 //! A lowered statement finds its variables' storage in the layout codegen
 //! already builds, through the current body's scope, by the name lowering
@@ -22,41 +24,43 @@ use ironplc_dsl::core::{Id, Located, SourceSpan};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
 use ironplc_dsl::textual::StmtKind as AstStmtKind;
 use ironplc_ir::lowered::{
-    Arg, Callee, Const, Expr, ExprKind, Field, NarrowWidth, Nullability, Place as LoweredPlace,
+    Arg, Callee, Const, Expr, ExprKind, FieldIdx, NarrowWidth, Nullability, Place as LoweredPlace,
     PouId, Projection, ScalarType, Signedness as LoweredSignedness, Stmt, StmtKind, TypeId,
     TypeKind, VarId,
 };
-use ironplc_lowering::{Lowering, StatementLowering};
+use ironplc_lowering::{PartialProgram, StatementLowering};
 
-use crate::compile::{CompileContext, CurrentBody, OpType, OpWidth, Signedness, UserFunctionInfo};
+use crate::compile::{CompileContext, OpType, OpWidth, Signedness, UserFunctionInfo};
 use crate::compile_subscript::subscript_check;
 use crate::compile_user_call::passes_by_reference;
 use crate::emit::Emitter;
+use crate::layout::ids::LaidOut;
 
 mod aggregate;
 mod call_args;
 mod expr;
 mod fb_call;
 mod fn_call;
+mod instance_copy;
 mod method;
 mod place;
 mod policy;
+mod slot_copy;
 mod stmt;
 mod string;
-mod string_result;
 
 use call_args::passes;
+pub(crate) use place::type_info;
 pub(crate) use policy::parse_policy;
-pub(crate) use string_result::StringResults;
 
 /// Which route codegen compiles a statement by.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     /// Every statement from the AST.
-    #[default]
     Ast,
     /// The lowered statement, where lowering supports it, and the AST for
     /// every other.
+    #[default]
     PreferLowered,
     /// The lowered statement; a statement lowering does not support yet is a
     /// P9999.
@@ -73,77 +77,90 @@ pub struct RouteCounts {
     pub from_ast: usize,
 }
 
-/// The lowering a compilation asks, and what it has made of the statements
-/// so far.
-pub(crate) struct LoweredRoute<'a> {
-    lowering: Lowering<'a>,
+/// The program lowering made for a compilation, and how many statements
+/// took each route so far.
+pub(crate) struct LoweredRoute {
+    lowering: PartialProgram,
     require: bool,
+    /// Whether the layout built from the lowered declarations is checked
+    /// equal to the one built from the AST.
+    check_layout: bool,
     pub(crate) counts: RouteCounts,
 }
 
-impl<'a> LoweredRoute<'a> {
-    /// The lowered route for `route`, or `None` when every statement is
-    /// compiled from the AST.
-    pub(crate) fn new(route: Route, lowering: impl FnOnce() -> Lowering<'a>) -> Option<Self> {
+impl LoweredRoute {
+    /// The program lowering made.
+    pub(crate) fn lowering(&self) -> &PartialProgram {
+        &self.lowering
+    }
+
+    /// Whether the layout built from the lowered declarations is checked
+    /// equal to the one built from the AST.
+    pub(crate) fn check_layout(&self) -> bool {
+        self.check_layout
+    }
+
+    /// The lowered route for `route`, with the program `lower` lowers, or
+    /// `None` when every statement is compiled from the AST, which lowers
+    /// nothing. A P9998 lowering reports fails the compilation.
+    pub(crate) fn new(
+        route: Route,
+        check_layout: bool,
+        lower: impl FnOnce() -> Result<PartialProgram, Vec<Diagnostic>>,
+    ) -> Result<Option<Self>, Diagnostic> {
         let require = match route {
-            Route::Ast => return None,
+            Route::Ast => return Ok(None),
             Route::PreferLowered => false,
             Route::RequireLowered => true,
         };
-        Some(Self {
-            lowering: lowering(),
+        let lowering = lower().map_err(|diagnostics| {
+            diagnostics
+                .into_iter()
+                .next()
+                .unwrap_or_else(Diagnostic::internal_error)
+        })?;
+        Ok(Some(Self {
+            lowering,
             require,
+            check_layout,
             counts: RouteCounts::default(),
-        })
+        }))
     }
 }
 
-/// Compiles the top-level statement `stmt` of the current body from the
-/// lowered program, if the route asks for it and lowering supports it.
-/// Returns `false` when the statement is left to the AST.
+/// Compiles `stmt`, the top-level statement at `index` of the current body,
+/// from the lowered program, if the route asks for it and lowering supports
+/// it. Returns `false` when the statement is left to the AST.
 pub(crate) fn try_compile_statement(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
+    index: usize,
     stmt: &AstStmtKind,
 ) -> Result<bool, Diagnostic> {
     let Some(mut route) = ctx.lowered_route.take() else {
         return Ok(false);
     };
-    let compiled = compile_by_route(&mut route, emitter, ctx, stmt);
+    let compiled = compile_by_route(&mut route, emitter, ctx, index, stmt);
     ctx.lowered_route = Some(route);
     compiled
 }
 
 fn compile_by_route(
-    route: &mut LoweredRoute<'_>,
+    route: &mut LoweredRoute,
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
+    index: usize,
     stmt: &AstStmtKind,
 ) -> Result<bool, Diagnostic> {
-    let lowering = match ctx.current_body.clone() {
-        Some(CurrentBody::Pou(pou)) => route.lowering.lower_statement_of(&pou, stmt)?,
-        Some(CurrentBody::Method { block, method }) => route
-            .lowering
-            .lower_method_statement_of(&block, &method, stmt)?,
-        None => StatementLowering::Unsupported,
+    let lowering = &route.lowering;
+    let lowered = match current_pou(ctx).and_then(|pou| lowering.statement(pou, index)) {
+        Some(StatementLowering::Lowered(lowered)) => Some(lowered),
+        Some(StatementLowering::Unsupported) | None => None,
     };
-    let lowered = match lowering {
-        StatementLowering::Lowered(lowered) => Some(lowered),
-        StatementLowering::Unsupported => None,
-    };
-    // The calls with a string result moved out of the statement, which are
-    // emitted where their results are read (`string_result.rs`).
-    ctx.string_results = match &lowered {
-        Some(lowered) => StringResults::of(&route.lowering, ctx, lowered),
-        None => StringResults::default(),
-    };
-    let compiled = match lowered {
-        Some(lowered) if can_emit_all(&route.lowering, ctx, &lowered) => {
+    match lowered {
+        Some(lowered) if can_emit_all(lowering, ctx, lowered) => {
             crate::compile_stmt::record_statement_position(emitter, ctx, stmt);
-            stmt::emit_stmts(emitter, ctx, &route.lowering, &lowered)?;
-            if !ctx.string_results.is_empty() {
-                return Err(string_result::not_emitted(&statement_span(stmt)));
-            }
+            stmt::emit_stmts(emitter, ctx, lowering, lowered)?;
             route.counts.lowered += 1;
             Ok(true)
         }
@@ -155,9 +172,7 @@ fn compile_by_route(
             route.counts.from_ast += 1;
             Ok(false)
         }
-    };
-    ctx.string_results = StringResults::default();
-    compiled
+    }
 }
 
 /// Where `stmt` is, for a diagnostic about it.
@@ -177,9 +192,10 @@ fn statement_span(stmt: &AstStmtKind) -> ironplc_dsl::core::SourceSpan {
 }
 
 /// Whether this backend emits every statement of `stmts`, as `stmt.rs` emits
-/// them: the parts of an assignment of a call of a function with outputs
-/// together (`fn_call.rs`), and any other statement on its own.
-fn can_emit_all(lowering: &Lowering<'_>, ctx: &CompileContext, stmts: &[Stmt]) -> bool {
+/// them: a call statement, the stores of its outputs and, for a function
+/// whose result is a structure, the copy of its result together
+/// (`fn_call.rs`), and any other statement on its own.
+fn can_emit_all(lowering: &PartialProgram, ctx: &CompileContext, stmts: &[Stmt]) -> bool {
     let mut rest = stmts;
     while let [first, ..] = rest {
         let taken = match fn_call::output_call(lowering, ctx, rest) {
@@ -196,7 +212,7 @@ fn can_emit_all(lowering: &Lowering<'_>, ctx: &CompileContext, stmts: &[Stmt]) -
 /// Whether every place `stmt` names has storage this backend reaches as one
 /// value, at the operation type the lowered program gives it. A statement
 /// whose storage this backend does not reach yet is compiled from the AST.
-fn can_emit(lowering: &Lowering<'_>, ctx: &CompileContext, stmt: &Stmt) -> bool {
+fn can_emit(lowering: &PartialProgram, ctx: &CompileContext, stmt: &Stmt) -> bool {
     let all = |stmts: &[Stmt]| can_emit_all(lowering, ctx, stmts);
     match stmt.kind() {
         StmtKind::Assign { place, value } => {
@@ -242,41 +258,29 @@ fn can_emit(lowering: &Lowering<'_>, ctx: &CompileContext, stmt: &Stmt) -> bool 
         StmtKind::Loop {
             body, continuing, ..
         } => all(body) && all(continuing),
-        StmtKind::Copy { dst, src } => aggregate::can_emit(lowering, ctx, dst, src),
+        StmtKind::Copy { dst, src } => {
+            aggregate::can_emit(lowering, ctx, dst, src)
+                || instance_copy::instance_copy(lowering, ctx, dst, src).is_some()
+                || slot_copy::slot_copy(lowering, ctx, dst, src).is_some()
+        }
         StmtKind::FbCall { instance, block } => {
             fb_call::reaches_block(lowering, ctx, instance, *block)
         }
-        // A call with a string result is emitted where its result is read
-        // (`string_result.rs`); any other call statement with the
-        // assignments of its outputs (`can_emit_all`).
-        StmtKind::Call { .. } => {
-            string_result::is_moved(ctx, stmt) && string_result::call_can_emit(lowering, ctx, stmt)
-        }
+        // A call statement is emitted with the stores of its outputs and the
+        // copy of its result (`can_emit_all`).
+        StmtKind::Call { .. } => false,
         StmtKind::Exit(_) | StmtKind::Continue(_) | StmtKind::Return => true,
     }
 }
 
-fn expr_can_emit(lowering: &Lowering<'_>, ctx: &CompileContext, expr: &Expr) -> bool {
-    expr_can_emit_reading(lowering, ctx, expr, &[])
-}
-
-/// Whether this backend emits `expr`, in which a read of the whole of one of
-/// `results` takes the value a call left on the stack (`fn_call.rs`).
-fn expr_can_emit_reading(
-    lowering: &Lowering<'_>,
-    ctx: &CompileContext,
-    expr: &Expr,
-    results: &[VarId],
-) -> bool {
+/// Whether this backend emits `expr`.
+fn expr_can_emit(lowering: &PartialProgram, ctx: &CompileContext, expr: &Expr) -> bool {
     if op_type(expr.ty()).is_none() {
         return false;
     }
     match expr.kind() {
         ExprKind::Const(_) | ExprKind::Null => true,
-        ExprKind::Read(place) => {
-            (place.path().is_empty() && results.contains(&place.root()))
-                || reads(lowering, ctx, place, expr.ty())
-        }
+        ExprKind::Read(place) => reads(lowering, ctx, place, expr.ty()),
         // A reference to a variable, or to what a `VAR_IN_OUT` parameter
         // refers to, as the AST route makes one.
         ExprKind::RefTo(place) => place::variable_name(lowering, ctx, place).is_some(),
@@ -284,27 +288,25 @@ fn expr_can_emit_reading(
         | ExprKind::Convert(value)
         | ExprKind::ConvertChecked(value)
         | ExprKind::Unary { value, .. } => {
-            operation_can_emit(expr) && expr_can_emit_reading(lowering, ctx, value, results)
+            operation_can_emit(expr) && expr_can_emit(lowering, ctx, value)
         }
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::Compare { lhs, rhs, .. }
         | ExprKind::ShortCircuit { lhs, rhs, .. } => {
-            expr_can_emit_reading(lowering, ctx, lhs, results)
-                && expr_can_emit_reading(lowering, ctx, rhs, results)
+            expr_can_emit(lowering, ctx, lhs) && expr_can_emit(lowering, ctx, rhs)
         }
         ExprKind::Call {
             callee: Callee::User(pou),
             args,
-        } => match user_function(lowering, ctx, *pou) {
+        } => match user_function(ctx, *pou) {
             Some(function) => {
-                passes(&function.params, args.iter())
-                    && args_can_emit_reading(lowering, ctx, args, results)
+                passes(&function.params, args.iter()) && args_can_emit(lowering, ctx, args)
             }
             // A method's value: its receiver, then an argument for each input.
             None => method::method_site(lowering, ctx, *pou, args).is_some_and(|site| {
                 site.has_return_value
                     && site.takes(args[1..].iter())
-                    && args_can_emit_reading(lowering, ctx, &args[1..], results)
+                    && args_can_emit(lowering, ctx, &args[1..])
             }),
         },
         ExprKind::Call {
@@ -312,9 +314,9 @@ fn expr_can_emit_reading(
             args,
         } => {
             expr::instruction_of(*intrinsic, args.len()).is_some()
-                && args_can_emit_reading(lowering, ctx, args, results)
+                && args_can_emit(lowering, ctx, args)
         }
-        ExprKind::InPlaceCall(_) => false,
+        ExprKind::InPlaceCall(call) => fn_call::in_place_can_emit(lowering, ctx, call),
     }
 }
 
@@ -344,54 +346,43 @@ fn operation_can_emit(expr: &Expr) -> bool {
     }
 }
 
+/// Whether this backend passes each of `args`.
 fn args_can_emit<'s>(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     args: impl IntoIterator<Item = &'s Arg>,
-) -> bool {
-    args_can_emit_reading(lowering, ctx, args, &[])
-}
-
-/// Whether this backend passes each of `args`, in which a read of the whole
-/// of one of `results` takes the value a call left on the stack.
-fn args_can_emit_reading<'s>(
-    lowering: &Lowering<'_>,
-    ctx: &CompileContext,
-    args: impl IntoIterator<Item = &'s Arg>,
-    results: &[VarId],
 ) -> bool {
     args.into_iter().all(|arg| match arg {
-        Arg::Value(value) => expr_can_emit_reading(lowering, ctx, value, results),
+        Arg::Value(value) => expr_can_emit(lowering, ctx, value),
         Arg::Str(value) => string::str_can_emit(lowering, ctx, value),
         Arg::Ref(place) => place::variable_name(lowering, ctx, place)
             .is_some_and(|name| passes_by_reference(ctx, &name)),
+        Arg::Copy(place) => aggregate::reaches_argument(lowering, ctx, place),
     })
 }
 
-/// The function `pou` as this backend's layout knows it, by the name the
-/// lowered program keeps on the POU, when it returns a value or a string's
-/// buffer on the stack: not a structure. `None` for any other function.
-pub(super) fn user_function(
-    lowering: &Lowering<'_>,
-    ctx: &CompileContext,
-    pou: PouId,
-) -> Option<UserFunctionInfo> {
-    // A method is called by `METHOD_CALL` (`method.rs`), whatever its name.
-    if lowering.pous().method_of(pou).is_some() {
-        return None;
+/// The function `pou` as this backend's layout knows it, when it returns a
+/// value or a string's buffer on the stack: not a structure. `None` for any
+/// other function.
+pub(super) fn user_function(ctx: &CompileContext, pou: PouId) -> Option<UserFunctionInfo> {
+    callee_function(ctx, pou).filter(|function| function.return_struct_desc_index.is_none())
+}
+
+/// The function `pou` as this backend's layout knows it, whatever its
+/// result: one whose result is a structure leaves the offset of the
+/// structure's region on the stack. `None` for a method.
+pub(super) fn callee_function(ctx: &CompileContext, pou: PouId) -> Option<UserFunctionInfo> {
+    // A method is called by `METHOD_CALL` (`method.rs`).
+    match ctx.lowered_ids.pou(pou)? {
+        LaidOut::Function(name) => ctx.user_function(name).cloned(),
+        LaidOut::Program | LaidOut::Block(_) | LaidOut::Method { .. } => None,
     }
-    let name = lowering.pous().name(pou)?.to_string().to_lowercase();
-    let function = ctx.user_functions.get(&name)?;
-    function
-        .return_struct_desc_index
-        .is_none()
-        .then(|| function.clone())
 }
 
 /// Whether `place` has storage this backend reaches as one value of type
 /// `ty`.
 fn reaches(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     place: &LoweredPlace,
     ty: ScalarType,
@@ -405,7 +396,7 @@ fn reaches(
 /// storage, or through the reference its storage holds, as one value of the
 /// type the place gives what that reference refers to.
 fn reads(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     place: &LoweredPlace,
     ty: ScalarType,
@@ -426,7 +417,7 @@ fn reads(
 
 /// Whether this backend emits every subscript on the way to `place`.
 fn subscripts_can_emit(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     place: &LoweredPlace,
 ) -> bool {
@@ -439,25 +430,41 @@ fn subscripts_can_emit(
 }
 
 /// The name this backend's layout knows a variable `place` by: the
-/// variable's name, or the name of a field of the current instance, which
-/// this backend copies into a slot of that name. `None` for any other place.
-pub(super) fn storage_name(lowering: &Lowering<'_>, place: &LoweredPlace) -> Option<Id> {
+/// variable's name, or the name of the slot a field of the current instance
+/// is copied into. `None` for any other place, and for a variable the
+/// current body does not see by that name.
+pub(super) fn storage_name(
+    lowering: &PartialProgram,
+    ctx: &CompileContext,
+    place: &LoweredPlace,
+) -> Option<Id> {
     let root = lowering.variables().get(place.root())?;
     if place.path().is_empty() {
-        return Some(Id::from(&root.name().to_string()));
+        return seen_name(ctx, place.root()).cloned();
     }
-    let (field, rest) = instance_field(lowering, root.ty(), place.path())?;
-    rest.is_empty().then(|| Id::from(&field.name.to_string()))
+    let (instance, field, rest) = instance_field(lowering, root.ty(), place.path())?;
+    if !rest.is_empty() {
+        return None;
+    }
+    ctx.lowered_ids.field(instance, field).cloned()
+}
+
+/// The name the layout knows the variable `var` by, when the current body
+/// sees it by that name; `None` for a variable the layout keeps no slot for,
+/// or one the current body does not see.
+pub(super) fn seen_name(ctx: &CompileContext, var: VarId) -> Option<&Id> {
+    let (scope, name) = ctx.lowered_ids.variable(var)?;
+    ctx.sees(*scope, name).then_some(name)
 }
 
 /// When `path` starts by reaching a field of the current instance through the
-/// instance parameter, of type `root`: that field, and the projections after
-/// it. `None` for any other path.
-pub(super) fn instance_field<'l, 'p>(
-    lowering: &'l Lowering<'_>,
+/// instance parameter, of type `root`: the instance's type, that field, and
+/// the projections after it. `None` for any other path.
+pub(super) fn instance_field<'p>(
+    lowering: &PartialProgram,
     root: TypeId,
     path: &'p [Projection],
-) -> Option<(&'l Field, &'p [Projection])> {
+) -> Option<(TypeId, FieldIdx, &'p [Projection])> {
     let [deref, field, rest @ ..] = path else {
         return None;
     };
@@ -472,28 +479,19 @@ pub(super) fn instance_field<'l, 'p>(
     if !is_instance(lowering, root) {
         return None;
     }
-    let types = lowering.types();
-    let (instance, _) = types.reference(root)?;
-    let declared = types.fields(instance)?.get(field.index() as usize)?;
-    Some((declared, rest))
+    let (instance, _) = lowering.types().reference(root)?;
+    Some((instance, *field, rest))
+}
+
+/// The POU whose body is compiled in the current scope; `None` for a body
+/// lowering did not lower.
+pub(super) fn current_pou(ctx: &CompileContext) -> Option<PouId> {
+    ctx.lowered_ids.pou_in(ctx.scope)
 }
 
 /// Whether `pou` is the body being compiled.
-pub(super) fn is_current_body(lowering: &Lowering<'_>, ctx: &CompileContext, pou: PouId) -> bool {
-    let pous = lowering.pous();
-    let named = |pou: PouId, name: &Id| {
-        pous.name(pou)
-            .is_some_and(|named| Id::from(&named.to_string()) == *name)
-    };
-    match (&ctx.current_body, pous.method_of(pou)) {
-        (Some(CurrentBody::Pou(name)), None) => named(pou, name),
-        (Some(CurrentBody::Method { block, method }), Some(of)) => {
-            named(pou, method) && named(of, block)
-        }
-        (Some(CurrentBody::Pou(_)), Some(_))
-        | (Some(CurrentBody::Method { .. }), None)
-        | (None, _) => false,
-    }
+pub(super) fn is_current_body(ctx: &CompileContext, pou: PouId) -> bool {
+    ctx.lowered_ids.scope(pou) == Some(ctx.scope)
 }
 
 /// Whether two spans are the same text. `SourceSpan`'s own equality holds
@@ -564,7 +562,7 @@ pub(super) fn read(expr: &Expr) -> Option<&LoweredPlace> {
 /// non-null reference to a program or function block through which the body
 /// reaches its own fields. A `REF_TO` is nullable, and lowering binds no
 /// other non-null reference yet, so no other variable is one.
-fn is_instance(lowering: &Lowering<'_>, ty: TypeId) -> bool {
+fn is_instance(lowering: &PartialProgram, ty: TypeId) -> bool {
     let types = lowering.types();
     types.reference(ty).is_some_and(|(target, nullability)| {
         nullability == Nullability::NonNull

@@ -74,7 +74,11 @@ pub(crate) fn compile_string_compare(
         CompareOp::Gt => emitter.emit_gt_i32(),
         CompareOp::LtEq => emitter.emit_le_i32(),
         CompareOp::GtEq => emitter.emit_ge_i32(),
-        _ => {
+        CompareOp::And
+        | CompareOp::Or
+        | CompareOp::Xor
+        | CompareOp::AndThen
+        | CompareOp::OrElse => {
             // Callers pass only comparison operators.
             return Err(Diagnostic::internal_error_at(Label::span(
                 span,
@@ -143,7 +147,7 @@ pub(crate) fn resolve_string_arg(
     // bug.
     if let ExprKind::Variable(variable) = &arg.kind {
         if let Some(var_name) = resolve_variable_name(variable) {
-            if let Some(info) = ctx.string_vars.get(var_name) {
+            if let Some(info) = ctx.string_var(var_name) {
                 if info.char_width != char_width {
                     return Err(encoding_mismatch(char_width, info.char_width, func_span));
                 }

@@ -8,10 +8,10 @@ use ironplc_ir::lowered::{
     Arg, BinaryOp, Callee, CompareOp, Const, Expr, ExprKind, Intrinsic, NarrowWidth, Place,
     ShortCircuitOp, UnaryOp,
 };
-use ironplc_lowering::Lowering;
+use ironplc_lowering::PartialProgram;
 
 use super::call_args::emit_passed;
-use super::fn_call::take_result;
+use super::fn_call::emit_in_place;
 use super::method::{emit_method_call, method_site};
 use super::place::{resolve_load, variable_name, Load};
 use super::policy::parse_builtin;
@@ -30,7 +30,7 @@ use crate::emit::Emitter;
 pub(super) fn emit_expr(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     expr: &Expr,
 ) -> Result<(), Diagnostic> {
     let op = op_type(expr.ty()).ok_or_else(|| {
@@ -41,9 +41,6 @@ pub(super) fn emit_expr(
     })?;
     match expr.kind() {
         ExprKind::Const(constant) => emit_constant(emitter, ctx, *constant),
-        // The result of a call with outputs, which the call left on the
-        // stack (`fn_call.rs`).
-        ExprKind::Read(place) if take_result(ctx, place) => {}
         ExprKind::Read(place) => match resolve_load(lowering, ctx, place, expr.span())? {
             Load::Stored(storage) => storage.emit_load(emitter, ctx)?,
             Load::Referenced(storage) => {
@@ -131,7 +128,7 @@ pub(super) fn emit_expr(
             callee: Callee::User(pou),
             args,
         } => {
-            if let Some(function) = user_function(lowering, ctx, *pou) {
+            if let Some(function) = user_function(ctx, *pou) {
                 emit_user_call(emitter, ctx, lowering, &function, args, expr.span())?;
             } else {
                 // `can_emit` leaves to the AST a call of a function or
@@ -152,19 +149,9 @@ pub(super) fn emit_expr(
             callee: Callee::Intrinsic(intrinsic),
             args,
         } => emit_intrinsic_call(emitter, ctx, lowering, *intrinsic, args, expr.span())?,
-        // `can_emit` leaves a statement with an in-place call to the AST.
-        ExprKind::InPlaceCall(_) => return Err(in_place_not_emitted(expr.span())),
+        ExprKind::InPlaceCall(call) => emit_in_place(emitter, ctx, lowering, call, expr.span())?,
     }
     Ok(())
-}
-
-/// The internal error for an in-place call, which `can_emit` leaves to the
-/// AST route.
-pub(super) fn in_place_not_emitted(span: &SourceSpan) -> Diagnostic {
-    Diagnostic::internal_error_at(Label::span(
-        span.clone(),
-        "An in-place call this backend does not emit",
-    ))
 }
 
 /// Applies `expr`, an operation of one operand, to the value of its operand
@@ -220,7 +207,7 @@ pub(super) fn emit_operation(emitter: &mut Emitter, expr: &Expr) -> Result<(), D
 pub(super) fn emit_user_call<'s>(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     function: &UserFunctionInfo,
     args: impl IntoIterator<Item = &'s Arg>,
     span: &SourceSpan,
@@ -229,11 +216,12 @@ pub(super) fn emit_user_call<'s>(
     if let Some(result) = &function.return_string_info {
         emitter.emit_str_init(result.data_offset, result.max_length, result.char_width);
     }
+    let stack_depth = ctx.function_stack_depth(function.function_id, span)?;
     emitter.emit_call(
         function.function_id,
         function.num_params,
         function.var_offset,
-        function.max_stack_depth,
+        stack_depth,
     );
     ctx.record_call_edge(function.function_id);
     Ok(())
@@ -244,7 +232,7 @@ pub(super) fn emit_user_call<'s>(
 pub(super) fn emit_intrinsic_call(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     intrinsic: Intrinsic,
     args: &[Arg],
     span: &SourceSpan,
@@ -289,7 +277,7 @@ pub(super) fn emit_intrinsic_call(
 fn emit_args<'s>(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     args: impl IntoIterator<Item = &'s Arg>,
     span: &SourceSpan,
 ) -> Result<Vec<u32>, Diagnostic> {
@@ -299,6 +287,13 @@ fn emit_args<'s>(
             Arg::Value(value) => emit_expr(emitter, ctx, lowering, value)?,
             Arg::Str(value) => strings.push(str_arg_offset(emitter, ctx, lowering, value)?),
             Arg::Ref(place) => emit_ref(emitter, ctx, lowering, place, span)?,
+            // No intrinsic takes an aggregate (REQ-LOW-ir-145).
+            Arg::Copy(_) => {
+                return Err(Diagnostic::internal_error_at(Label::span(
+                    span.clone(),
+                    "An aggregate argument of an intrinsic",
+                )))
+            }
         }
     }
     Ok(strings)
@@ -309,7 +304,7 @@ fn emit_args<'s>(
 pub(super) fn emit_ref(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     place: &Place,
     span: &SourceSpan,
 ) -> Result<(), Diagnostic> {

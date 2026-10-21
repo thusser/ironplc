@@ -189,8 +189,8 @@ fn compile_when_inherited_method_called_then_lowered_route_leaves_it() {
 }
 
 /// A block with a method of a result and no fields, a block that extends it
-/// with a field of its own, and two levels of blocks that extend it with
-/// none.
+/// with a field of its own, two levels of blocks that extend it with none,
+/// and a block that extends it through the block with the field.
 const INHERITED: &str = "
     FUNCTION_BLOCK Base
       METHOD Get : DINT
@@ -200,22 +200,25 @@ const INHERITED: &str = "
     END_FUNCTION_BLOCK
     FUNCTION_BLOCK Derived EXTENDS Base VAR n : DINT; END_VAR END_FUNCTION_BLOCK
     FUNCTION_BLOCK Middle EXTENDS Base END_FUNCTION_BLOCK
-    FUNCTION_BLOCK Leaf EXTENDS Middle END_FUNCTION_BLOCK";
+    FUNCTION_BLOCK Leaf EXTENDS Middle END_FUNCTION_BLOCK
+    FUNCTION_BLOCK Under EXTENDS Derived END_FUNCTION_BLOCK";
 
 /// REQ-LOW-lowering-177: a method a block inherits from one that declares no
-/// fields runs on an instance of the derived block, and through a block in
-/// between.
+/// fields runs on an instance of the derived block, through a block in
+/// between, and through a block in between that declares a field.
 #[test]
 fn run_when_method_inherited_from_base_without_fields_then_base_method_runs() {
     let snapshot = run_lowered(&format!(
         "{INHERITED}
-         PROGRAM main VAR d : Derived; l : Leaf; r1 : DINT; r2 : DINT; END_VAR
+         PROGRAM main VAR d : Derived; l : Leaf; u : Under; r1 : DINT; r2 : DINT; r3 : DINT; END_VAR
            r1 := d.Get(k := 2);
            r2 := l.Get(k := 4) + 1;
+           r3 := u.Get(k := 3);
          END_PROGRAM"
     ));
     assert_eq!(snapshot.read_as::<i32>("r1"), 20);
     assert_eq!(snapshot.read_as::<i32>("r2"), 41);
+    assert_eq!(snapshot.read_as::<i32>("r3"), 30);
 }
 
 /// REQ-LOW-codegen-178: a call of a method a block inherits from one that
@@ -226,13 +229,62 @@ fn run_when_method_inherited_from_base_without_fields_then_base_method_runs() {
 #[case::stored_result("r := d.Get(k := 2);")]
 #[case::unused_result("d.Get(k := 3);")]
 #[case::through_block_in_between("r := l.Get(k := 4) + 1;")]
+#[case::through_block_with_field("r := u.Get(k := 5);")]
 fn compile_when_method_inherited_from_base_without_fields_then_same_code_as_ast(
     #[case] statement: &str,
 ) {
     assert_same_code(&format!(
         "{INHERITED}
-         PROGRAM main VAR d : Derived; l : Leaf; r : DINT; END_VAR
+         PROGRAM main VAR d : Derived; l : Leaf; u : Under; r : DINT; END_VAR
            {statement}
          END_PROGRAM"
     ));
+}
+
+/// A block of `fields` `DINT` fields, the last of them 7, whose method
+/// `Last` reads the last, and a program that stores the method's result in
+/// `r`, both as a statement and through a call with an output.
+fn wide_block(fields: usize) -> String {
+    let last = fields - 1;
+    let others: String = (0..last).map(|i| format!("f{i} : DINT; ")).collect();
+    format!(
+        "FUNCTION_BLOCK Wide
+           VAR {others}f{last} : DINT := 7; END_VAR
+           METHOD Last : DINT
+             VAR_OUTPUT copy : DINT; END_VAR
+             copy := f{last};
+             Last := f{last};
+           END_METHOD
+         END_FUNCTION_BLOCK
+         PROGRAM main
+           VAR w : Wide; r : DINT; o : DINT; END_VAR
+           r := w.Last();
+           w.Last(copy => o);
+         END_PROGRAM"
+    )
+}
+
+/// REQ-LOW-codegen-191: a method of a block of 255 fields, as many as
+/// `METHOD_CALL` counts, runs on every one of them.
+#[test]
+fn run_when_method_of_block_with_255_fields_called_then_reads_last_field() {
+    let snapshot = run_lowered(&wide_block(255));
+    assert_eq!(snapshot.read_as::<i32>("r"), 7);
+    assert_eq!(snapshot.read_as::<i32>("o"), 7);
+}
+
+/// REQ-LOW-codegen-191: a block of 256 fields is P9997 on every route,
+/// rather than a method call that copies the wrong fields.
+#[rstest]
+#[case::ast(Route::Ast)]
+#[case::required(Route::RequireLowered)]
+#[case::preferred(Route::PreferLowered)]
+fn compile_when_method_of_block_with_256_fields_called_then_p9997(#[case] route: Route) {
+    let options = options();
+    let (library, context) = parse(&wide_block(256), &options);
+    let compiled = compile_by_route(&library, &context, &options, route);
+    assert_eq!(
+        compiled.err().map(|diagnostic| diagnostic.code),
+        Some("P9997".to_string())
+    );
 }

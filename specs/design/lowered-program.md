@@ -504,6 +504,7 @@ pub struct Program {
     pub pous: Vec<Pou>,                // indexed by PouId
     pub init: Vec<Stmt>,               // initial values of every global and instance, run once
     pub execution: ExecutionModel,     // resources, tasks and program instances (execution-model.md)
+    pub bindings: ExecutionBindings,   // what each id of the model is in this program
 }
 
 pub struct Variable {
@@ -550,15 +551,24 @@ pub struct Field {
     pub name: Id,
     pub section: Option<Section>,      // Internal for a synthesized field
     pub ty: TypeId,
+    pub location: Option<DirectAddress>, // a program's `x AT %IX0.1`
+    pub retention: Retention,
     pub span: SourceSpan,
 }
 ```
 
 What runs and when is the execution model that `ironplc-ir` already holds
 ([The Resolved Execution Model](execution-model.md)). The lowered program
-holds it rather than repeating it, and its `ProgramId` and `GlobalId` become,
-or are replaced by, the `PouId` of the program's body and the `VarId` of the
-global.
+holds it unchanged rather than repeating it, and binds each of its entries to
+the program's own: each `ProgramId` to the `PouId` of the program's body,
+each `GlobalId` to the `VarId` of the global, and each program instance to
+the `VarId` of the global that holds it. A backend reads what runs from the
+model and where it lives from the bindings.
+
+**REQ-LOW-ir-029** A lowered program is finished only when every POU has its
+parts and its body, every function and method its signature, every global of
+the execution model is bound to a global variable, and every instance of a
+program type is bound to a global variable of that program's type.
 
 A program, like a function block, has an instance: the global that a program
 configuration declares holds it, and the program's variables are the fields of
@@ -579,7 +589,11 @@ lowered.
 
 **REQ-LOW-lowering-170** The type of a program, or of a function block the
 library declares, has one field for each variable it declares other than a
-`VAR_TEMP` or a `VAR_EXTERNAL`, in the order it declares them.
+`VAR_TEMP` or a `VAR_EXTERNAL`, in the order it declares them. A program's
+access paths (`VAR_ACCESS`) and its located variables with no name, which no
+statement names, are no fields, nor are the global variables a PLCopen XML
+program declares in its interface (`<globalVars>`), which are global
+variables.
 
 A function block type may record its *base*, the function block type it
 extends. It then begins with the base's fields, of the same names, sections
@@ -590,17 +604,35 @@ passes for a reference to an instance of its base (REQ-LOW-ir-173), with
 nothing converted. A backend lays a block's fields out so that its base's
 come first, laid out as the base's are.
 
-Lowering records a block's base when the block's lowered fields begin with
-the base type's. While a block's lowered type has only the fields it declares
-itself, that is so only when the base's type has no fields, so a block that
-extends one with a field records no base and extends nothing in the lowered
-program. When lowering gives a block the fields it inherits, it takes them
-from the type environment's `instance_fields`, which lists them from the root
-of the `EXTENDS` chain down, so every block then records its base.
+Lowering records as a block's base the nearest block of its `EXTENDS` chain
+whose type's fields the block's lowered fields begin with. While a block's
+lowered type has only the fields it declares itself, that is the nearest block
+above it that declares no fields: a block that extends one with a field
+records the nearest block above that declares none, if one does, and extends
+only that block and the blocks above it in the lowered program. When lowering
+gives a block the fields it inherits, it takes them from the type
+environment's `instance_fields`, which lists them from the root of the
+`EXTENDS` chain down, so every block then records the block it extends.
 
 **REQ-LOW-ir-176** A function block type that records a base begins with the
 base's fields, of the same names, sections and types, and the type table
 refuses one that does not.
+
+A type's parts are in the table before it is, with one exception: a function
+block can refer to itself through a reference field, the usual linked list
+(`next : REF_TO Node` in `Node`). Such a type is declared before it is
+defined: the table gives it its id first, a reference to it can then be
+added, and the type is defined with its fields at that id.
+
+**REQ-LOW-lowering-195** Lowering declares a function block type when a
+reference reaches it again while its fields are being lowered, directly or
+through other types, and defines it at that id once they are. A type that
+reaches itself in any other way is not lowered yet.
+
+**REQ-LOW-ir-194** Only a reference refers to a type that is declared and not
+defined; every other part of a type is a type the table defines. A declared
+type is defined once, with an entry the table would add. One that is never
+defined has no entry, so nothing finds its kind or fields.
 
 The type table describes types as the language defines them. The width of an
 `INT` is part of the language; where a field sits in memory, how many slots a
@@ -616,6 +648,19 @@ does a `CASE` label naming one. Every enumeration operates as a `DINT`, and
 analysis reports an ordinal outside its range (P2044, REQ-EN-codegen-084), so
 each ordinal fits one; lowering reports one that does not as P9998.
 
+An enumeration's entry also names its underlying type: the integer or bit
+string type its declaration names for its values (`(A, B) WORD`, behind
+`--allow-enum-base-type`), or `INT` when it names none, as in CODESYS and
+TwinCAT. It is part of the language rather than a layout: it gives `SIZEOF`
+its size (REQ-LOW-lowering-103), and changes neither how a backend stores an
+enumeration nor how it operates on one.
+
+**REQ-LOW-ir-192** An enumeration's entry names its underlying type, an
+integer or bit string type in the table.
+
+**REQ-LOW-lowering-190** An enumeration's underlying type is the type its
+declaration names, or `INT` when it names none.
+
 **REQ-LOW-lowering-027** The type table holds no size, offset or slot count,
 and refers to the type of every field, element, enumeration, subrange and
 reference target by its `TypeId`.
@@ -629,11 +674,16 @@ and ignored. A native backend that drives real I/O, or keeps retained variables
 in non-volatile memory, needs both, so the lowered program carries them rather
 than dropping them a stage earlier.
 
-**REQ-LOW-lowering-023** A variable declared with a direct address carries
-that address.
+A program's and a function block's variables are fields of its instance (see
+[Program, POUs and variables](#32-program-pous-and-variables)), so a field
+carries its location and retention as a variable does. A program's located
+variable, and a block's `RETAIN` variable, are fields.
 
-**REQ-LOW-lowering-024** A variable carries the retention qualifier of its
-declaration (`RETAIN`, `NON_RETAIN` or `PERSISTENT`), or none if its
+**REQ-LOW-lowering-023** A variable or field declared with a direct address
+carries that address.
+
+**REQ-LOW-lowering-024** A variable or field carries the retention qualifier
+of its declaration (`RETAIN`, `NON_RETAIN` or `PERSISTENT`), or none if its
 declaration has none.
 
 Initial values are statements because that is how the bytecode VM applies
@@ -660,6 +710,21 @@ initializer (`t : MyFb := (x := 7)`) needs no further mechanism. The locals of
 a function or method, and the `VAR_TEMP` of any body, are re-initialized by
 statements at the head of the body.
 
+**REQ-LOW-lowering-194** `init` stores the completed initializer of every
+declared global, in the execution model's order, and then of every field of
+every program instance, in declaration order, through the place that holds
+it: a scalar with `Assign`, a string with `AssignStr`, and an array, a
+structure or a function block instance element by element and field by field.
+
+`init` stores every value, one that leaves its storage cleared included.
+Whether a store can be left out because the backend's storage starts cleared
+is the backend's to say.
+
+**REQ-LOW-lowering-195** The body of a function or method begins with the
+stores of the completed initializer of each of its declarations the analyzer
+flags as starting again on every call (`VarDecl::reset_on_call`: its `VAR`,
+`VAR_TEMP` and `VAR_OUTPUT`), in declaration order, and then of its result.
+
 **REQ-LOW-lowering-025** The lowered program contains only POUs reachable from
 a program instance, matching what `SemanticContext::reachable` gives codegen
 today.
@@ -671,6 +736,24 @@ is never generated. A library with no program instance therefore lowers
 nothing. A library with a `PROGRAM` but no `CONFIGURATION` has instances: the
 execution model gives it an implicit configuration whose instances make its
 programs reachable.
+
+**REQ-LOW-lowering-193** Every declaration of every reachable POU, and every
+global of the execution model, has its variable or field in the lowered
+program, whether or not a statement names it, in declaration order within its
+POU.
+
+Lowering declares them all before it lowers any statement, so a statement
+that names one reaches the variable already declared.
+
+**REQ-LOW-lowering-197** The lowered program gives, for each body, what each
+of its declarations declares, in the order the body declares them: a field
+of its instance, a variable of its own, or the global a `VAR_EXTERNAL`
+names. It gives the variable that holds each function's and method's result,
+and tells a variable a declaration declares from a temporary lowering makes.
+
+A backend lays out its storage from them in the order the source declares
+it, which neither the type of an instance nor the variable table records
+across a body's fields and variables.
 
 **REQ-LOW-lowering-026** Every variable's `ty` is present in the type table.
 
@@ -1003,9 +1086,8 @@ pub enum StrExprKind {
 A user function's string result is returned through a result parameter, to
 a temporary its caller passes (see
 [Callees, arguments and intrinsics](#38-callees-arguments-and-intrinsics)).
-A call of the function is a `Call` statement, after which an expression reads
-the temporary, or an in-place call, which is the string the function wrote
-to the temporary (see [In-place calls](#in-place-calls)).
+A call of the function is a string in-place call, the string the function
+wrote to the temporary (see [In-place calls](#in-place-calls)).
 
 **REQ-LOW-lowering-052** The callee of a string `Call` expression is an
 `Intrinsic`.
@@ -1016,6 +1098,12 @@ lowering reports one it meets as P9998.
 
 **REQ-LOW-lowering-051** A string literal's characters fit its encoding
 ([ADR-0016](../adrs/0016-string-encoding.md)).
+
+**REQ-LOW-lowering-188** The string a reference refers to, `rs^`, or an
+element of an array of strings a reference refers to, `rsa^[i]`, is a `Read`
+of the place through the `Deref`, and a store to it is an `AssignStr` to that
+place, as for any value a reference refers to. `REF(s)^`, and `ADR(s)^`,
+which the analyzer makes `REF(s)^`, is a `Read` of `s`.
 
 Temporary buffers, their pool size and their release
 ([ADR-0052](../adrs/0052-temp-string-buffers-released-on-consume.md)) are how
@@ -1093,6 +1181,17 @@ of other strings in the program.
 intermediate result with a smaller capacity keeps its first code units, up to
 that capacity.
 
+**REQ-LOW-codegen-189** The bytecode backend's reference to a string is a
+data-region reference to the string's header
+([var-in-out-parameters.md](var-in-out-parameters.md#references)), whether a
+`RefTo` or a reference variable's starting value makes it. The backend reads
+and writes the string a reference refers to with `STR_LOAD_ARRAY_DEREF` and
+`STR_STORE_ARRAY_DEREF`: a string is the one element of a one-element array of
+the reference's capacity, and an element of an array of strings is reached
+with that array's descriptor. The route that reads the AST makes the same
+reference, and follows it with `LOAD_INDIRECT`, which takes only a variable
+reference, so a string read through a reference traps there (V9005).
+
 ### 3.7 Statements
 
 ```rust
@@ -1149,6 +1248,44 @@ have the same names, in order, and the same shapes; a function block instance
 is copied only from one of its own type. `ProgramBuilder::copy` reports a
 P9998 for places that break this.
 
+An instance assigned from another, `f := g`, lowers to a `Copy` of the whole
+instance, so `f` gets the values of `g`'s fields in storage of its own
+(REQ-LOW-codegen-165). The bytecode backend copies it field by field, with
+`FB_LOAD_PARAM` and `FB_STORE_PARAM`: every field of the block, including the
+ones a standard block keeps for itself, such as a timer's start time. This
+corrects the route that reads the AST, which stores `g`'s slot in `f`'s and so
+makes `f` an alias of `g`: a later call of `f` changes `g`.
+
+An output of a function block type stored by a call, `g(ob => f)`, lowers to a
+`Copy` of the instance the field `ob` holds, as `f := g.ob` does.
+
+**REQ-LOW-codegen-196** The bytecode backend gives the instance that a field
+of a function block type holds storage of its own, and a `Copy` of an instance
+copies the instance each such field holds into the one the destination's field
+holds. A `Copy` from or to such a field, `f := g.ob`, `g(ob => f)`,
+`g.ob := f` or `g(inner := f)`, copies the instance it holds.
+
+The layout reserves the fields of a held instance after those of the instance
+that holds it, to any depth, and the setup block stores their offset in the
+field's slot, so the field's slot holds what an instance's slot holds. This
+also changes the route that reads the AST, which shares the layout. Before, a
+field of a function block type held no instance: its slot held 0, the offset
+of whatever was laid out first, so after `g(ob => f)` a call of `f` wrote
+another instance's fields. That route still stores the field's slot in
+`f`'s, so `f` becomes an alias of the instance `g.ob` holds.
+
+Inside a function, function block or method body, that backend's layout
+keeps no data region for the body's own structures and arrays, and calls no
+instance the body declares. Neither route reads inside such a variable
+there, or calls such an instance. So for a `Copy` to one, the bytecode
+backend stores the source's slot in the destination's, as the route that
+reads the AST does, and no program tells that from a copy. A field of the
+block that holds an instance is not such a variable: a caller copies from it
+(`g(ob => f)`). A `Copy` from one such field to another, `ob := loc`, copies
+the instance the source holds into the one the destination holds
+(REQ-LOW-codegen-196), and a `Copy` to one from anything else is left to the
+route that reads the AST.
+
 **REQ-LOW-lowering-062** Every `Exit` and `Continue` names a `Loop` or `For`
 that encloses it.
 
@@ -1165,6 +1302,14 @@ storage width of its place's type.
 `shift` with the low `bits` bits of its value, and leaves the other bits as
 they were. The value is a `BOOL` for one bit, a 32-bit integer for up to 32
 bits, and a 64-bit integer for more.
+
+An `AssignBits` reads the value at its place before it evaluates its value,
+as the route that reads the AST does, so a write the value makes to the
+place is lost: `w.3 := F(x := 1, n => w) > 0` replaces bit 3 of the value `w`
+had before the call, and the output `F` stores in `w` is overwritten.
+
+**REQ-LOW-codegen-185** An `AssignBits` reads the value at its place before it
+evaluates its value, and stores that value with its bits replaced.
 
 The arms of a `Case` are tried in order and the first arm with a matching
 label runs, as `compile_case` does today.
@@ -1190,9 +1335,15 @@ repeats: it evaluates `to`; it leaves the loop when `control` is greater than
 assignment.
 
 **REQ-LOW-lowering-067** The `step` of a `For` is a nonzero constant of the
-operation type of `control`, and `control` is a variable or a field of the
-current instance. A `FOR` whose step is not a nonzero constant is reported as
+operation type of `control`, and `control` is a variable, a field of the
+current instance, or what a reference variable refers to, as a function's or
+method's `VAR_OUTPUT` parameter does. A `FOR` whose step is not a nonzero
+constant, and one whose control variable is a `VAR_IN_OUT`, is reported as
 P9999, as it is today.
+
+The analyzer holds the control variable to an integer, `ANY_INT` or a subrange
+of one (P4091), so a `For` never counts with a real, a bit string, a duration,
+a `BOOL` or an enumeration.
 
 `to` is evaluated on every iteration, and the control variable wraps, so a
 `FOR` whose bound is the largest value of the control variable's type does not
@@ -1250,6 +1401,22 @@ route cannot call, such as one declared inside a function block
 through `VAR_EXTERNAL`
 ([issue 1858](https://github.com/ironplc/ironplc/issues/1858)), stays on it.
 
+That backend's layout keeps no data region yet for a string, structure or
+array field of an instance it reaches by name. The route that reads the AST
+keeps in the field's slot the index of the temporary buffer that holds a
+string, or the region offset of a structure or an array, and the bytecode
+backend stores and loads the same, by `FB_STORE_PARAM` and `FB_LOAD_PARAM`,
+for a call's input or output and for a field read or written outside a call.
+So a string stored in such a field does not reach the block's body by either
+route ([issue 1753](https://github.com/ironplc/ironplc/issues/1753)). A `Copy`
+to a structure or array field shares the source's region rather than meeting
+REQ-LOW-codegen-165, but neither route compiles a read of what such a field
+holds, in the block's body, a method or a caller, so no program observes the
+difference. A `Copy` of an instance to a field of a function block type,
+`g(inner := f)` or `g.inner := f`, copies it into the instance the field
+holds (REQ-LOW-codegen-196), which neither route calls
+([issue 1553](https://github.com/ironplc/ironplc/issues/1553)).
+
 The order of the inputs among themselves is the order of the call's normal
 form: the order the block declares them, whatever order the call writes them
 in. Codegen evaluates them in that order, as it evaluates the arguments of a
@@ -1293,9 +1460,23 @@ array or structure input to a function or function block. Inside the body
 the parameter has no array or structure storage, so reading an element or a
 field of it is reported as P9999 (`compile_array.rs`, `compile_struct.rs`).
 A call still passes one scalar value for the parameter
-(`ParamPassing::Value`), which is harmless only because a body that reads
-the parameter never compiles. Lowering reports such an input as P9999 until
-it provides `Arg::Copy` for it.
+(`ParamPassing::Value`), the offset of the argument's region, which is
+harmless only because a body that reads the parameter never compiles.
+Lowering passes such an input of a function or method as an `Arg::Copy`
+(REQ-LOW-lowering-075), and while both routes exist the bytecode backend
+emits it as that route does, the offset, so a call compiles to the same code
+by either route. The callee gets a copy of its own once a body that reads the
+parameter compiles, which it does on neither route yet.
+
+So too a method's input of a function block type, `b.Go(i := f)`, which a
+function cannot declare (P4054). The argument is an `Arg::Copy` of the
+instance, and the bytecode backend passes the instance's slot, which holds the
+data offset of its fields, as that route does. Neither route calls such an
+input in the method's body or reads its fields
+([issue 1553](https://github.com/ironplc/ironplc/issues/1553)). An argument
+that is a field of another function block instance, `b.Go(i := g.inner)` or
+`SUMP(q := g.p)`, is passed as the value that field's slot holds, as that
+route passes it.
 
 A string is passed by value too. The argument for a `VAR_INPUT` of a `STRING`
 or `WSTRING` type is a `Str` of the parameter's encoding, of any capacity
@@ -1325,10 +1506,13 @@ method's instance parameter and before the declared parameters. Every access
 to the result goes through a `Deref`, as for a `VAR_IN_OUT`
 (REQ-LOW-lowering-033). At each call, the argument for it is a `Ref` to a
 compiler-provided temporary of the result's type: scratch space the caller
-owns. The call is a `Call` statement, and an `AssignStr` or `Copy` from the
-temporary then puts the result where it goes. A scalar result stays the value
-of a `Call` expression. Today a user function may return a structure
-(`UserFunctionInfo::return_struct_desc_index`, `compile_aggregate.rs`).
+owns. A call of a function whose result is a string is a string in-place
+call, the string the function wrote to the temporary
+([In-place calls](#in-place-calls)). A call of a function whose result is a
+structure is assigned whole to a structure, and is a `Call` statement whose
+temporary is then copied to the target. A scalar result stays the value of a
+`Call` expression, or of a scalar in-place call. A function whose result is
+an array is not lowered: the route that reads the AST does not compile one.
 
 The temporary is what keeps this safe. Passing the destination itself would
 let the callee write `s` while it still reads `s`, as `s := f(s)` does, and a
@@ -1344,76 +1528,43 @@ parameter.
 
 **REQ-LOW-ir-181** A function that returns its result through a result
 parameter has no value. Its result parameter is its first parameter, a
-non-null reference to a string, and a call of it is a `Call` statement or a
-string in-place call, never a `Call` expression or a scalar in-place call.
+non-null reference to a string or a structure, and a call of it is a `Call`
+statement or a string in-place call, never a `Call` expression or a scalar
+in-place call.
 
 A call of a function whose result is a string is usually part of an
 expression: `n := LEN(f(s))`, `s := CONCAT(f(a), f(b))`, `s := f(f('x'))`.
-Its `Call` statement runs before the statement the expression is in, and the
-expression reads the temporary where the call's value is used. So
-`n := LEN(f(s))` lowers to a `Call` of `f` passing a reference to a
-temporary `t`, then `n := LEN(t)`. The calls of one statement run in the
-order the source runs them, so a call in another call's argument runs first.
-A statement inside another, such as one in an `IF`'s branch, has calls of its
-own, which run before it. Each `Call` has the span of the statement it runs
-before (REQ-LOW-lowering-063).
+It is an in-place call where the expression uses the call's value, so
+`n := LEN(f(s))` lowers to `LEN` of the in-place call of `f` passing a
+reference to a temporary `t`: the call writes `t`, and `LEN` reads the string
+from it ([In-place calls](#in-place-calls)).
 
-**REQ-LOW-lowering-179** A call of a function whose result is a string, in a
-statement, lowers to a `Call` statement placed before the statement, with the
-statement's other such calls in the order they run, and to a read of the
-temporary it passes for the result where the call's value is used.
+**REQ-LOW-lowering-179** A call of a function whose result is a string lowers
+to a string in-place call where the source evaluates the call, passing a
+`Ref` to a new temporary for the result parameter, with the stores of its
+outputs, if any.
 
-Running a call before its statement means what running it where the source
-does means only when nothing evaluated in between can tell them apart. A
-function can write a global, a variable passed to its `VAR_IN_OUT`, or what a
-reference refers to. An operation can trap before the call runs, and the
-writes made before a trap stay (REQ-LOW-codegen-038). So a read of a
-variable, a call or an operation evaluated before the call keeps the
-statement from being lowered. So does a call that runs another number of
-times than once, or may not run:
+A call of a function whose result is a structure has no value to be part of
+an expression; the analyzer types it only where it is assigned whole,
+`p := MK(v := 3, n => k)`. The function writes its result to the temporary,
+the outputs reach their targets, then the result reaches its target, as the
+outputs of a call reach theirs before the value of the call is used.
 
-- in an `ELSIF` condition, which runs only when the conditions before it are
-  false;
-- in a `WHILE` or `REPEAT` condition, or the `TO` of a `FOR`, which runs on
-  every iteration;
-- in the selector of a `CASE`, which the route that reads the AST evaluates
-  once for each label it tests;
-- in a bit or partial write, which reads its place before its value;
-- on the right of `AND_THEN` or `OR_ELSE`, which may not run.
+**REQ-LOW-lowering-186** The assignment of a call of a function whose result
+is a structure to a structure lowers to a `Call` statement passing a `Ref` to
+a new temporary for the result parameter, then the stores of its outputs, if
+any, then a `Copy` of the temporary to the target.
 
-`n := 1 + LEN(f(s))` and `s := CONCAT(f(a), f(b))` are lowered.
-`n := k + LEN(f(s))`, `s := CONCAT(t, f(s))` and
-`n := LEN(f(a)) + LEN(f(b))` are not yet, nor is a call of a function with
-outputs whose result is a string.
-
-**REQ-LOW-lowering-180** A statement whose calls of functions with a string
-result run before it is lowered only when, in the order the statement is
-evaluated, nothing is evaluated before each such call but its own arguments,
-the calls run before it, constants, string literals, references to places
-and reads of the temporaries of the calls run before it; and no such call is
-in an `ELSIF`, `WHILE` or `REPEAT` condition, the `TO` of a `FOR`, the
-selector of a `CASE`, a bit or partial write, or the right operand of
-`AND_THEN` or `OR_ELSE`.
-
-While both routes exist, the bytecode backend emits a call of a function
-whose result is a string where its temporary is read
-(`lowered/string_result.rs`). That is where the route that reads the AST
-compiles the call (`compile_user_call.rs`):
-
-1. the arguments;
-2. `STR_INIT` of the function's result, in the callee's data region;
-3. `CALL`, which leaves the result in a temporary buffer
-   ([ADR-0052](../adrs/0052-temp-string-buffers-released-on-consume.md)).
-
-The temporary has no storage of its own. Its read is the call, and the
-operation reading it consumes the buffer, as on the route that reads the AST:
-an `AssignStr` stores it, a string function's operand is copied into a
-temporary slot, and a call's argument into its parameter. A call so compiles
-to the same instructions by either route, with the same temporary buffers and
-slots. Emitting it where its temporary is read, rather than where its `Call`
-statement stands, means the same by REQ-LOW-lowering-180. Inside the
-function's body, the result parameter reaches the string the backend keeps
-the result in (`UserFunctionInfo::return_string_info`).
+While both routes exist, the bytecode backend emits these statements as the
+route that reads the AST emits the assignment (`compile_aggregate.rs`): the
+inputs, `CALL`, which leaves the offset of the function's structure on the
+stack, the stores of the outputs, then `COPY_REGION` into the target, sized
+by the function's descriptor for its result. The temporary has no storage of
+its own: it is the structure the function's body writes, which that
+backend's layout keeps as the function's variable of the function's name, so
+the body's `result^` is that variable. A target that is an element of an
+array or a field of a structure is left to the route that reads the AST,
+which does not compile one either.
 
 A function or method may also declare `VAR_OUTPUT`, which a call assigns to a
 place with `=>`. An output is passed the same way as a result: the argument is
@@ -1437,92 +1588,40 @@ after the call instead, which the flat variable table makes safe
 
 **REQ-LOW-lowering-092** An argument for a function's or method's
 `VAR_OUTPUT` parameter is a `Ref` to a compiler-provided temporary of the
-parameter's type, and the call is followed by an assignment from that
-temporary to the output's target.
+parameter's type, and once the call returns an assignment moves the output
+from that temporary to its target: a store of the in-place call, or a
+statement after a `Call` statement.
 
-The value of a call with outputs has to wait while the outputs are stored,
-and a temporary is where it waits. So a call of a function or method with
-outputs in the value of an assignment is lowered ahead of the assignment, as
-its *part*:
+The value of a call with outputs has to wait while its outputs are stored.
+A call of a function or method with outputs in an expression is an in-place
+call: the call, then the store of each output in its target, of the value
+the analyzer recorded for it, the call output a read of the output's
+temporary. The expression goes on with the call's value where the source has
+the call. `r := F(a, q => x)` assigns `r` the in-place call of `F`, whose store
+moves `q` to `x`, converted as the analyzer recorded; `r := F(a, q => x) +
+F(b, q => y)` adds two in-place calls. A call in the arguments of another is
+in place in that argument, so it runs first. That is the order the route
+that reads the AST runs them in, so a variable that is both an output's
+target and `r` ends with the result.
 
-1. the assignment of the call to a temporary of the result's type;
-2. the assignment of each output to its target, of the value the analyzer
-   recorded for it, the call output read from the output's temporary.
+**REQ-LOW-lowering-172** A call of a function or method with outputs, in an
+expression, lowers to a scalar in-place call: the call, passing a `Ref` to a
+temporary for each output, then the store of each output the call assigns,
+from its temporary to its target.
 
-The assignment lowers to the part of each call, in the order its value
-evaluates them, then itself, its value reading each call's result from the
-result's temporary, all with the assignment's span. `r := F(a, q => x)` is
-one part, then the assignment to `r` of the result's temporary, converted as
-the analyzer recorded. `r := F(a, q => x) + F(b, q => y)` is two parts, then
-`r := t1 + t2`. A call in the arguments of another has its part first. That
-is the order the route that reads the AST runs them in, so a variable that is
-both an output's target and `r` ends with the result.
+**REQ-LOW-lowering-174** An in-place call stands in its expression where the
+source has the call, so the operands the source evaluates before the call
+are evaluated before the call and its stores, and those after it after them
+(REQ-LOW-codegen-120).
 
-**REQ-LOW-lowering-172** An assignment whose value has calls of functions or
-methods with outputs lowers to the part of each call, in the order the value
-evaluates them, then the assignment, whose value reads each call's result
-from its temporary, all with the assignment's span. A part is the assignment
-of the call to a temporary of the result's type, then the assignments of the
-call's outputs from their temporaries.
-
-Running the parts first keeps the order the source runs things in only when
-nothing else in the value runs before a call. So lowering checks a property
-of the statements it built (`ironplc_ir::lowered::reads_results_in_order`).
-The *leading reads* of an expression are the reads of result temporaries it
-evaluates before any other node finishes:
-
-- a read of a result temporary is its own leading read;
-- an operation of one operand has its operand's;
-- an operation of several, and a call, has its first operand's, going on into
-  the next while the one before is itself such a read;
-- a short circuit has its left operand's, since its right one runs only on a
-  condition;
-- a constant, `Null`, a `RefTo`, a read of any other place, and a `Ref` or
-  string argument end the run, so that the rule does not depend on how a
-  backend passes a place, a method's instance or a string.
-
-**REQ-LOW-lowering-174** An assignment with calls with outputs in its value
-is lowered only when it is an `Assign` of a scalar value, each call's result
-is read once, among the leading reads of a later part's call or of the
-assignment's value, and the results each of those reads are the most recent
-not yet read, in the order they were made. Any other such assignment stays
-on the route that reads the AST.
-
-So `r := a + F(x := 1, n => a)`, which reads `a` before the call that writes
-it, stays on the route that reads the AST, as do `r := 1 + F(..)`,
-`r := F(..) * 2 + F(..)`, a call that is the right operand of `AND_THEN` or
-`OR_ELSE`, and a call read inside a subscript. So does a bit assignment such
-as `x.3 := F(x := 1, n => x) > 0`, whose place the route that reads the AST
-reads before its value, and a call with outputs in a condition, a selector, a
-bound, a target's subscript or a function block call's inputs, which are not
-the value of an assignment. A call whose function has an in-out, or a
-result, that is a string stays on that route too. An input may be a string,
-passed as any input is, and so may an output, assigned by an `AssignStr` from
-its temporary. A call of a function without outputs whose result is a string
-is lowered by REQ-LOW-lowering-179.
-
-While both routes exist, the bytecode backend emits the parts and the
-assignment as the route that reads the AST emits the assignment
-(`compile_user_call.rs`, `compile_method.rs`): each call, which leaves its
-result on the stack, then the store of each of its outputs, read from the
-function's own output variable, then the rest of the assignment's value and
-its store. A read of a result's temporary takes the value its call left on
-the stack, which REQ-LOW-lowering-174 makes the next value the expression
-would have pushed. No temporary has storage: the result stays on the stack
-while the outputs are stored, and the backend's layout keeps each output in
-the function's variable until the function is called again (ADR-0046), so the
-call passes no reference for it. Inside the function's body, an output is
-that variable. The layout records where in the data region each `STRING` or
-`WSTRING` output is (`UserFunctionInfo::string_outputs`). The route that
-reads the AST does not read a string output, and reports one as P9999.
-Inside a function's body the VM reaches no variable of another function, so
-a function that reads the outputs of a function it calls traps
-(`InvalidVariableIndex`) on either route.
-
-**REQ-LOW-codegen-175** While both routes exist, the bytecode backend emits
-an assignment with calls with outputs in its value as the route that reads
-the AST emits it, each call's result on the stack until the value reads it,
-and gives no result or output temporary storage of its own.
+So `r := a + F(x := 1, n => a)` reads `a`, then calls `F` and stores its
+output in `a`, then adds: `r` is the old `a` plus the result. A call with
+outputs in a condition, a selector, a bound, a subscript or a function block
+call's input is in place there too. A call whose function has an in-out that
+is a string stays on the route that reads the AST. An input may be a string,
+passed as any input is, and so may an output, stored by an `AssignStr` from
+its temporary. The route that reads the AST does not read a string output,
+and reports one as P9999.
 
 #### In-place calls
 
@@ -1568,8 +1667,57 @@ result through a result parameter, passes a `Ref` to the whole of a
 temporary for it, names that temporary, and has the shape of the
 temporary's type.
 
-While both routes exist, the bytecode backend leaves a statement that holds
-an in-place call to the route that reads the AST.
+Lowering builds one for every call with outputs (REQ-LOW-lowering-172) and
+every call of a function whose result is a string (REQ-LOW-lowering-179),
+where the source evaluates the call. So the rules of the expression that
+holds it decide when it runs, and how many times:
+
+**REQ-LOW-lowering-180** An in-place call runs where, and as often as, the
+source evaluates the call: in an `ELSIF` condition, only when the conditions
+before it are false; in a `WHILE` or `REPEAT` condition, or the `TO` of a
+`FOR`, on every iteration (REQ-LOW-lowering-066); in the selector of a
+`CASE`, once (REQ-LOW-codegen-124); on the right of `AND_THEN` or `OR_ELSE`,
+only when the left operand does not decide the result; and in the value of
+an `AssignBits`, after the statement reads its place (REQ-LOW-codegen-185).
+
+The route that reads the AST evaluates a `CASE` selector once for each label
+it tests, so a call with a side effect in a selector runs once on the
+lowered route and again for each label on that route. That is the
+correction REQ-LOW-codegen-124 names.
+
+While both routes exist, the bytecode backend emits an in-place call where
+its expression is evaluated, as the route that reads the AST emits the call
+(`compile_user_call.rs`, `compile_method.rs`):
+
+1. a method's instance, with `FB_LOAD_INSTANCE`;
+2. the inputs, a string copied into its parameter;
+3. `STR_INIT` of a string result, in the callee's data region;
+4. `CALL` or `METHOD_CALL`, which leaves the result on the stack: a value, or
+   a string in a temporary buffer
+   ([ADR-0052](../adrs/0052-temp-string-buffers-released-on-consume.md));
+5. each store, the output read from the callee's own variable;
+6. for a method, the instance beneath the result dropped.
+
+No temporary has storage. The result stays on the stack while the outputs
+are stored, and the backend's layout keeps each output in the callee's
+variable until the callee is called again (ADR-0046), so the call passes no
+reference for it. The operation that uses a string result consumes its
+buffer, as on the route that reads the AST: an `AssignStr` stores it, a
+string function's operand is copied into a temporary slot, and a call's
+argument into its parameter. Inside a function's body, the result parameter
+reaches the string the backend keeps the result in
+(`UserFunctionInfo::return_string_info`), and an output is the function's
+own variable. The layout records where in the data region each `STRING` or
+`WSTRING` output is (`UserFunctionInfo::string_outputs`). Inside a function's
+body the VM reaches no variable of another function, so a function that
+reads the outputs of a function it calls traps (`InvalidVariableIndex`) on
+either route.
+
+**REQ-LOW-codegen-175** While both routes exist, the bytecode backend emits
+an in-place call where its expression is evaluated, as the route that reads
+the AST emits the call: its inputs, `STR_INIT` of a string result, `CALL` or
+`METHOD_CALL`, then each store, with the result on the stack throughout. It
+gives no result or output temporary storage of its own.
 
 A method is called like a function whose first parameter is its instance, and
 the first argument of the call is a `Ref` to the receiver. `inst.m(a)` passes
@@ -1597,8 +1745,20 @@ A call whose result is used is a `Call` expression. One whose result is not
 used is a `Call` statement, which discards the result, if the method has
 one. A method without a result is called only by a statement. A call with
 outputs is lowered as a function's is (REQ-LOW-lowering-092,
-REQ-LOW-lowering-172): a `Call` statement is followed by the assignments of
-its outputs.
+REQ-LOW-lowering-172): in an expression it is an in-place call, and a `Call`
+statement is followed by the stores of its outputs.
+
+**REQ-LOW-lowering-187** A method whose result is an array or a structure is
+declared without a result, and the variable named after it is a variable of
+its body. No call reads such a result: assigning one is P2037, so a call of
+the method is a statement, which discards it.
+
+While both routes exist, the bytecode backend calls such a method as the
+route that reads the AST does: `METHOD_CALL` returns the slot of the result
+variable, and the statement drops it with the instance
+(`compile_method_call_statement`). That route compiles no write or read
+inside the result in the method's body either, so neither route lets a
+program see the result.
 
 **REQ-LOW-ir-173** A `Call` statement passes its callee one argument for
 each parameter, as a `Call` expression does, and discards the callee's
@@ -1612,13 +1772,10 @@ Not lowered yet, so each stays on the route that reads the AST:
 - a call through `THIS^` or `SUPER^`, which analysis does not resolve yet;
 - a call of a method the receiver's block inherits from a block its
   lowered type does not extend, as one with a field (REQ-LOW-lowering-177);
-- a call of a method with an in-out or a result that is a string, or with an
-  input, an in-out or a result that is an aggregate (REQ-LOW-lowering-079).
-  The route that reads the AST reports a method whose result is a string as
-  P9999;
-- a call with outputs anywhere but a statement or the value of an
-  assignment, or where REQ-LOW-lowering-174 does not hold, as for a
-  function.
+- a call of a method with an in-out that is a string or an aggregate, or
+  with a result that is a string (REQ-LOW-lowering-079). The route that reads
+  the AST reports a method whose result is a string as P9999. A method whose
+  result is an aggregate is lowered (REQ-LOW-lowering-187).
 
 While both routes exist, the bytecode backend emits a method's call as the
 route that reads the AST emits it (`compile_method.rs`): the receiver's
@@ -1631,6 +1788,15 @@ an instance it cannot reach, such as one declared inside a function block,
 stays on it. A method's outputs, strings included, are read from the
 method's own variables, as a function's are, and a method's body is asked
 for its statements as any other body is.
+
+`FB_CALL` and `METHOD_CALL` count a block's fields by a byte, and
+`FB_LOAD_PARAM` and `FB_STORE_PARAM` name one by a byte. Both routes share the
+layout that lays out a block's fields, so a block with more fields than that
+is rejected there, whatever calls or reads it.
+
+**REQ-LOW-codegen-191** The bytecode backend reports a function block with
+more than 255 fields, its inputs, outputs and internal variables together, as
+P9997, a limit of its format, on every route.
 
 A call of a method the receiver's block inherits is a call of the method of
 the block that declares it, as the analyzer resolves it (ADR-0041), with a
@@ -1750,7 +1916,10 @@ declared parameters, each where it has one.
 
 **REQ-LOW-lowering-072** Each argument's class and type match its parameter's:
 `Value` at the parameter's operation type, `Str` at its encoding, `Copy` from a
-place of its type, `Ref` to a place of its type.
+place of its type, `Ref` to a place of its type. A place of a type of the same
+shape, as an alias of the type has, is a place of its type here: a
+`VAR_IN_OUT` of a `DINT` takes a variable of a type declared as `DINT`, and
+the reverse.
 
 **REQ-LOW-lowering-075** An argument for a `VAR_INPUT` parameter of an array,
 structure or function block type is a `Copy`, and an argument for a
@@ -1946,7 +2115,19 @@ element: a `UDINT` subscript of 4,294,967,295 traps on `ARRAY[-3..100]`.
 destination holds the value the same element or field of its source held
 before it, and the source is unchanged. The destination has storage of its
 own: a later store to it leaves the source as it is. A `Copy` of a place to
-itself changes nothing.
+itself changes nothing. The bytecode backend does not meet this yet for a
+structure or array field of a function block instance, or for a structure,
+array or function block variable of a function, function block or method
+body other than a field that holds an instance, which no program reads
+inside (see [Statements](#37-statements)).
+
+**REQ-LOW-codegen-193** The bytecode backend copies a whole array or
+structure into the one a reference refers to, `p^ := z`, with
+`COPY_REGION_DEREF` through the reference `p` holds. The destination is sized
+by the descriptor of the array or structure type `p` refers to, which `p`'s
+declaration registers. The route that reads the AST stores `z`'s data offset
+in the slot of the variable `p` refers to instead, which makes that variable
+an alias of `z`.
 
 **REQ-LOW-codegen-089** An `Intrinsic` means what the IEC 61131-3 standard
 function means, with these choices where the standard leaves room: the count
@@ -2072,7 +2253,7 @@ today.
 | Whether an interface value can hold only one concrete type | Not made; calls through an interface are not compiled | The concrete types the value can hold (REQ-LOW-analyzer-107) | A direct method call, or a `Callee::Interface` |
 | Capacity of a string declared without one | Codegen and `slot_count`, from `DEFAULT_STRING_MAX_LENGTH` | The string type's capacity (REQ-LOW-analyzer-053) | The capacity of its `StringShape` |
 | Enumeration ordinal | The analyzer, when the type enters the type environment (`EnumerationMembers`); codegen looks the ordinal up (`compile_enum.rs`) | Each member's ordinal, explicit (`GREEN := 5`) or counted on from the one before, and the type's default member, on `SemanticType::Enumeration` | `Const` |
-| Declaration a variable name refers to | The analyzer's `SymbolEnvironment::resolve_variable` ([Variable Binding](variable-binding.md)); codegen resolves names again, from tables of its own (`scope.rs`) | Not in the `Library`: the function answers from the `SemanticContext`, with a `DeclRef` that names the declaration by its scope and its name ([ADR-0066](../adrs/0066-name-resolution-is-an-analyzer-function.md)) | One `VarId` for each `DeclRef` (REQ-LOW-lowering-020, REQ-LOW-lowering-022) |
+| Declaration a variable name refers to | The analyzer's `SymbolEnvironment::resolve_variable` ([Variable Binding](variable-binding.md)); codegen resolves names again, from tables of its own (`layout/names.rs`) | Not in the `Library`: the function answers from the `SemanticContext`, with a `DeclRef` that names the declaration by its scope and its name ([ADR-0066](../adrs/0066-name-resolution-is-an-analyzer-function.md)) | One `VarId` for each `DeclRef` (REQ-LOW-lowering-020, REQ-LOW-lowering-022) |
 
 **Decisions lowering makes**
 
@@ -2166,6 +2347,8 @@ implements it.
 | Bit read `x.3`, partial read `x.%B1` | Shift and mask of a `Read` |
 | Bit and partial write | `AssignBits` |
 | `p^ := v` | `Assign` to a place ending in `Deref` |
+| `REF(x)^`, and `ADR(x)^`, which the analyzer makes `REF(x)^` | A `Read` of `x` |
+| A subscript of a reference to an array, `r[i]` (a TwinCAT `REFERENCE TO`, or a `REF_TO` the analyzer lets a subscript follow without `^`) | The `Index` of the `Deref`, as `r^[i]`. This corrects the route that reads the AST, which indexes the reference's own slot as though it held the array's data |
 | `S=`, `R=` | `If` on the value around an `Assign` of `TRUE` or `FALSE` |
 | `REF=` | `Assign` of a `RefTo` (already the analyzer's view) |
 | Function block call with inputs and outputs | Assignments to the instance's fields, `FbCall`, assignments from them (REQ-LOW-lowering-069) |
@@ -2201,9 +2384,11 @@ the place.
 names its place once.
 
 **REQ-LOW-lowering-103** `SIZEOF` lowers to a `Const` computed from the
-language's storage widths, never from a backend's layout. For a type whose size
-only a layout gives, such as a structure, a string or an enumeration, it is
-P9999.
+language's storage widths, never from a backend's layout, with the sizes
+CODESYS, TwinCAT and RuSTy give: a `BOOL` takes a byte, a `STRING[n]` `n + 1`
+bytes and a `WSTRING[n]` `2 * (n + 1)`, an enumeration its underlying type's
+size (REQ-LOW-lowering-190), and an array its element's size for each element.
+For a type whose size only a layout gives, such as a structure, it is P9999.
 
 **REQ-LOW-lowering-165** A desugaring evaluates each argument of the call it
 stands for once: `DT_TO_DATE(x)` is `(x / 86400) * 86400` rather than
@@ -2336,7 +2521,7 @@ Nothing is deleted before its last reader has moved to the lowered program.
 | `SemanticContext` | Keep | None. It is lowering's input. |
 | `TypeEnvironment`, `TypeId` | Keep | Lowering builds the lowered program's type table from it. |
 | `SemanticType` (formerly `IntermediateType`) | Keep | Lowering reads it and does not carry `slot_count` into the lowered program. `slot_count` moves to the bytecode backend: it sizes strings with the container's `string_region_size`, which is VM layout. The byte offsets, sizes and alignments it once computed for fields are removed: nothing read them. |
-| `xform_insert_implicit_conversions` | Keep and extend | Records every implicit conversion and the type of every untyped literal (ADR-0056). It already records most of them; [issue 2050](https://github.com/ironplc/ironplc/issues/2050) finishes the rest. It is the recording pass (see [Names](#names)). |
+| `xform_insert_implicit_conversions` | Keep | Records every implicit conversion and the type of every untyped literal (ADR-0056), in every context but a directly represented variable, which no route compiles yet. It is the recording pass (see [Names](#names)). |
 | `rule_constant_range` | Keep | It runs after the recording pass. It checks a literal against its recorded type, and reads through a conversion to check against the operand types as written (see [Decisions](#4-decisions)). |
 | `intermediates/` | Keep | Its signatures carry the `BuiltinFunction` identity. |
 | `FunctionEnvironment` | Keep | Signatures of built-in functions name their `BuiltinFunction` (REQ-LOW-analyzer-070). |
@@ -2435,6 +2620,13 @@ source name, not by its slot index.
 So the tests say nothing about how the compiler is structured, and they hold
 across this change without edits. A step that needs one edited is not
 behaviour preserving.
+
+**REQ-LOW-codegen-198** While the bytecode backend builds its layout both
+from the AST and from the lowered declarations, the end-to-end helpers have
+it check the two equal for every program they compile, and an entry either
+records differently, such as a slot's number, the type it is operated at, a
+string's run of the data region or an array descriptor, fails the
+compilation.
 
 **Lowering is tested on the tree.** A decision in
 [Decisions](#4-decisions) is asserted by lowering a small program and
@@ -2706,18 +2898,17 @@ This section constrains the order of work; it is not a work breakdown.
   assignments, the arguments of functions, methods and function block calls,
   loop bounds, the results of calls and dereferences, conditions, subscripts,
   shift counts, string positions, the outputs a call stores and the types of
-  literals. The context it does not record yet, a directly
-  represented variable, comes next
-  ([issue 2050](https://github.com/ironplc/ironplc/issues/2050)). A statement
-  that needs a decision the analyzer does not record yet stays on the route
-  that reads the AST.
+  literals. The one context it does not record, a directly represented
+  variable, is one no route compiles yet (P9999). A statement that needs a
+  decision the analyzer does not record yet stays on the route that reads the
+  AST.
 - **P9998 only once unreachable.** An error path of codegen becomes a P9998 in
   lowering only once it is shown unreachable from a program analysis accepts
   (see [The Clean-Analysis Gate](#2-the-clean-analysis-gate)).
 - **The gate is already in place.** Codegen's entry point takes a
-  `CleanAnalysis`. While both routes exist, codegen passes it on to the entry
-  point that lowers one statement, so the lowered route meets
-  REQ-LOW-lowering-011 from its first statement, and no caller moves again.
+  `CleanAnalysis`. While both routes exist, codegen passes it on to
+  lowering's entry point, so the lowered route meets REQ-LOW-lowering-011
+  from its first statement, and no caller moves again.
 
 **Growing one statement at a time**
 
@@ -2726,26 +2917,29 @@ This section constrains the order of work; it is not a work breakdown.
   and expressions. So the lowered program cannot grow one node kind at a time
   while codegen reads the AST for the rest. It grows one top-level statement
   at a time instead:
-  1. While codegen compiles a body, it asks lowering for each top-level
-     statement, together with every statement and expression inside it.
-  2. If lowering supports all of them, codegen emits the lowered statement.
-  3. If not, lowering answers that the statement is unsupported, and codegen
+  1. Before codegen emits anything, lowering lowers the whole library in one
+     walk, and keeps what each top-level statement of each body lowered to,
+     together with every statement and expression inside it.
+  2. While codegen compiles a body, it reads each top-level statement's
+     result, by the body's POU and the statement's index. If lowering
+     supported all of it, codegen emits the lowered statement.
+  3. If not, the result says the statement is unsupported, and codegen
      compiles that statement from the AST.
 
   Both routes emit into the same body through the same emitter. A POU is not
   the unit: most POUs mix constructs, so a POU would take the new route only
   once nearly all of lowering existed.
-- **Unsupported is not a defect.** While both routes exist, lowering offers an
-  entry point that lowers one statement of a body. That entry point tells a
-  statement it does not support yet apart from a broken invariant. An
+- **Unsupported is not a defect.** While both routes exist, the walk tells a
+  statement lowering does not support yet apart from a broken invariant. An
   unsupported statement falls back and is counted. A broken invariant is a
-  P9998, as always.
+  P9998, as always, and fails the compilation wherever the walk meets it.
 - **Storage found by name at first.** A lowered variable carries its name and
   its owning POU (REQ-LOW-lowering-006). So while both routes exist, the
   bytecode backend finds a lowered variable's storage in the layout codegen
-  builds today: through the current body's `Scope`, by name. A field of the
-  current instance is found the same way. While the VM copies fields, that is
-  the slot holding the copy (see [Instance fields](#instance-fields)). The
+  builds today: in the current body's scope (`layout/names.rs`), by name. A
+  field of the current instance is found the same way. While the VM copies
+  fields, that is the slot holding the copy (see
+  [Instance fields](#instance-fields)). The
   function a `Callee::User` calls is found by the name its POU carries, as
   the function the route that reads the AST compiled.
   REQ-LOW-codegen-122 and REQ-LOW-codegen-123 are met later. Once a POU's
@@ -2766,8 +2960,8 @@ This section constrains the order of work; it is not a work breakdown.
   - `PreferLowered`: the lowered statement where lowering supports it.
   - `RequireLowered`: a statement lowering does not support is an error.
 
-  A release uses `Ast` until the routes agree. Making `PreferLowered` the
-  default is a one-line change, and so is undoing it.
+  A release uses `PreferLowered`. Going back to `Ast` as the default is a
+  one-line change.
 
 **Checking the new route**
 
@@ -2782,6 +2976,10 @@ This section constrains the order of work; it is not a work breakdown.
   listed as known differences. So is a program that reads a function's or
   a method's string output, which only the lowered route compiles
   (REQ-LOW-lowering-172).
+- **The layouts check each other.** While both layout builders exist, the
+  one from the lowered declarations is checked equal to the one from the AST
+  for every end-to-end program (REQ-LOW-codegen-198), before the bodies are
+  compiled against it.
 - **Progress cannot fall.** CI reports how many top-level statements of the
   end-to-end programs took the lowered route. The number does not fall.
 - **The IR is readable from its first commit.** `ironplc-ir` writes a lowered

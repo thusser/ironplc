@@ -107,7 +107,8 @@ pub(crate) fn resolve_field_op_type(field_type: &SemanticType) -> Option<OpType>
         SemanticType::Structure { .. }
         | SemanticType::Array { .. }
         | SemanticType::String { .. }
-        | SemanticType::FunctionBlock { .. } => None,
+        | SemanticType::FunctionBlock { .. }
+        | SemanticType::Interface { .. } => None,
     }
 }
 
@@ -224,7 +225,7 @@ pub(crate) fn resolve_struct_field_access(
     let (root_name, slot_offset, field_type) =
         walk_struct_chain(ctx, &structured.record, &structured.field, 0)?;
 
-    let struct_info = ctx.struct_vars.get(&root_name).ok_or_else(|| {
+    let struct_info = ctx.struct_var(&root_name).ok_or_else(|| {
         Diagnostic::not_implemented(Label::span(
             structured.span(),
             format!("Variable '{}' is not a structure", root_name),
@@ -269,7 +270,7 @@ pub(crate) fn walk_struct_chain(
 
     match record {
         SymbolicVariableKind::Named(named) => {
-            let struct_info = ctx.struct_vars.get(&named.name).ok_or_else(|| {
+            let struct_info = ctx.struct_var(&named.name).ok_or_else(|| {
                 Diagnostic::not_implemented(Label::span(
                     named.name.span(),
                     format!("Variable '{}' is not a structure", named.name),
@@ -456,11 +457,7 @@ pub(crate) fn allocate_struct_variable(
                     let scratch_idx = ctx.allocate_scratch_variable(&id.to_string());
                     scratch_var_index = Some(scratch_idx);
                 }
-                let element_field_type = if char_width.is_wide() {
-                    FieldType::WString
-                } else {
-                    FieldType::String
-                };
+                let element_field_type = FieldType::string(*char_width);
                 let str_desc_index = builder.add_array_descriptor(
                     element_field_type as u8,
                     total_elements,
@@ -495,6 +492,7 @@ pub(crate) fn allocate_struct_variable(
 
     // Store metadata
     ctx.struct_vars.insert(
+        ctx.scope,
         id.clone(),
         StructVarInfo {
             var_index: index,
@@ -726,6 +724,7 @@ mod tests {
         types.extend([
             SemanticType::Enumeration {
                 members: EnumerationMembers::default(),
+                underlying_type: None,
             },
             SemanticType::Subrange {
                 base_type: Box::new(SemanticType::UInt {

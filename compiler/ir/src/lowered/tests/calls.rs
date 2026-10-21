@@ -387,8 +387,8 @@ fn declare_function_returning_through_when_parameter_refers_to_string_then_call_
     ));
 }
 
-/// REQ-LOW-ir-181: a result parameter is a non-null reference to a string,
-/// first among the parameters of a function.
+/// REQ-LOW-ir-181: a result parameter is a non-null reference to a string or
+/// a structure, first among the parameters of a function.
 #[test]
 fn declare_function_returning_through_when_first_not_reference_to_string_then_internal_error() {
     let mut f = fixture();
@@ -406,4 +406,128 @@ fn declare_function_returning_through_when_first_not_reference_to_string_then_in
             "ProgramBuilder::declare_function_returning_through"
         ));
     }
+}
+
+/// REQ-LOW-lowering-079, REQ-LOW-ir-181: a function whose result is a
+/// structure returns it through its first parameter, a non-null reference to
+/// the structure, as one whose result is a string does; a call of it is a
+/// statement. A reference to an array is refused: no function returns one.
+#[test]
+fn declare_function_returning_through_when_parameter_refers_to_structure_then_call_is_statement() {
+    let mut f = fixture();
+    let pou = f.b.push_pou(name("mk"));
+    let dint = f.ty(f.dint);
+    let structure = TypeKind::Structure {
+        fields: vec![Field::new("x", span(), None, dint)],
+    };
+    let structure = f.b.push_type(entry(structure), &span()).unwrap();
+    let array = TypeKind::Array {
+        dimensions: vec![(1, 2)],
+        element: dint,
+    };
+    let array = f.b.push_type(entry(array), &span()).unwrap();
+    let mut reference_to = |target| {
+        let kind = TypeKind::Reference {
+            target,
+            nullability: Nullability::NonNull,
+        };
+        f.b.push_type(entry(kind), &span()).unwrap()
+    };
+    let (to_structure, to_array) = (reference_to(structure), reference_to(array));
+    let Owner::Pou(main) = f.b.variables().get(f.dint).unwrap().owner() else {
+        panic!("the fixture's variables belong to main");
+    };
+    let mut var = |text: &str, owner, ty| f.b.push_variable(name(text), owner, ty).unwrap();
+    let result = var("mk", Owner::Pou(pou), to_structure);
+    let array_result = var("mk", Owner::Pou(pou), to_array);
+    let temporary = var("mk()", Owner::Pou(main), structure);
+    assert!(is_internal_error_naming(
+        f.b.declare_function_returning_through(pou, vec![array_result], &span()),
+        "ProgramBuilder::declare_function_returning_through"
+    ));
+    f.b.declare_function_returning_through(pou, vec![result], &span())
+        .unwrap();
+    assert_eq!(f.b.params(pou), Some(vec![Param::Ref(structure)]));
+    let call =
+        f.b.call_stmt(pou, vec![Arg::Ref(f.place(temporary))], span());
+    assert_eq!(call.unwrap().to_string(), "call pou1 (ref v10)");
+}
+
+/// REQ-LOW-lowering-072, REQ-LOW-lowering-075: a function's input that is a
+/// structure takes a copy of a place of the structure's shape, a `Copy`
+/// argument. A `Ref` to the place, and a copy of a structure of another
+/// shape, are refused.
+#[test]
+fn call_when_aggregate_input_then_takes_copy_of_place_of_its_shape() {
+    let mut f = fixture();
+    let pou = f.b.push_pou(name("sum"));
+    let dint = f.ty(f.dint);
+    let mut structure = |field: &str| {
+        let kind = TypeKind::Structure {
+            fields: vec![Field::new(field, span(), None, dint)],
+        };
+        f.b.push_type(entry(kind), &span()).unwrap()
+    };
+    let (shape, other) = (structure("x"), structure("y"));
+    let Owner::Pou(main) = f.b.variables().get(f.dint).unwrap().owner() else {
+        panic!("the fixture's variables belong to main");
+    };
+    let mut var = |text: &str, owner, ty| f.b.push_variable(name(text), owner, ty).unwrap();
+    let q = var("q", Owner::Pou(pou), shape);
+    let result = var("sum", Owner::Pou(pou), dint);
+    let p = var("p", Owner::Pou(main), shape);
+    let o = var("o", Owner::Pou(main), other);
+    f.b.declare_function(pou, vec![q], result, &span()).unwrap();
+    assert_eq!(f.b.params(pou), Some(vec![Param::Copy(shape)]));
+    let call = f.b.call(pou, vec![Arg::Copy(f.place(p))], span()).unwrap();
+    assert_eq!(call.to_string(), "(call pou1 i32s (copy v10))");
+    for refused in [Arg::Ref(f.place(p)), Arg::Copy(f.place(o))] {
+        assert!(is_internal_error_naming(
+            f.b.call(pou, vec![refused], span()),
+            "ProgramBuilder::call"
+        ));
+    }
+}
+
+/// REQ-LOW-lowering-072: a `VAR_IN_OUT` parameter takes a `Ref` to a place
+/// of a type of the shape it refers to, as an alias of that type is. A place
+/// of another shape is refused.
+#[test]
+fn call_when_in_out_argument_has_type_of_same_shape_then_takes_ref() {
+    let mut f = fixture();
+    let pou = f.b.push_pou(name("inc"));
+    let dint = f.ty(f.dint);
+    let alias =
+        f.b.push_type(
+            entry(TypeKind::Integer {
+                width: IntWidth::B32,
+                signed: true,
+            }),
+            &span(),
+        )
+        .unwrap();
+    let in_out =
+        f.b.push_type(
+            entry(TypeKind::Reference {
+                target: dint,
+                nullability: Nullability::NonNull,
+            }),
+            &span(),
+        )
+        .unwrap();
+    let Owner::Pou(main) = f.b.variables().get(f.dint).unwrap().owner() else {
+        panic!("the fixture's variables belong to main");
+    };
+    let mut var = |text: &str, owner, ty| f.b.push_variable(name(text), owner, ty).unwrap();
+    let v = var("v", Owner::Pou(pou), in_out);
+    let result = var("inc", Owner::Pou(pou), dint);
+    let a = var("a", Owner::Pou(main), alias);
+    f.b.declare_function(pou, vec![v], result, &span()).unwrap();
+    assert_ne!(alias, dint);
+    let call = f.b.call(pou, vec![Arg::Ref(f.place(a))], span()).unwrap();
+    assert_eq!(call.to_string(), format!("(call pou1 i32s (ref {a}))"));
+    assert!(is_internal_error_naming(
+        f.b.call(pou, vec![Arg::Ref(f.place(f.int))], span()),
+        "ProgramBuilder::call"
+    ));
 }

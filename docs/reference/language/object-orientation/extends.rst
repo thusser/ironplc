@@ -71,7 +71,9 @@ Example
    END_FUNCTION_BLOCK
 
 ``FB_AdvancedMotor`` is the derived type and ``FB_Motor`` is its base type.
-A function block type extends at most one base type.
+A function block type extends at most one base type, and the base type must
+be a declared function block type. A name that is not declared, or that names
+another kind of type, reports :doc:`P4088 </reference/compiler/problems/P4088>`.
 
 What a derived type inherits
 ----------------------------
@@ -88,7 +90,13 @@ method, not a second variable of the same name.
 Methods work the other way round. A derived type may declare a method with
 the name of one it inherits, which **overrides** it: a call on the derived
 type runs the derived type's method, and that method reaches the one it
-overrode through :doc:`SUPER^ <this-and-super>`.
+overrode through :doc:`SUPER^ <this-and-super>`. An override has the
+signature of the method it overrides: the same return type and the same
+``VAR_INPUT``, ``VAR_OUTPUT`` and ``VAR_IN_OUT`` variables, in the same order.
+One that differs reports :doc:`P4089 </reference/compiler/problems/P4089>`.
+A property overrides an inherited property of its name in the same way, and
+has the type of the property it overrides; one of another type reports
+:doc:`P4090 </reference/compiler/problems/P4090>`.
 
 See Also
 --------

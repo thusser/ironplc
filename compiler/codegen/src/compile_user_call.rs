@@ -75,11 +75,12 @@ pub(crate) fn compile_user_function_call(
         emitter.emit_str_init(ret_str.data_offset, ret_str.max_length, ret_str.char_width);
     }
 
+    let stack_depth = ctx.function_stack_depth(func_info.function_id, &func.name.span())?;
     emitter.emit_call(
         func_info.function_id,
         func_info.num_params,
         func_info.var_offset,
-        func_info.max_stack_depth,
+        stack_depth,
     );
     ctx.record_call_edge(func_info.function_id);
     // A function leaves its outputs in its own output variables; storing
@@ -170,11 +171,11 @@ fn compile_reference_arg(
 /// being compiled is one.
 pub(crate) fn passes_by_reference(ctx: &CompileContext, name: &Id) -> bool {
     ctx.var_type_info(name).is_some()
-        && !ctx.string_vars.contains_key(name)
-        && !ctx.array_vars.contains_key(name)
-        && !ctx.struct_vars.contains_key(name)
-        && !ctx.struct_array_vars.contains_key(name)
-        && !ctx.fb_instances.contains_key(name)
+        && !ctx.string_var(name).is_some()
+        && !ctx.array_var(name).is_some()
+        && !ctx.struct_var(name).is_some()
+        && !ctx.struct_array_var(name).is_some()
+        && !ctx.fb_instance(name).is_some()
 }
 
 /// Pushes a reference to the variable `name`, which
@@ -188,8 +189,8 @@ pub(crate) fn emit_reference(
     if let Some(ref_slot) = ctx.in_out_ref_slot(name) {
         emitter.emit_load_var_i64(ref_slot);
     } else {
-        let var_index = ctx.var_index(name)?;
-        let pool_index = ctx.add_i64_constant(var_index.into());
+        let reference = crate::compile_reference::reference_to(ctx, name)?;
+        let pool_index = ctx.add_i64_constant(reference as i64);
         emitter.emit_load_const_i64(pool_index);
     }
     Ok(())

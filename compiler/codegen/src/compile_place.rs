@@ -133,7 +133,7 @@ impl<'ast> Place<&'ast Expr> {
         instance_name: &Id,
         field: &Id,
     ) -> Result<Option<Self>, Diagnostic> {
-        let Some(instance) = ctx.fb_instances.get(instance_name) else {
+        let Some(instance) = ctx.fb_instance(instance_name) else {
             return Ok(None);
         };
         let name = field.to_string().to_lowercase();
@@ -230,8 +230,7 @@ impl<S> Place<S> {
     ) -> Result<Self, Diagnostic> {
         let span = variable_span(reference);
         let ref_slot = resolve_variable_name(reference)
-            .filter(|name| !ctx.in_out_params.contains(*name))
-            .and_then(|name| ctx.variables.get(name).copied())
+            .and_then(|name| ctx.var_index(name).ok())
             .ok_or_else(|| {
                 Diagnostic::not_implemented(Label::span(
                     span.clone(),
@@ -291,6 +290,14 @@ impl<S> Place<S> {
 
 impl<S: Subscript> Place<S> {
     /// The type the place's value is loaded and stored at.
+    /// The variable whose slot the place is, when it is the whole of one.
+    pub(crate) fn variable(&self) -> Option<VarIndex> {
+        match &self.address {
+            Address::Variable(var_index) => Some(*var_index),
+            Address::Indirect(_) | Address::Element { .. } | Address::FbField { .. } => None,
+        }
+    }
+
     pub(crate) fn op_type(&self) -> OpType {
         self.type_info
             .map(|ti| (ti.op_width, ti.signedness))
@@ -568,7 +575,7 @@ fn variable_type_info(ctx: &CompileContext, name: Option<&Id>) -> Option<VarType
 
 /// Returns `true` if `name` is a STRING variable.
 fn is_string_variable(ctx: &CompileContext, name: Option<&Id>) -> bool {
-    name.is_some_and(|name| ctx.string_vars.contains_key(name))
+    name.is_some_and(|name| ctx.string_var(name).is_some())
 }
 
 /// A STRING lives in the data region rather than in one slot, so it is not a

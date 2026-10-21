@@ -6,13 +6,17 @@ use ironplc_dsl::core::FileId;
 use ironplc_dsl::textual::*;
 use ironplc_dsl::visitor::Visitor;
 use ironplc_parser::options::CompilerOptions;
+use ironplc_problems::Problem;
 
 use rstest::rstest;
 use spec_test_macro::spec_test;
 
 use crate::stages::analyze;
+use crate::test_helpers;
 use crate::type_environment::TypeEnvironment;
 use crate::value_type::operand_type_name;
+
+use call_arguments::call_arguments;
 
 /// The operands of every comparison in a library, in source order, each as
 /// the type it is compared at: `DINT->LINT` for a `DINT` converted to
@@ -75,20 +79,28 @@ impl Visitor<Infallible> for ComparisonOperands<'_> {
 /// Analyzes `source`, which must be free of diagnostics, and returns the
 /// operands of its comparisons.
 fn comparison_operands(source: &str) -> Vec<[String; 2]> {
+    let (operands, codes) = comparison_operands_and_codes(source);
+    assert!(codes.is_empty(), "unexpected diagnostics: {codes:?}");
+    operands
+}
+
+/// Analyzes `source` and returns the operands of its comparisons, and the
+/// codes of the problems the analysis reports.
+fn comparison_operands_and_codes(source: &str) -> (Vec<[String; 2]>, Vec<String>) {
     let options = CompilerOptions::default();
     let library = ironplc_parser::parse_program(source, &FileId::default(), &options).unwrap();
     let (library, context) = analyze(&[&library], &options).unwrap();
-    assert!(
-        !context.has_diagnostics(),
-        "unexpected diagnostics: {:?}",
-        context.diagnostics()
-    );
+    let codes = context
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.code.clone())
+        .collect();
     let mut visitor = ComparisonOperands {
         types: context.types(),
         operands: vec![],
     };
     let Ok(()) = visitor.walk(&library);
-    visitor.operands
+    (visitor.operands, codes)
 }
 
 /// The operands of every arithmetic operator expression and function form in
@@ -222,11 +234,18 @@ fn apply_when_right_operand_wider_then_left_converted() {
     assert_eq!(comparison_operands(&source), pair("DINT->LINT", "LINT"));
 }
 
+/// A pair neither of which widens to the other is reported; the pass still
+/// compares it at the concrete left operand's type.
 #[spec_test(REQ_IC_analyzer_011)]
 #[test]
-fn apply_when_neither_widens_then_right_converted_to_left() {
+fn apply_when_neither_widens_then_right_converted_to_left_and_reported() {
     let source = program("d : DINT; u : UDINT;", "d < u");
-    assert_eq!(comparison_operands(&source), pair("DINT", "UDINT->DINT"));
+    let (operands, codes) = comparison_operands_and_codes(&source);
+    assert_eq!(operands, pair("DINT", "UDINT->DINT"));
+    assert_eq!(
+        codes,
+        test_helpers::codes(&[Problem::OperatorOperandTypeMismatch])
+    );
 }
 
 /// A named subrange is compared at its base type, so it is the `INT` that
@@ -569,42 +588,6 @@ fn apply_when_subrange_target_then_converted_to_base_type() {
     let source = "TYPE Small : DINT (0..10); END_TYPE
         PROGRAM main VAR s : Small; l : LINT; END_VAR s := l; END_PROGRAM";
     assert_eq!(assigned_values(source), vec!["LINT->DINT"]);
-}
-
-/// The inputs of every call to `name` in `source`, which must be free of
-/// diagnostics, each as [`describe`] shows it.
-fn call_arguments(source: &str, name: &str) -> Vec<String> {
-    struct Arguments<'a> {
-        types: &'a TypeEnvironment,
-        name: &'a str,
-        arguments: Vec<String>,
-    }
-    impl Visitor<Infallible> for Arguments<'_> {
-        type Value = ();
-        fn visit_function(&mut self, node: &Function) -> Result<(), Infallible> {
-            if node.name.original().eq_ignore_ascii_case(self.name) {
-                let inputs = node.param_assignment.iter().filter_map(|p| p.input_expr());
-                self.arguments
-                    .extend(inputs.map(|e| describe(self.types, e)));
-            }
-            node.recurse_visit(self)
-        }
-    }
-    let options = CompilerOptions::default();
-    let library = ironplc_parser::parse_program(source, &FileId::default(), &options).unwrap();
-    let (library, context) = analyze(&[&library], &options).unwrap();
-    assert!(
-        !context.has_diagnostics(),
-        "unexpected diagnostics: {:?}",
-        context.diagnostics()
-    );
-    let mut visitor = Arguments {
-        types: context.types(),
-        name,
-        arguments: vec![],
-    };
-    let Ok(()) = visitor.walk(&library);
-    visitor.arguments
 }
 
 /// A function `f` whose one input is of type `param`, called as `f(<args>)`
@@ -998,6 +981,7 @@ fn apply_when_untyped_literal_typed_then_type_recorded_as_inferred() {
 }
 
 mod bitwise;
+mod call_arguments;
 mod call_result;
 mod fixed_result;
 mod fixed_type;

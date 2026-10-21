@@ -9,29 +9,54 @@
 //! either route, and the VM copies the instance's fields in and out around
 //! the body for every statement of it, as "One field model per body"
 //! requires until issue 2120 lands. The outputs are ordinary stores.
+//!
+//! An input is a value, a string or a structure or array, stored by an
+//! `Assign`, an `AssignStr` or a `Copy`. `FB_STORE_PARAM` stores in the
+//! field's slot what the AST route stores there: the value, the index of the
+//! temporary buffer that holds the string, or the region offset of the
+//! structure or array (`place::instance_slot`). An instance input is copied
+//! into the instance its field holds (`instance_copy.rs`).
 
 use ironplc_dsl::core::{Id, SourceSpan};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
 use ironplc_ir::lowered::{
-    Expr, ExprKind, Place as LoweredPlace, PouId, Projection, Stmt, StmtKind,
+    Expr, ExprKind, Place as LoweredPlace, PouId, Projection, Stmt, StmtKind, StrExpr,
 };
-use ironplc_lowering::Lowering;
+use ironplc_lowering::PartialProgram;
 
+use super::aggregate::emit_source;
 use super::expr::emit_expr;
+use super::instance_copy::{emit_instance_copy, instance_copy};
 use super::place::variable_name;
 use super::same_span;
+use super::string::emit_str_expr;
 use crate::compile::CompileContext;
-use crate::compile_call::standard_fb_layout;
 use crate::compile_fb_call::FbCallSite;
 use crate::emit::Emitter;
+use crate::held_instances::layout;
+use crate::layout::ids::LaidOut;
 
 /// The stores of a call's inputs and the call, at the head of a list of
 /// lowered statements.
 pub(super) struct CallSite<'s> {
     /// The name this backend's layout knows the instance by.
     instance: Id,
-    /// Each input's field, by name, and the value stored in it, in order.
-    inputs: Vec<(Id, &'s Expr)>,
+    /// Each input's field, by name, and what is stored in it, in order.
+    inputs: Vec<(Id, Input<'s>)>,
+}
+
+/// What a call stores in one of its inputs.
+enum Input<'s> {
+    /// A value, by an `Assign`.
+    Value(&'s Expr),
+    /// A string, by an `AssignStr`.
+    Str(&'s StrExpr),
+    /// The structure, array or instance at a place, `src`, by a `Copy` to
+    /// the field, `dst`.
+    Copy {
+        dst: &'s LoweredPlace,
+        src: &'s LoweredPlace,
+    },
 }
 
 impl CallSite<'_> {
@@ -46,13 +71,16 @@ impl CallSite<'_> {
 /// `stmts` does not start with one, as when a source assignment to a field
 /// comes before a separate call.
 pub(super) fn call_site<'s>(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     stmts: &'s [Stmt],
 ) -> Option<CallSite<'s>> {
     let span = stmts.first()?.span();
     let call_at = stmts.iter().position(|stmt| {
-        !matches!(stmt.kind(), StmtKind::Assign { .. }) || !same_span(stmt.span(), span)
+        !matches!(
+            stmt.kind(),
+            StmtKind::Assign { .. } | StmtKind::AssignStr { .. } | StmtKind::Copy { .. }
+        ) || !same_span(stmt.span(), span)
     })?;
     let call = &stmts[call_at];
     let StmtKind::FbCall { instance, .. } = call.kind() else {
@@ -73,7 +101,7 @@ pub(super) fn call_site<'s>(
 
 /// The call site of `instance` with no inputs: a lone `FbCall`.
 pub(super) fn bare_call<'s>(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     instance: &LoweredPlace,
 ) -> Option<CallSite<'s>> {
@@ -87,24 +115,38 @@ pub(super) fn bare_call<'s>(
 pub(super) fn emit_call_site(
     emitter: &mut Emitter,
     ctx: &mut CompileContext,
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     call: &CallSite<'_>,
     span: &SourceSpan,
 ) -> Result<(), Diagnostic> {
     let site = FbCallSite::open(emitter, ctx, &call.instance, span)?;
-    for (field, value) in &call.inputs {
-        // `store_input` narrows a value to a field it records the type of,
-        // as the AST route does, so the narrowing lowering made
-        // (REQ-LOW-lowering-046) is left to it rather than emitted twice.
-        let narrowed_by_site = ctx.fb_instances.get(&call.instance).is_some_and(|info| {
-            info.field_types
-                .contains_key(&field.to_string().to_lowercase())
-        });
-        let value = match untruncated(value) {
-            Some(inner) if narrowed_by_site => inner,
-            Some(_) | None => value,
-        };
-        emit_expr(emitter, ctx, lowering, value)?;
+    for (field, input) in &call.inputs {
+        match input {
+            Input::Value(value) => {
+                // `store_input` narrows a value to a field it records the
+                // type of, as the AST route does, so the narrowing lowering
+                // made (REQ-LOW-lowering-046) is left to it rather than
+                // emitted twice.
+                let narrowed_by_site = ctx.fb_instance(&call.instance).is_some_and(|info| {
+                    info.field_types
+                        .contains_key(&field.to_string().to_lowercase())
+                });
+                let value = match untruncated(value) {
+                    Some(inner) if narrowed_by_site => inner,
+                    Some(_) | None => value,
+                };
+                emit_expr(emitter, ctx, lowering, value)?;
+            }
+            Input::Str(value) => emit_str_expr(emitter, ctx, lowering, value)?,
+            Input::Copy { dst, src } => {
+                // An instance is copied into the instance the field holds.
+                if let Some(copy) = instance_copy(lowering, ctx, dst, src) {
+                    emit_instance_copy(emitter, &copy);
+                    continue;
+                }
+                emit_source(emitter, ctx, lowering, src, span)?
+            }
+        }
         site.store_input(emitter, field)?;
     }
     site.close(emitter, ctx);
@@ -120,28 +162,20 @@ pub(super) fn emit_call_site(
 /// runs the VM's block on the instance, as the route that reads the AST
 /// calls it.
 pub(super) fn reaches_block(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     ctx: &CompileContext,
     instance: &LoweredPlace,
     block: PouId,
 ) -> bool {
     let Some(fb_instance) =
-        variable_name(lowering, ctx, instance).and_then(|name| ctx.fb_instances.get(&name))
+        variable_name(lowering, ctx, instance).and_then(|name| ctx.fb_instance(&name))
     else {
         return false;
     };
-    let Some(name) = lowering.pous().name(block) else {
+    let Some(LaidOut::Block(name)) = ctx.lowered_ids.pou(block) else {
         return false;
     };
-    let name = name.to_string().to_uppercase();
-    let type_id = match ctx.user_fb_types.get(&name) {
-        Some(user_fb) => Some(user_fb.type_id),
-        None => ctx
-            .standard_blocks
-            .get(&name)
-            .map(|standard| standard_fb_layout(*standard).0),
-    };
-    type_id == Some(fb_instance.type_id)
+    layout(ctx, name).is_some_and(|layout| layout.type_id == fb_instance.type_id)
 }
 
 /// The internal error for a call `can_emit` should have left to the AST
@@ -153,15 +187,27 @@ pub(super) fn no_instance(span: &SourceSpan) -> Diagnostic {
     ))
 }
 
-/// The field and value of `stmt` when it stores a value in a field of
-/// `instance`.
+/// The field of `instance` that `stmt` stores in, and what it stores; `None`
+/// when `stmt` stores in no field of `instance`.
 fn input<'s>(
-    lowering: &Lowering<'_>,
+    lowering: &PartialProgram,
     instance: &LoweredPlace,
     stmt: &'s Stmt,
-) -> Option<(Id, &'s Expr)> {
-    let StmtKind::Assign { place, value } = stmt.kind() else {
-        return None;
+) -> Option<(Id, Input<'s>)> {
+    let (place, input) = match stmt.kind() {
+        StmtKind::Assign { place, value } => (place, Input::Value(value)),
+        StmtKind::AssignStr { place, value } => (place, Input::Str(value)),
+        StmtKind::Copy { dst, src } => (dst, Input::Copy { dst, src }),
+        StmtKind::AssignBits { .. }
+        | StmtKind::Call { .. }
+        | StmtKind::FbCall { .. }
+        | StmtKind::If { .. }
+        | StmtKind::Case { .. }
+        | StmtKind::For { .. }
+        | StmtKind::Loop { .. }
+        | StmtKind::Exit(_)
+        | StmtKind::Continue(_)
+        | StmtKind::Return => return None,
     };
     let (Projection::Field(field), prefix) = place.path().split_last()? else {
         return None;
@@ -179,7 +225,7 @@ fn input<'s>(
         .types()
         .fields(instance.ty())?
         .get(field.index() as usize)?;
-    Some((Id::from(&declared.name.to_string()), value))
+    Some((Id::from(&declared.name.to_string()), input))
 }
 
 /// Whether two steps of a path to an instance are the same step. An instance

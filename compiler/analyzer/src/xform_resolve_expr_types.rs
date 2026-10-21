@@ -7,7 +7,7 @@
 //! `value_type::operand_type_name`.
 use ironplc_dsl::common::*;
 use ironplc_dsl::core::{Id, Located};
-use ironplc_dsl::diagnostic::{Diagnostic, Label};
+use ironplc_dsl::diagnostic::Diagnostic;
 use ironplc_dsl::fold::Fold;
 use ironplc_dsl::scope::ScopeNode;
 use ironplc_dsl::textual::*;
@@ -165,28 +165,21 @@ impl ExprTypeResolver<'_> {
                 prefer_concrete(&op.left.expr_type, &op.right.expr_type)
             }
             ExprKind::UnaryOp(op) => op.term.expr_type.clone(),
-            ExprKind::Compare(compare) => match compare.op {
-                // AND, OR and XOR have the type both operands widen to, as
-                // their function forms do: `w OR lw` on a `WORD` and an
-                // `LWORD` is an `LWORD`, and `d AND 16#FF` on a `DWORD` is a
-                // `DWORD`.
-                CompareOp::And | CompareOp::Or | CompareOp::Xor => self.inputs_of_one_type_result(
+            ExprKind::Compare(compare) => match compare.op.kind() {
+                // AND, OR and XOR, and their short-circuit forms AND_THEN
+                // and OR_ELSE, have the type both operands widen to, as the
+                // function forms do: `w OR lw` on a `WORD` and an `LWORD` is
+                // an `LWORD`, and `d AND 16#FF` on a `DWORD` is a `DWORD`.
+                CompareOpKind::Bitwise => self.inputs_of_one_type_result(
                     &[&compare.left, &compare.right],
                     InputsOfOneType {
                         first: 0,
                         result: OneTypeResult::Common,
                     },
                 ),
-                // Only `BOOL`s.
-                CompareOp::AndThen | CompareOp::OrElse => {
-                    prefer_concrete(&compare.left.expr_type, &compare.right.expr_type)
+                CompareOpKind::Equality | CompareOpKind::Ordering => {
+                    self.expr_type_named(TypeName::from("BOOL"))
                 }
-                CompareOp::Eq
-                | CompareOp::Ne
-                | CompareOp::Lt
-                | CompareOp::Gt
-                | CompareOp::LtEq
-                | CompareOp::GtEq => self.expr_type_named(TypeName::from("BOOL")),
             },
             ExprKind::Function(f) => {
                 if let Some(result) = self.resolve_overloaded_call(f) {
@@ -228,16 +221,21 @@ impl ExprTypeResolver<'_> {
                         }
                     })
             }
-            // The method's return type. A call on `THIS^`/`SUPER^`, or to a
-            // method without a return type, has no type here; the method
-            // call rule reports both.
+            // The method's return type. A call to a method without a return
+            // type has no type here; the method call rule reports it.
             ExprKind::MethodCall(call) => {
-                let MethodReceiver::Instance(instance) = &call.receiver else {
-                    return None;
+                let block = match &call.receiver {
+                    MethodReceiver::Instance(instance) => self.declared_type_id(instance)?,
+                    MethodReceiver::SelfRef(self_ref) => {
+                        let block = self
+                            .symbols
+                            .self_type(&self.scope.current(), self_ref.kind)?;
+                        self.type_environment.id_of(&block)?
+                    }
                 };
                 // The result's type named again, as a function call's
                 // is, so a `STRING[10]` result types the call as `STRING`.
-                let result = self.method(instance, &call.method)?.result_type()?;
+                let result = self.method_of(block, &call.method)?.result_type()?;
                 let return_type = self.type_environment.name_of(result)?.clone();
                 self.expr_type_named(return_type)
             }
@@ -303,15 +301,17 @@ impl ExprTypeResolver<'_> {
             CallFrame::Method {
                 receiver: MethodReceiver::Instance(instance),
                 method,
-            } => self.method(instance, method)?.output_type(output),
+            } => {
+                let block = self.declared_type_id(instance)?;
+                self.method_of(block, method)?.output_type(output)
+            }
             CallFrame::Method { .. } => None,
         }
     }
 
     /// The signature of the method `method` called on the function block
-    /// instance `instance`: the one its block declares or inherits.
-    fn method(&self, instance: &Id, method: &Id) -> Option<&MethodSignature> {
-        let block = self.declared_type_id(instance)?;
+    /// `block`: the one it declares or inherits.
+    fn method_of(&self, block: TypeId, method: &Id) -> Option<&MethodSignature> {
         self.type_environment
             .method(block, method)
             .map(|(_, signature)| signature)
@@ -462,7 +462,8 @@ impl ExprTypeResolver<'_> {
     /// When no input's type accepts every other one -- a `DINT` and a `UDINT`
     /// -- the call has the type of its first concrete input, else of its
     /// first, as a comparison of such a pair compares at its concrete left
-    /// operand's (#1931).
+    /// operand's. Unlike the comparison, the call is not reported yet
+    /// (#2127).
     fn inputs_of_one_type_result(
         &self,
         inputs: &[&Expr],
@@ -575,17 +576,10 @@ impl Fold<Diagnostic> for ExprTypeResolver<'_> {
         &mut self,
         node: SelfRefVariable,
     ) -> Result<SelfRefVariable, Diagnostic> {
-        // Fail rather than resolve to "unknown": every downstream consumer
-        // of this pass treats an unresolved type as a fact about the
-        // program, and silently producing one here would let THIS^/SUPER^
-        // through unnoticed once it is otherwise supported. See issue #1406.
-        Err(Diagnostic::not_implemented(Label::span(
-            node.span(),
-            format!(
-                "{} is recognized but its type cannot be resolved by IronPLC yet",
-                node.kind.spelling()
-            ),
-        )))
+        // `THIS^`/`SUPER^` with nothing to refer to (outside a function
+        // block, or `SUPER^` without a base) is reported by
+        // `rule_self_reference_context`; its members then have no type.
+        Ok(node)
     }
 
     fn fold_expr(&mut self, node: Expr) -> Result<Expr, Diagnostic> {
@@ -595,14 +589,7 @@ impl Fold<Diagnostic> for ExprTypeResolver<'_> {
         // An unqualified enumerated value compared with a value of an
         // enumeration type has that type.
         if let ExprKind::Compare(compare) = &mut expr.kind {
-            if !matches!(
-                compare.op,
-                CompareOp::And
-                    | CompareOp::Or
-                    | CompareOp::Xor
-                    | CompareOp::AndThen
-                    | CompareOp::OrElse
-            ) {
+            if compare.op.is_comparison() {
                 let left = self.expr_context(&compare.left);
                 let right = self.expr_context(&compare.right);
                 self.type_from_context(&mut compare.right, left);

@@ -17,19 +17,21 @@ use super::loops::{build_for, build_loop, expand_for, ForParts, LoopScope};
 use super::place::Place;
 use super::stmt::{store_narrowing, Stmt};
 use super::str_expr::StrExpr;
-use super::types::{NarrowWidth, Nullability, TypeEntry, TypeKind, TypeTable};
-use super::variables::{by_value, FunctionSignature, Owner, PouTable, VariableTable};
+use super::types::{NarrowWidth, Nullability, Section, TypeEntry, TypeKind, TypeTable};
+use super::variables::{by_value, Declared, FunctionSignature, Owner, PouTable, VariableTable};
 use crate::execution::DebugName;
 
 /// Builds one lowered program.
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder {
-    stamp: Stamp,
+    pub(super) stamp: Stamp,
     /// How many loops the builder has opened.
     loops: u32,
-    types: TypeTable,
-    variables: VariableTable,
-    pous: PouTable,
+    pub(super) types: TypeTable,
+    pub(super) variables: VariableTable,
+    pub(super) pous: PouTable,
+    /// The statements of `init`, in order (see [`super::Program`]).
+    pub(super) init: Vec<Stmt>,
 }
 
 impl Default for ProgramBuilder {
@@ -48,6 +50,7 @@ impl ProgramBuilder {
             types: TypeTable::new(stamp),
             variables: VariableTable::new(stamp),
             pous: PouTable::new(stamp),
+            init: Vec::new(),
         }
     }
 
@@ -77,6 +80,36 @@ impl ProgramBuilder {
     /// Adds the type `entry`; see [`TypeTable::push`] for what it must be. The
     /// body of a function block or program type is a POU of this program.
     pub fn push_type(&mut self, entry: TypeEntry, span: &SourceSpan) -> Result<TypeId, Diagnostic> {
+        self.check_body(&entry, "ProgramBuilder::push_type", span)?;
+        self.types.push(entry, span)
+    }
+
+    /// Declares a type that [`ProgramBuilder::define_type`] gives its entry
+    /// later; see [`TypeTable::declare`].
+    pub fn declare_type(&mut self) -> TypeId {
+        self.types.declare()
+    }
+
+    /// Gives the type `id` declares its entry, which is one
+    /// [`ProgramBuilder::push_type`] would add; see [`TypeTable::define`].
+    pub fn define_type(
+        &mut self,
+        id: TypeId,
+        entry: TypeEntry,
+        span: &SourceSpan,
+    ) -> Result<(), Diagnostic> {
+        self.check_body(&entry, "ProgramBuilder::define_type", span)?;
+        self.types.define(id, entry, span)
+    }
+
+    /// Why `entry` cannot be added, if it is a function block or program type
+    /// whose body is not a POU of this program.
+    fn check_body(
+        &self,
+        entry: &TypeEntry,
+        constructor: &str,
+        span: &SourceSpan,
+    ) -> Result<(), Diagnostic> {
         let body = match &entry.kind {
             TypeKind::FunctionBlock { body, .. } | TypeKind::Program { body, .. } => Some(*body),
             TypeKind::Bool
@@ -93,20 +126,35 @@ impl ProgramBuilder {
         };
         if let Some(body) = body.filter(|body| self.pous.name(*body).is_none()) {
             return Err(broken(
-                "ProgramBuilder::push_type",
+                constructor,
                 span,
                 format!("the body {body} is not a POU of this program"),
             ));
         }
-        self.types.push(entry, span)
+        Ok(())
     }
 
-    /// Adds a variable named `name`, owned by `owner`, of type `ty`. The owner
-    /// is a POU of this program and the type a type of it.
+    /// Adds a temporary named `name`, owned by `owner`, of type `ty`: a
+    /// variable lowering makes, which no declaration declares. The owner is a
+    /// POU of this program and the type a type of it.
     pub fn push_variable(
         &mut self,
         name: DebugName,
         owner: Owner,
+        ty: TypeId,
+    ) -> Result<VarId, Diagnostic> {
+        let declared = Declared::in_section(Section::Temporary);
+        self.push_declared_variable(name, owner, declared, ty)
+    }
+
+    /// Adds a variable named `name`, owned by `owner`, declared as
+    /// `declared` says, of type `ty`. The owner is a POU of this program and
+    /// the type a type of it.
+    pub fn push_declared_variable(
+        &mut self,
+        name: DebugName,
+        owner: Owner,
+        declared: Declared,
         ty: TypeId,
     ) -> Result<VarId, Diagnostic> {
         if let Owner::Pou(pou) = owner {
@@ -118,7 +166,7 @@ impl ProgramBuilder {
                 ));
             }
         }
-        self.variables.push(&self.types, name, owner, ty)
+        self.variables.push(&self.types, name, owner, declared, ty)
     }
 
     /// The whole of the variable `root`, at its type.
@@ -183,13 +231,13 @@ impl ProgramBuilder {
         self.declare(CONSTRUCTOR, pou, parameters, Some(result), span)
     }
 
-    /// Declares the POU `pou` a function whose result is a string, which it
-    /// returns through its first parameter, the result parameter: a
-    /// non-null reference to a string, a variable `pou` owns
+    /// Declares the POU `pou` a function whose result is a string or a
+    /// structure, which it returns through its first parameter, the result
+    /// parameter: a non-null reference to the result, a variable `pou` owns
     /// (REQ-LOW-lowering-079). Its other parameters are as
-    /// [`Self::declare_function`]'s. A call of it is only a statement, which
-    /// passes a reference to a place of the string's type for the result
-    /// parameter.
+    /// [`Self::declare_function`]'s. A call of it passes a reference to a
+    /// place of the result's type for the result parameter, and is a
+    /// statement or, for a string, a string in-place call (REQ-LOW-ir-181).
     pub fn declare_function_returning_through(
         &mut self,
         pou: PouId,
@@ -201,18 +249,23 @@ impl ProgramBuilder {
             return Err(broken(CONSTRUCTOR, span, format!("{pou} is a method")));
         }
         let result = parameters.first().copied();
-        let to_string = result
+        let to_string_or_structure = result
             .and_then(|result| self.variables.get(result))
             .and_then(|result| match self.types.reference(result.ty()) {
                 Some((target, Nullability::NonNull)) => self.types.kind(target),
                 Some((_, Nullability::Nullable)) | None => None,
             })
-            .is_some_and(|target| matches!(target, TypeKind::String(_)));
-        let Some(result) = result.filter(|_| to_string) else {
+            .is_some_and(|target| {
+                matches!(target, TypeKind::String(_) | TypeKind::Structure { .. })
+            });
+        let Some(result) = result.filter(|_| to_string_or_structure) else {
             return Err(broken(
                 CONSTRUCTOR,
                 span,
-                format!("the first parameter of {pou} is not a non-null reference to a string"),
+                format!(
+                    "the first parameter of {pou} is not a non-null reference to a string \
+                     or a structure"
+                ),
             ));
         };
         self.check_parameters(CONSTRUCTOR, pou, &parameters, None, span)?;

@@ -25,12 +25,16 @@
 use ironplc_analyzer::symbol_environment::{
     DeclRef, Resolution, ScopeKind, ScopePath, SymbolInfo, SymbolKind,
 };
-use ironplc_dsl::common::{TypeName, VarDecl, VariableType};
+use ironplc_dsl::common::{
+    AddressAssignment, DeclarationQualifier, LocationPrefix, SizePrefix, TypeName, VarDecl,
+    VariableIdentifier, VariableType,
+};
 use ironplc_dsl::core::{Id, Located, SourceSpan};
 use ironplc_dsl::diagnostic::Diagnostic;
 use ironplc_ir::execution::DebugName;
 use ironplc_ir::lowered::{
-    Field, Nullability, Owner, Place, PouId, Section, TypeEntry, TypeId, TypeKind, VarId,
+    AddressArea, AddressSize, Declared, DirectAddress, Field, Nullability, Owner, Place, PouId,
+    Retention, Section, TypeEntry, TypeId, TypeKind, VarId,
 };
 
 use crate::{Body, Lowering};
@@ -51,7 +55,7 @@ pub(crate) struct BodyFrame {
 pub(crate) struct Instance {
     pub(crate) this: VarId,
     /// The type of the instance `this` refers to.
-    instance_type: TypeId,
+    pub(crate) instance_type: TypeId,
     /// The name of each field of the instance's type, by position.
     field_names: Vec<Id>,
     /// The scope that declares the fields: the body's own for a program or
@@ -85,7 +89,8 @@ impl<'a> Lowering<'a> {
         }
         let scope = ScopeKind::Named(ScopePath::new(path));
         let instance = match body {
-            Body::Program(program) if !program.access_variables.is_empty() => None,
+            // A program's `VAR_ACCESS` paths name other variables, and no
+            // statement names one, so they are no fields of its instance.
             Body::Program(program) => self
                 .program_instance(pou, &program.name, &program.variables)?
                 .map(Some),
@@ -172,34 +177,48 @@ impl<'a> Lowering<'a> {
     }
 
     /// The fields of the instance of a program that declares `variables`:
-    /// one for each variable, other than a `VAR_TEMP` or a `VAR_EXTERNAL`,
-    /// in the order they are declared, as a function block's are (see
-    /// `block_fields` in `types.rs`). `None` when lowering cannot express the
-    /// type of one of them yet.
+    /// one for each variable, in the order they are declared, as a function
+    /// block's are (see `block_fields` in `types.rs`), other than a
+    /// `VAR_TEMP`, a `VAR_EXTERNAL`, a global variable or an access path,
+    /// which a PLCopen program declares in its interface and statements
+    /// reach in global scope, and a located variable with no name, which no
+    /// statement names (REQ-LOW-lowering-170). `None` when lowering cannot
+    /// express the type of one of them yet.
     fn instance_fields(&mut self, variables: &[VarDecl]) -> Made<Vec<Field>> {
         let mut fields = Vec::new();
         for decl in variables {
             let section = match decl.var_type {
-                VariableType::VarTemp | VariableType::External => continue,
+                VariableType::VarTemp
+                | VariableType::External
+                | VariableType::Global
+                | VariableType::Access => continue,
                 VariableType::Var => Section::Local,
                 VariableType::Input => Section::Input,
                 VariableType::Output => Section::Output,
                 VariableType::InOut => Section::InOut,
-                VariableType::Global | VariableType::Access => return Ok(None),
             };
-            let (Some(field_name), Some(type_id)) = (decl.identifier.symbolic_id(), decl.type_id)
-            else {
+            let Some(field_name) = decl.identifier.symbolic_id() else {
+                continue;
+            };
+            let Some(type_id) = decl.type_id else {
                 return Ok(None);
             };
             let Some(ty) = self.lowered_type(type_id)? else {
                 return Ok(None);
             };
-            fields.push(Field::new(
+            let location = match &decl.identifier {
+                VariableIdentifier::Symbol(_) => None,
+                VariableIdentifier::Direct(direct) => {
+                    Some(direct_address(&direct.address_assignment))
+                }
+            };
+            let field = Field::new(
                 &field_name.to_string(),
                 field_name.span(),
                 Some(section),
                 ty,
-            ));
+            );
+            fields.push(field.declared(location, retention(&decl.qualifier)));
         }
         Ok(Some(fields))
     }
@@ -222,9 +241,10 @@ impl<'a> Lowering<'a> {
             .map(|field| Id::from(&field.name.to_string()))
             .collect();
         let this_type = self.non_null_reference(instance_type, &name.span())?;
-        let this = self.program.push_variable(
+        let this = self.program.push_declared_variable(
             DebugName::new("THIS", name.span()),
             Owner::Pou(pou),
+            Declared::in_section(Section::Instance),
             this_type,
         )?;
         Ok(Instance {
@@ -250,8 +270,10 @@ impl<'a> Lowering<'a> {
             | Resolution::NotAVariable
             | Resolution::Undeclared => return Ok(None),
         };
-        if decl.scope == ScopeKind::Global {
-            return self.declared_variable(decl, info, Owner::Global, false, span);
+        // A global variable, or one a PLCopen program declares global in its
+        // interface, which is no field of the program's instance.
+        if decl.scope == ScopeKind::Global || info.variable_type == Some(VariableType::Global) {
+            return self.global_variable(decl, info, span);
         }
         if let Some(instance) = frame
             .instance
@@ -293,12 +315,13 @@ impl<'a> Lowering<'a> {
         // reference to the caller's variable, and its `VAR_OUTPUT` one to the
         // temporary the call passes for it, each reached through `^`
         // (REQ-LOW-lowering-033, REQ-LOW-lowering-092). So is a function's
-        // string result, its result parameter (REQ-LOW-lowering-079).
+        // string or structure result, its result parameter
+        // (REQ-LOW-lowering-079).
         let owner = Owner::Pou(frame.pou);
         let by_reference = matches!(
             info.variable_type,
             Some(VariableType::InOut | VariableType::Output)
-        ) || self.is_string_result(frame, info)?;
+        ) || self.is_result_through_parameter(frame, info)?;
         if by_reference {
             let Some(parameter) = self.declared_variable(decl, info, owner, true, span)? else {
                 return Ok(None);
@@ -308,12 +331,63 @@ impl<'a> Lowering<'a> {
         self.declared_variable(decl, info, owner, false, span)
     }
 
+    /// The variable of the global `name`, declared in global scope; `None`
+    /// when it is not one lowering can express yet. A `VAR_GLOBAL` a body
+    /// reaches only through a `VAR_EXTERNAL` is the same variable.
+    pub(crate) fn global_place(&mut self, name: &Id, span: &SourceSpan) -> Made<Place> {
+        let symbols = self.analysis.context().symbols();
+        match symbols.resolve_variable(name, &ScopeKind::Global) {
+            Resolution::Variable { decl, info } | Resolution::GlobalNotVisible { decl, info } => {
+                self.global_variable(decl, info, span)
+            }
+            Resolution::NotAVariable | Resolution::Undeclared => Ok(None),
+        }
+    }
+
+    /// The variable of the global `decl` declares, which `info` describes.
+    fn global_variable(
+        &mut self,
+        decl: DeclRef,
+        info: &SymbolInfo,
+        span: &SourceSpan,
+    ) -> Made<Place> {
+        // A `VAR_EXTERNAL` resolves to its global, whose declaration, not
+        // the external's, says whether it is retained or located.
+        let info = if decl.scope == ScopeKind::Global {
+            self.analysis
+                .context()
+                .symbols()
+                .global_variable(&decl.name)
+                .map_or(info, |(_, global)| global)
+        } else {
+            info
+        };
+        self.declared_variable(decl, info, Owner::Global, false, span)
+    }
+
+    /// Whether `name`, in the body of `frame`, names a `VAR_IN_OUT`.
+    pub(crate) fn is_in_out(&self, frame: &BodyFrame, name: &Id) -> bool {
+        match self
+            .analysis
+            .context()
+            .symbols()
+            .resolve_variable(name, &frame.scope)
+        {
+            Resolution::Variable { info, .. } => info.variable_type == Some(VariableType::InOut),
+            Resolution::GlobalNotVisible { .. }
+            | Resolution::NotAVariable
+            | Resolution::Undeclared => false,
+        }
+    }
+
     /// Whether `info` is the result of the function whose body `frame` is,
-    /// and the result is a string, which the function returns through its
-    /// result parameter (REQ-LOW-lowering-079). A method's result is a
-    /// scalar: the route that reads the AST does not compile a method whose
-    /// result is a string.
-    fn is_string_result(
+    /// and the result is a string or a structure, which the function returns
+    /// through its result parameter (REQ-LOW-lowering-079). A method's
+    /// result is not: the route that reads the AST does not compile a method
+    /// whose result is a string, and a method whose result is a structure is
+    /// not lowered yet. A function whose result is an array is not lowered:
+    /// the route that reads the AST does not compile one.
+    fn is_result_through_parameter(
         &mut self,
         frame: &BodyFrame,
         info: &SymbolInfo,
@@ -329,7 +403,7 @@ impl<'a> Lowering<'a> {
         };
         Ok(matches!(
             self.program.types().kind(ty),
-            Some(TypeKind::String(_))
+            Some(TypeKind::String(_) | TypeKind::Structure { .. })
         ))
     }
 
@@ -347,7 +421,7 @@ impl<'a> Lowering<'a> {
         let id = match self.declared.get(&decl) {
             Some(id) => *id,
             None => {
-                let Some(type_id) = info.type_id else {
+                let (Some(type_id), Some(declared)) = (info.type_id, declared(info, owner)) else {
                     return Ok(None);
                 };
                 let Some(mut ty) = self.lowered_type(type_id)? else {
@@ -357,7 +431,9 @@ impl<'a> Lowering<'a> {
                     ty = self.non_null_reference(ty, &info.span)?;
                 }
                 let name = DebugName::new(decl.name.to_string(), info.span.clone());
-                let id = self.program.push_variable(name, owner, ty)?;
+                let id = self
+                    .program
+                    .push_declared_variable(name, owner, declared, ty)?;
                 self.declared.insert(decl, id);
                 id
             }
@@ -381,5 +457,65 @@ impl<'a> Lowering<'a> {
             },
             span,
         )
+    }
+}
+
+/// What the declaration `info` describes says of its variable, which `owner`
+/// owns: its section, its direct address and its retention
+/// (REQ-LOW-lowering-023, REQ-LOW-lowering-024). A variable the program
+/// owns is a global, a compiler-provided one included, which records no
+/// section. A function's or method's result is an output, as the debug
+/// section shows it. `None` for a declaration that is no variable lowering
+/// expresses yet, a `VAR_ACCESS`.
+fn declared(info: &SymbolInfo, owner: Owner) -> Option<Declared> {
+    let section = if owner == Owner::Global {
+        Section::Global
+    } else if matches!(info.kind, SymbolKind::ResultVariable) {
+        Section::Output
+    } else {
+        match &info.variable_type {
+            Some(VariableType::Global | VariableType::External) => Section::Global,
+            Some(VariableType::Input) => Section::Input,
+            Some(VariableType::Output) => Section::Output,
+            Some(VariableType::InOut) => Section::InOut,
+            Some(VariableType::Var) => Section::Local,
+            Some(VariableType::VarTemp) => Section::Temporary,
+            Some(VariableType::Access) | None => return None,
+        }
+    };
+    Some(Declared {
+        section,
+        location: info.address.as_ref().map(direct_address),
+        retention: info.qualifier.as_ref().map_or(Retention::None, retention),
+    })
+}
+
+/// The retention a declaration with `qualifier` states.
+pub(crate) fn retention(qualifier: &DeclarationQualifier) -> Retention {
+    match qualifier {
+        DeclarationQualifier::Retain => Retention::Retain,
+        DeclarationQualifier::NonRetain => Retention::NonRetain,
+        DeclarationQualifier::Persistent => Retention::Persistent,
+        DeclarationQualifier::Unspecified | DeclarationQualifier::Constant => Retention::None,
+    }
+}
+
+/// The lowered form of the direct address `address`.
+pub(crate) fn direct_address(address: &AddressAssignment) -> DirectAddress {
+    DirectAddress {
+        area: match address.location {
+            LocationPrefix::I => AddressArea::Input,
+            LocationPrefix::Q => AddressArea::Output,
+            LocationPrefix::M => AddressArea::Memory,
+        },
+        size: match address.size {
+            SizePrefix::Nil | SizePrefix::X => AddressSize::Bit,
+            SizePrefix::B => AddressSize::Byte,
+            SizePrefix::W => AddressSize::Word,
+            SizePrefix::D => AddressSize::DoubleWord,
+            SizePrefix::L => AddressSize::LongWord,
+            SizePrefix::Unspecified => AddressSize::Unspecified,
+        },
+        path: address.address.clone(),
     }
 }

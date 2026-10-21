@@ -10,9 +10,9 @@
 //! copy of the store sequence makes the two observably the same thing at
 //! runtime.
 
-use crate::initial_value::{InitialValue, ScalarValue};
 use ironplc_dsl::core::{Id, Located};
 use ironplc_dsl::diagnostic::{Diagnostic, Label};
+use ironplc_lowering::initial_value::{InitialValue, ScalarValue};
 
 use super::compile::{CompileContext, OpType};
 use super::compile_expr::compile_expr;
@@ -108,8 +108,7 @@ pub(crate) fn emit_fb_instance_member_initializers(
 /// The operation type of `field` of the instance `instance_name`, when its
 /// block records one for the field.
 fn field_op_type(ctx: &CompileContext, instance_name: &Id, field: &Id) -> Option<OpType> {
-    ctx.fb_instances
-        .get(instance_name)?
+    ctx.fb_instance(instance_name)?
         .field_types
         .get(&field.to_string().to_lowercase())
         .map(|field_type| (field_type.op_width, field_type.signedness))

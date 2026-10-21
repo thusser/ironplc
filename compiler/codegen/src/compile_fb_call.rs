@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use ironplc_container::FbTypeId;
 use ironplc_dsl::core::{Id, Located, SourceSpan};
 use ironplc_dsl::diagnostic::Diagnostic;
 
@@ -18,7 +19,7 @@ use crate::emit::Emitter;
 pub(crate) struct FbCallSite {
     /// The type `FB_CALL` dispatches on: a user-defined block's, or a
     /// standard block's in the VM.
-    type_id: u16,
+    type_id: FbTypeId,
     /// The index of each field of the instance, by its lower-case name.
     field_indices: HashMap<String, u8>,
     /// The declared type of each field of the instance, by its lower-case
@@ -36,8 +37,7 @@ impl FbCallSite {
         span: &SourceSpan,
     ) -> Result<Self, Diagnostic> {
         let info = ctx
-            .fb_instances
-            .get(instance)
+            .fb_instance(instance)
             .ok_or_else(|| Diagnostic::todo_with_span(span.clone()))?;
         emitter.emit_fb_load_instance(info.var_index);
         Ok(Self {
@@ -82,7 +82,7 @@ impl FbCallSite {
 mod tests {
     use std::collections::HashMap;
 
-    use ironplc_container::VarIndex;
+    use ironplc_container::{FbTypeId, VarIndex};
     use ironplc_dsl::core::{Id, SourceSpan};
 
     use super::FbCallSite;
@@ -111,13 +111,15 @@ mod tests {
     fn store_input_when_instance_has_no_such_field_then_not_implemented() {
         let mut ctx = CompileContext::new();
         ctx.fb_instances.insert(
+            ctx.scope,
             Id::from("f"),
             FbInstanceInfo {
                 var_index: VarIndex::new(0),
-                type_id: 0,
+                type_id: FbTypeId::default(),
                 data_offset: 0,
                 field_indices: HashMap::new(),
                 field_types: HashMap::new(),
+                held: Vec::new(),
             },
         );
         let mut emitter = Emitter::new();
