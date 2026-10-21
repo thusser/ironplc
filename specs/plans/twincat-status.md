@@ -27,9 +27,12 @@ on the merged tree with `ironplcc check --dialect twincat`:
 
 - `THIS^.x := x;` in a method: clean.
 - #1889, `Advance();` for an own method without `THIS^.`: still P4012.
-- #2143, `flag := THIS^.Prop;` (INT into BOOL): still passes unreported. The
-  analyzer test `analyze_when_self_ref_names_a_non_field_then_pinned_untyped_and_unreported`
-  pins the wrong behavior and has to change with the fix.
+- #2143, `flag := THIS^.Prop;` (INT into BOOL): passed unreported. Fixed in
+  **#2452** (branch `fix-self-ref-property-type`, merged into `twincat-dev`):
+  the property is registered with its declared type, so the mismatch is P4035
+  and `SUPER^.Prop` and inherited properties are typed too. The corpus (218
+  files) is unchanged. The `THIS^.other_local` and `THIS^.Other` cases stay
+  pinned as untyped and unreported.
 
 **Open work.**
 
@@ -48,9 +51,8 @@ on the merged tree with `ironplcc check --dialect twincat`:
   `REFERENCE TO`, and the opt-in flag. `license/cla` showed no result on both
   PRs (and on #1998); not checked why.
 
-**Order proposed.** #2143 first (small; the type comes from the symbol
-environment), then the #2370 follow-up, then #1889 after #2369 settles because
-both touch call resolution. #1430 (qualified names) stays blocked on a design
+**Order proposed.** #2143 is done (#2452, waiting for review). Next the #2370
+follow-up, then #1889 after #2369 settles because both touch call resolution. #1430 (qualified names) stays blocked on a design
 decision with garretfick. One branch per fix from `origin/main`, merged into
 `twincat-dev` afterward.
 
