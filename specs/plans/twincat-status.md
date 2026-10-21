@@ -6,6 +6,54 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-10-21: synced to `main` @ `ef74fc120`; OOP PRs landed; open work sorted
+
+`twincat-dev` merged `origin/main` (77 commits) with no conflicts, merge commit
+`4fb0e4d2a`. Not pushed. The test suite was not run after the merge.
+
+**The 2026-10-17 entry's "waiting for review" list is out of date.** garretfick
+landed all of it himself, with the commits still authored by thusser:
+
+- **#2148** closed, landed as **#2378**. Same commit plus one fix: the pass asks
+  `SymbolEnvironment::resolve_variable` instead of `find`, so in the strict
+  dialect a `VAR_GLOBAL` not reached through `VAR_EXTERNAL` no longer hides an
+  enumerated value.
+- **#2000** closed, landed as **#2389** (all commits plus a merge of `main`).
+- **#1900** squash-merged. **#1901** closed, landed as **#2370**.
+- **#1998** closed (superseded by #2389). #1999 was already closed.
+
+**Issues.** #1888 (`THIS^` has no type) is fixed by #2389 and closed. Repros run
+on the merged tree with `ironplcc check --dialect twincat`:
+
+- `THIS^.x := x;` in a method: clean.
+- #1889, `Advance();` for an own method without `THIS^.`: still P4012.
+- #2143, `flag := THIS^.Prop;` (INT into BOOL): still passes unreported. The
+  analyzer test `analyze_when_self_ref_names_a_non_field_then_pinned_untyped_and_unreported`
+  pins the wrong behavior and has to change with the fix.
+
+**Open work.**
+
+- **#2370 follow-up, not started by anyone as far as I can see.** Five known
+  gaps: (1) `IMPLEMENTS` of an undeclared name or a non-interface is accepted,
+  (2) a block that inherits `IMPLEMENTS` through `EXTENDS` is not checked, so a
+  derived override with a different signature still converts to the interface,
+  (3) the same P4067/P4068 is reported twice when a block implements an
+  interface and one that extends it, (4) the rule builds its own parameter list
+  instead of the one call binding uses, (5) docs: `implements.rst` repeats
+  P4068's rules, and `P4067.rst` should say `METHOD ABSTRACT` counts. Gaps 1 and
+  2 accept wrong code.
+- **#2369** (method-call receivers plan) and **#1870** (OOP dispatch design):
+  review requested from garretfick in a comment today. #1870 still has open
+  points: which instances get a table entry, interface values from a
+  `REFERENCE TO`, and the opt-in flag. `license/cla` showed no result on both
+  PRs (and on #1998); not checked why.
+
+**Order proposed.** #2143 first (small; the type comes from the symbol
+environment), then the #2370 follow-up, then #1889 after #2369 settles because
+both touch call resolution. #1430 (qualified names) stays blocked on a design
+decision with garretfick. One branch per fix from `origin/main`, merged into
+`twincat-dev` afterward.
+
 ## 2026-10-17: synced to `main` @ `be6c29bf1`; corpus re-checked; method-call receivers planned
 
 `twincat-dev` merged `origin/main` (258 commits) with no conflicts, merge
