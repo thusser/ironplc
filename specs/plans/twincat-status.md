@@ -36,25 +36,31 @@ on the merged tree with `ironplcc check --dialect twincat`:
 
 **Open work.**
 
-- **#2370 follow-up, not started by anyone as far as I can see.** Five known
-  gaps: (1) `IMPLEMENTS` of an undeclared name or a non-interface is accepted,
-  (2) a block that inherits `IMPLEMENTS` through `EXTENDS` is not checked, so a
-  derived override with a different signature still converts to the interface,
-  (3) the same P4067/P4068 is reported twice when a block implements an
-  interface and one that extends it, (4) the rule builds its own parameter list
-  instead of the one call binding uses, (5) docs: `implements.rst` repeats
-  P4068's rules, and `P4067.rst` should say `METHOD ABSTRACT` counts. Gaps 1 and
-  2 accept wrong code.
+- **#2370 follow-up: already done.** #2375 (merged 2026-10-17) closed all
+  five gaps: P4070 for an `IMPLEMENTS` name that is not an interface, inherited
+  interfaces checked, each problem reported once, the rule compares the
+  signatures the type environment records, and the docs fixed. The first
+  version of this entry listed them as open because it only read #2370.
+- **#2146** (member FB instance calls): arguments of `inst.inner(...)` are not
+  checked against the instance's inputs (`rule_method_call_declared::is_member_instance`
+  returns early), codegen reports P9999 for a call through `THIS^`/`SUPER^`, and
+  `method_arguments` records no implicit conversions for those calls. Not
+  started. It touches the same call resolution as #1889 and #2369.
+- **#1894** (modules over 1000 lines): `xform_resolve_symbol_and_function_environment.rs`
+  and `xform_resolve_type_decl_environment.rs` can drop under the limit by moving
+  `mod tests` to a sibling file (behaviour-preserving, one PR each).
+  `parser.rs` (2389) and `renderer.rs` (2131) need a real seam. Not started.
 - **#2369** (method-call receivers plan) and **#1870** (OOP dispatch design):
   review requested from garretfick in a comment today. #1870 still has open
   points: which instances get a table entry, interface values from a
   `REFERENCE TO`, and the opt-in flag. `license/cla` showed no result on both
   PRs (and on #1998); not checked why.
 
-**Order proposed.** #2143 is done (#2452, waiting for review). Next the #2370
-follow-up, then #1889 after #2369 settles because both touch call resolution. #1430 (qualified names) stays blocked on a design
-decision with garretfick. One branch per fix from `origin/main`, merged into
-`twincat-dev` afterward.
+**Order proposed.** #2143 is done (#2452, waiting for review). The #2370
+follow-up needs no work. #1889 and #2146 wait for #2369 because all three touch
+call resolution. #1894's two analyzer test moves can go anytime. #1430
+(qualified names) stays blocked on a design decision with garretfick. One branch
+per fix from `origin/main`, merged into `twincat-dev` afterward.
 
 ## 2026-10-17: synced to `main` @ `be6c29bf1`; corpus re-checked; method-call receivers planned
 
