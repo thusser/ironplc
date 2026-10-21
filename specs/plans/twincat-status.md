@@ -47,9 +47,10 @@ on the merged tree with `ironplcc check --dialect twincat`:
   `method_arguments` records no implicit conversions for those calls. Not
   started. It touches the same call resolution as #1889 and #2369.
 - **#1894** (modules over 1000 lines): `xform_resolve_symbol_and_function_environment.rs`
-  and `xform_resolve_type_decl_environment.rs` can drop under the limit by moving
-  `mod tests` to a sibling file (behaviour-preserving, one PR each).
-  `parser.rs` (2389) and `renderer.rs` (2131) need a real seam. Not started.
+  was already split on `main`. `xform_resolve_type_decl_environment.rs` is
+  split in **#2453** (tests moved to a sibling file, merged into `twincat-dev`,
+  waiting for review). `parser.rs` (2389) and `renderer.rs` (2131) need a real
+  seam and are not started.
 - **#2369** (method-call receivers plan) and **#1870** (OOP dispatch design):
   review requested from garretfick in a comment today. #1870 still has open
   points: which instances get a table entry, interface values from a
