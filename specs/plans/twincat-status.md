@@ -6,6 +6,19 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-10-29: synced to upstream `main` @ `8a75b19e7`
+
+`twincat-dev` merged `upstream/main` (`ironplc/ironplc`, 64 commits) with no
+conflicts, merge commit `2106c764c`, pushed. `cargo test --workspace` passes
+(11169 passed, 0 failed, 194 ignored). The fork's own `main` is still at
+`10769d995` (2026-07-21); `twincat-dev` is the branch that tracks upstream.
+
+Upstream #1199 (TwinCAT dialect tracking) was closed as completed on
+2026-09-08; remaining gaps are tracked as individual issues (#1430 qualified
+names, #1422 method-call receivers, #1692, #1425, #1429, #1498 design-doc
+audit). Fork PR #1 (pragma skipping) was closed: its tree is identical to
+upstream #1207, already on `main`.
+
 ## 2026-10-21: synced to `main` @ `ef74fc120`; OOP PRs landed; open work sorted
 
 `twincat-dev` merged `origin/main` (77 commits) with no conflicts, merge commit
