@@ -49,31 +49,19 @@ use ironplc_container::{
 // The string data-region layout lives in `ironplc-container` so the analyzer
 // and codegen size strings the same way. Re-exported here because the rest of
 // codegen reaches for these through `compile`.
-pub(crate) use ironplc_container::{string_region_size, DEFAULT_STRING_MAX_LENGTH};
-use ironplc_dsl::common::{
-    FunctionBlockDeclaration, FunctionDeclaration, LibraryElementKind, ProgramDeclaration,
-    StringType, VarDecl,
-};
-use ironplc_dsl::core::{Id, Located, SourceSpan};
-use ironplc_dsl::diagnostic::{Diagnostic, Label};
-use ironplc_parser::options::{CompilerOptions, StringToNumFailure, StringToNumNonNumeric};
+pub(crate) use ironplc_container::string_region_size;
+use ironplc_ir::lowered::{FieldIdx, PouId, Program, StandardFunctionBlock, VarId};
+use ironplc_ir::SourceSpan;
+use ironplc_ir::{Diagnostic, Label};
 
-use ironplc_analyzer::{
-    BuiltinFunction, CleanAnalysis, FunctionEnvironment, MethodOwners, SemanticType,
-    StandardFunctionBlock, TypeEnvironment,
-};
-
+use crate::access::{Named, Stored};
 use crate::emit::Emitter;
 use crate::held_instances::{HeldField, HeldInstance};
-use crate::layout::names::{self, ScopeId, Scoped};
+use crate::layout::names::{ScopeId, Scoped};
 
 use super::compile_fn::{compile_user_function, compile_user_function_block};
 use super::compile_method::compile_user_method;
 use super::layout::BlockLayout;
-use ironplc_ir::execution::SystemGlobal;
-
-use super::compile_setup::emit_initial_values;
-use super::compile_stmt::compile_body;
 
 /// The native operation width used for arithmetic and comparisons.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -124,11 +112,6 @@ pub(crate) const DEFAULT_VAR_TYPE_INFO: VarTypeInfo = VarTypeInfo {
 /// may occupy. Keeps flat-index arithmetic within i32 range.
 pub(crate) const MAX_DATA_REGION_SLOTS: u32 = 32768;
 
-/// Maximum number of fields a user-defined function block may have: its
-/// inputs, outputs and internal variables. `FB_CALL` and `METHOD_CALL` count
-/// them, and `FB_LOAD_PARAM` and `FB_STORE_PARAM` name one, by a byte.
-pub(crate) const MAX_USER_FB_FIELDS: usize = u8::MAX as usize;
-
 /// A constant in the pool: integer, float, or string.
 ///
 /// `Str` holds Latin-1 bytes (narrow STRING); `WStr` holds UTF-16LE bytes
@@ -159,15 +142,6 @@ pub(crate) struct StringVarInfo {
 pub(crate) const NARROW_CHAR_WIDTH: CharWidth = CharWidth::Narrow;
 /// Per-code-unit byte width for WSTRING (UTF-16LE per ADR-0016).
 pub(crate) const WIDE_CHAR_WIDTH: CharWidth = CharWidth::Wide;
-
-/// Returns the per-code-unit byte width for an IEC string type:
-/// `Narrow` for STRING, `Wide` for WSTRING (ADR-0016).
-pub(crate) fn char_width_for_string_type(width: &StringType) -> CharWidth {
-    match width {
-        StringType::String => NARROW_CHAR_WIDTH,
-        StringType::WString => WIDE_CHAR_WIDTH,
-    }
-}
 
 /// Encode a character-string literal into bytes for the constant pool.
 ///
@@ -208,140 +182,23 @@ pub(crate) fn emit_string_literal_load(
     emitter.emit_load_const_str(pool_index);
 }
 
-/// Options that affect code generation.
+/// Compiles a lowered program into a bytecode container.
 ///
-/// Every front end derives this from the project's [`CompilerOptions`] via
-/// [`From`], so the mapping from a compiler option to what codegen does with
-/// it has exactly one definition.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CodegenOptions {
-    /// The behavior policies `STRING_TO_<numeric>` calls are compiled under
-    /// (ADR-0049). They select the builtin func_id the call emits.
-    pub string_to_num: StringToNumPolicies,
-    /// Which route each statement is compiled by: from the AST, or from the
-    /// lowered program where lowering supports it.
-    pub route: crate::lowered::Route,
-    /// Whether the layout built from the lowered declarations is checked
-    /// equal to the one built from the AST, which the bodies are compiled
-    /// against, while both builders exist; a difference fails the
-    /// compilation. For the test suite.
-    pub check_layout: bool,
-}
-
-/// The two behavior policies of a `STRING_TO_<numeric>` conversion.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct StringToNumPolicies {
-    pub non_numeric: StringToNumNonNumeric,
-    pub failure: StringToNumFailure,
-}
-
-impl From<&CompilerOptions> for CodegenOptions {
-    fn from(options: &CompilerOptions) -> Self {
-        CodegenOptions {
-            string_to_num: StringToNumPolicies {
-                non_numeric: options.policy_string_to_num_non_numeric,
-                failure: options.policy_string_to_num_failure,
-            },
-            route: crate::lowered::Route::default(),
-            check_layout: false,
-        }
-    }
-}
-
-/// Compiles a library into a bytecode container.
-///
-/// Compiles the program instance the analyzer's execution model runs, under
-/// the task it binds it to, with the globals the model lists, into a
-/// container suitable for execution by the VM. Only user-defined functions
-/// reachable from the program root are included; unreachable functions are
-/// automatically excluded.
-///
-/// Takes a [`CleanAnalysis`], which can only be made from a semantic context
-/// that holds no diagnostics.
+/// Compiles the program instance the execution model runs, under the task it
+/// binds it to, with the globals the model lists, into a container suitable
+/// for execution by the VM. The lowered program holds only the POUs reachable
+/// from a program, so no other is in the container.
 ///
 /// Returns an error if the model asks for more than the VM supports (see
-/// [`crate::execution`]), or if the program contains unsupported constructs.
+/// [`crate::execution`]), or if the program holds a construct this backend
+/// does not compile yet (P9999).
 pub fn compile(
-    analysis: CleanAnalysis<'_>,
-    options: &CodegenOptions,
-    sources: &dyn crate::source_lookup::SourceLookup,
+    program: &Program,
+    sources: &dyn ironplc_ir::source::SourceLookup,
 ) -> Result<Container, Diagnostic> {
-    compile_with_route_counts(analysis, options, sources).map(|(container, _)| container)
-}
-
-/// Compiles a library into a bytecode container, as [`compile`] does, and
-/// says how many top-level statements took each route.
-pub fn compile_with_route_counts(
-    analysis: CleanAnalysis<'_>,
-    options: &CodegenOptions,
-    sources: &dyn crate::source_lookup::SourceLookup,
-) -> Result<(Container, crate::lowered::RouteCounts), Diagnostic> {
-    // Lowering completes every initializer on a copy, and reads the program
-    // and globals from it; the analyzed library stays as written
-    // (specs/design/initial-values.md).
-    let completed = ironplc_analyzer::xform_resolve_initial_values::apply(
-        analysis.library().clone(),
-        analysis.context(),
-    );
-    let analysis = CleanAnalysis::new(&completed, analysis.context())
-        .map_err(|_| Diagnostic::internal_error())?;
-    let library = analysis.library();
-    let context = analysis.context();
-    crate::compile_interface::reject_interface_variables(library)?;
-    let runnable = crate::execution::runnable(&analysis)?;
-
-    let reachable = context.reachable();
-
-    // Collect user-defined function declarations from the library,
-    // filtering to only reachable functions.
-    let func_decls: Vec<&FunctionDeclaration> = library
-        .elements
-        .iter()
-        .filter_map(|e| {
-            if let LibraryElementKind::FunctionDeclaration(f) = e {
-                reachable.contains(&f.name).then_some(f)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Collect user-defined function block declarations from the library,
-    // filtering to only reachable function blocks.
-    let fb_decls: Vec<&FunctionBlockDeclaration> = library
-        .elements
-        .iter()
-        .filter_map(|e| {
-            if let LibraryElementKind::FunctionBlockDeclaration(fb) = e {
-                reachable.contains(&fb.name.name).then_some(fb)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let method_owners = MethodOwners::of_library(library, context.types());
-    let parse = crate::lowered::parse_policy(&options.string_to_num);
-    let lowered_route =
-        crate::lowered::LoweredRoute::new(options.route, options.check_layout, || {
-            ironplc_lowering::Lowering::new(&analysis, parse).lower_program()
-        })?;
-    let (mut container, counts) = compile_program_with_functions(
-        ProgramInputs {
-            program: runnable.program,
-            func_decls: &func_decls,
-            fb_decls: &fb_decls,
-            system_globals: &runnable.system_globals,
-            global_vars: &runnable.globals,
-            method_owners: &method_owners,
-        },
-        context.functions(),
-        context.types(),
-        options.string_to_num,
-        *context.compiler_options(),
-        sources,
-        lowered_route,
-    )?;
+    let runnable = crate::execution::runnable(program)?;
+    crate::compile_method::reject_string_results(program)?;
+    let mut container = compile_program(program, runnable.program, sources)?;
 
     if runnable.has_system_uptime {
         container.header.flags |= ironplc_container::FLAG_HAS_SYSTEM_UPTIME;
@@ -349,17 +206,18 @@ pub fn compile_with_route_counts(
 
     crate::execution::apply_task_schedule(&mut container, runnable.schedule);
 
-    Ok((container, counts))
+    Ok(container)
 }
 
-/// Idempotently registers a POU's source file with the debug section's
-/// SOURCE_FILE_TABLE. Called from `compile_program_with_functions` for
-/// each top-level program / function / function-block declaration.
+/// Idempotently registers the source file of the POU whose name is at
+/// `span` with the debug section's SOURCE_FILE_TABLE. Called from
+/// `compile_program` for the program and each function and function block.
 fn register_pou_source_file(
     ctx: &mut CompileContext,
-    file_id: &ironplc_dsl::core::FileId,
-    sources: &dyn crate::source_lookup::SourceLookup,
+    span: &SourceSpan,
+    sources: &dyn ironplc_ir::source::SourceLookup,
 ) {
+    let file_id = &span.file_id;
     if ctx.debug_source_files.get(file_id).is_some() {
         return;
     }
@@ -473,22 +331,6 @@ pub(crate) fn finalize_function(
     })
 }
 
-/// The AST inputs that [`compile_program_with_functions`] operates on,
-/// all extracted from the same `Library` at the start of `compile()`.
-/// Grouped to keep the helper's argument count manageable.
-struct ProgramInputs<'a> {
-    program: &'a ProgramDeclaration,
-    func_decls: &'a [&'a FunctionDeclaration],
-    fb_decls: &'a [&'a FunctionBlockDeclaration],
-    /// The compiler-provided globals, which precede the declared ones.
-    system_globals: &'a [SystemGlobal],
-    /// The declared globals that get storage, in variable-table order.
-    global_vars: &'a [VarDecl],
-    /// The block that declares each method callable on each block, as the
-    /// analyzer resolves it.
-    method_owners: &'a MethodOwners,
-}
-
 /// Compiles a PROGRAM and its user-defined functions into a container.
 ///
 /// Always emits at least two functions:
@@ -499,126 +341,46 @@ struct ProgramInputs<'a> {
 /// When no initial values exist, the init function is a single RET_VOID.
 // Internal codegen helper split out from `compile()` purely for
 // readability of the public function; called from exactly one site.
-fn compile_program_with_functions(
-    inputs: ProgramInputs<'_>,
-    functions: &FunctionEnvironment,
-    types: &TypeEnvironment,
-    string_to_num: StringToNumPolicies,
-    compiler_options: CompilerOptions,
-    sources: &dyn crate::source_lookup::SourceLookup,
-    lowered_route: Option<crate::lowered::LoweredRoute>,
-) -> Result<(Container, crate::lowered::RouteCounts), Diagnostic> {
-    let ProgramInputs {
-        program,
-        func_decls,
-        fb_decls,
-        system_globals,
-        global_vars,
-        method_owners,
-    } = inputs;
+fn compile_program(
+    program: &Program,
+    main: PouId,
+    sources: &dyn ironplc_ir::source::SourceLookup,
+) -> Result<Container, Diagnostic> {
     let mut ctx = CompileContext::new();
-    ctx.lowered_route = lowered_route;
-    ctx.types = crate::type_info::type_representations(types);
-    ctx.block_members = ironplc_lowering::initial_value::block_members(types);
-    ctx.operand_names = crate::type_info::operand_names(types);
-    ctx.standard_blocks = crate::compile_call::standard_blocks_by_name(types);
-    ctx.builtin_functions = crate::compile_call::builtin_functions_by_name(functions);
-    ctx.method_owners = method_owners.clone();
-    ctx.string_to_num = string_to_num;
-    ctx.compiler_options = compiler_options;
+    ctx.program = Some(program);
+    ctx.standard_blocks = crate::compile_call::standard_blocks(program);
     let mut builder = ContainerBuilder::new();
 
     // Register every top-level POU's source file with the debug
-    // section's SOURCE_FILE_TABLE. Each statement's `compile_statement`
+    // section's SOURCE_FILE_TABLE. Each statement's `record_position`
     // call later looks up the resulting `SourceFileId` via
     // `ctx.debug_source_files.get(&span.file_id)` and pairs it with the
     // statement's (line, column) for the LineMapEntry. The
     // registration order (program first, then functions, then FB
     // bodies) determines the `file_id` numbering, which appears in
     // the on-disk container.
-    register_pou_source_file(&mut ctx, &program.name.span.file_id, sources);
-    for f in func_decls {
-        register_pou_source_file(&mut ctx, &f.name.span.file_id, sources);
-    }
-    for fb in fb_decls {
-        register_pou_source_file(&mut ctx, &fb.name.name.span.file_id, sources);
+    // The lowered program names the POUs and their spans.
+    let pou_spans = crate::layout::declarations::source_spans(program, main)?;
+    for span in &pou_spans {
+        register_pou_source_file(&mut ctx, span, sources);
     }
 
-    // Lay out the globals first (indices 0..G), the compiler-provided
-    // globals before any other.
-    crate::layout::lay_out_globals(&mut ctx, &mut builder, system_globals, global_vars, types)?;
-
-    // Register each user-defined FB type and its methods (field indices,
-    // field op types, type IDs, method function IDs) before the program's
-    // variables are laid out, so that its user-defined FB instances
-    // resolve. The FB copy slots are laid out after the functions', once
-    // their var_offsets are known.
-    crate::layout::lay_out_block_types(&mut ctx, fb_decls, func_decls.len() as u16, types)?;
-
-    // Lay out the program's variables (indices G..N), now that the
-    // user-defined FB types are known.
-    let local_vars = crate::layout::lay_out_program(&mut ctx, &mut builder, program, types)?;
-    let program_var_count = ctx.slot_count();
-
-    // Now compile the FB bodies with correct var_offsets.
+    // Lay out every declaration from the lowered program before any body is
+    // compiled against it; then compile the functions' bodies, then each
+    // FB's body followed by its METHODs'. The functions' bodies come before the FB bodies so that an
+    // FB body finds each callee's stack depth; per IEC 61131-3 functions
+    // cannot instantiate FBs, so they don't require FB bodies to have been
+    // compiled first.
+    let layout = crate::layout::declarations::Layout::of(program, main, &ctx.standard_blocks)?;
+    let bodies = layout.install(&mut ctx, &mut builder)?;
+    let program_var_count = bodies.program_slots;
     let mut compiled_functions = Vec::new();
-    let mut var_offset = VarIndex::new(program_var_count);
-
-    // Lay out every user FUNCTION, then compile their bodies, before the
-    // FUNCTION_BLOCK bodies, so that FB bodies can resolve calls to user
-    // functions via `ctx.user_functions` (each function registers itself in
-    // `lay_out_function`) and find each callee's stack depth. Per
-    // IEC 61131-3 functions cannot instantiate FBs, so they don't require FB
-    // bodies to have been compiled first.
-    //
-    // Function IDs are POSITIONAL in the container (`get_function`
-    // indexes the `functions` Vec). FB bodies are inserted at positions
-    // 2..(2 + N_fb), so user functions must start at the next free
-    // position so each callable POU has a unique runtime id.
-    let user_fn_id_base = 2u16 + fb_decls.len() as u16;
-    let mut function_layouts = Vec::with_capacity(func_decls.len());
-    for (next_function_id, func_decl) in (user_fn_id_base..).zip(func_decls.iter()) {
-        let layout = crate::layout::lay_out_function(
-            func_decl,
-            FunctionId::new(next_function_id),
-            var_offset,
-            &mut ctx,
-            &mut builder,
-            types,
-        )?;
-        var_offset = VarIndex::new(var_offset.raw() + layout.num_locals);
-        function_layouts.push(layout);
-    }
-
-    // Lay out each FB's copy slots and its METHODs' variables (OOP
-    // extension, ADR-0041 Phase 1), after the functions'.
-    let mut block_layouts = Vec::with_capacity(fb_decls.len());
-    for fb_decl in fb_decls {
-        block_layouts.push(crate::layout::lay_out_block(
-            fb_decl,
-            &mut var_offset,
-            &mut ctx,
-            &mut builder,
-            types,
-        )?);
-    }
-
-    // Every body is laid out: match the lowered program's ids to it, then
-    // compile the functions' bodies, then each FB's body followed by its
-    // METHODs'.
-    if let Some(route) = &ctx.lowered_route {
-        if route.check_layout() {
-            crate::layout::lowered::check(route.lowering(), &ctx, &builder, &program.name)?;
-        }
-        ctx.lowered_ids =
-            crate::layout::ids::LoweredIds::matched(route.lowering(), &ctx, &program.name);
-    }
-    for (func_decl, layout) in func_decls.iter().zip(function_layouts) {
-        compiled_functions.push(compile_user_function(func_decl, layout, &mut ctx)?);
+    for layout in bodies.functions {
+        compiled_functions.push(compile_user_function(layout, &mut ctx)?);
     }
     let mut compiled_fb_bodies: Vec<CompiledFunction> = Vec::new();
     let mut compiled_methods: Vec<CompiledFunction> = Vec::new();
-    for (fb_decl, layout) in fb_decls.iter().zip(block_layouts) {
+    for layout in bodies.blocks {
         let BlockLayout {
             function_id,
             scope,
@@ -626,23 +388,22 @@ fn compile_program_with_functions(
             methods,
         } = layout;
         compiled_fb_bodies.push(compile_user_function_block(
-            fb_decl,
             function_id,
             scope,
             num_locals,
             &mut ctx,
         )?);
-        for (method, layout) in fb_decl.methods.iter().zip(methods) {
-            compiled_methods.push(compile_user_method(method, layout, &mut ctx)?);
+        for layout in methods {
+            compiled_methods.push(compile_user_method(layout, &mut ctx)?);
         }
     }
 
-    let total_variables = var_offset;
+    let total_variables = bodies.slots;
 
-    // Emit bytecode for variable initial values into the init emitter.
+    // Emit bytecode for variable initial values into the init emitter, from
+    // the lowered program.
     let mut init_emitter = Emitter::new();
-    emit_initial_values(&mut init_emitter, &mut ctx, global_vars, types)?;
-    emit_initial_values(&mut init_emitter, &mut ctx, &local_vars, types)?;
+    crate::body::emit_init(&mut init_emitter, &mut ctx)?;
     init_emitter.emit_ret_void();
 
     // Compile the program body into the scan emitter. Mark
@@ -650,12 +411,12 @@ fn compile_program_with_functions(
     // emitted from inside the body records a call-graph edge.
     let mut scan_emitter = Emitter::new();
     ctx.current_function_id = Some(FunctionId::SCAN);
-    compile_body(
-        &mut scan_emitter,
-        &mut ctx,
-        &program.body,
-        &program.name.span(),
-    )?;
+    // A `VAR_TEMP` starts again at the head of every scan, from the lowered
+    // program.
+    if crate::body::restarts(&ctx)? {
+        crate::body::emit_prologue(&mut scan_emitter, &mut ctx)?;
+    }
+    crate::body::emit_body(&mut scan_emitter, &mut ctx)?;
     ctx.current_function_id = None;
     scan_emitter.emit_ret_void();
 
@@ -815,8 +576,8 @@ fn compile_program_with_functions(
         .shared_globals_size(program_var_count)
         .max_call_depth(max_call_depth);
 
-    // Add debug info.
-    let program_name = program.name.to_string();
+    // Add debug info, named as the lowered program names each POU.
+    let program_name = crate::body::pou_name(&ctx, ctx.scope)?;
     builder = builder
         .add_func_name(FuncNameEntry {
             function_id: FunctionId::INIT,
@@ -852,7 +613,7 @@ fn compile_program_with_functions(
         builder = builder.add_string_layout(entry);
     }
     // By type name, for the same reason as the user FB type descriptors.
-    for entry in crate::compile_enum::enum_definitions(types) {
+    for entry in std::mem::take(&mut ctx.debug_enum_defs) {
         builder = builder.add_enum_def(entry);
     }
 
@@ -882,15 +643,10 @@ fn compile_program_with_functions(
     // `specs/design/bytecode-verifier-rules.md` for the rules it enforces.
     crate::stack_balance::verify_container(&container)?;
 
-    let counts = ctx
-        .lowered_route
-        .as_ref()
-        .map(|route| route.counts)
-        .unwrap_or_default();
-    Ok((container, counts))
+    Ok(container)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StringParamInfo {
     /// Byte offset in the data region where this parameter's string is stored.
     pub(crate) data_offset: u32,
@@ -902,7 +658,7 @@ pub(crate) struct StringParamInfo {
 
 /// How a call site passes an argument to one input parameter
 /// (`VAR_INPUT`/`VAR_IN_OUT`) of a user-defined function or method.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParamPassing {
     /// The argument's value is pushed onto the operand stack at its own
     /// type, which the analyzer converted to the parameter's (ADR-0056), and
@@ -922,7 +678,7 @@ pub(crate) enum ParamPassing {
 ///
 /// When a function returns STRING/WSTRING, the return value lives in the
 /// data region rather than on the operand stack.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StringReturnInfo {
     /// Byte offset in the data region where the return string is stored.
     pub(crate) data_offset: u32,
@@ -933,7 +689,7 @@ pub(crate) struct StringReturnInfo {
 }
 
 /// Metadata for a compiled user-defined function.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct UserFunctionInfo {
     /// The function ID assigned in the container.
     pub(crate) function_id: FunctionId,
@@ -952,18 +708,18 @@ pub(crate) struct UserFunctionInfo {
     /// whole variable (`s := f()`) needs it to emit `COPY_REGION`, whose
     /// source size comes from the descriptor rather than an operand.
     pub(crate) return_struct_desc_index: Option<u16>,
-    /// The slot of each `VAR_OUTPUT`, which a call reads its outputs from
-    /// after the function returns.
-    pub(crate) outputs: HashMap<Id, VarIndex>,
+    /// The slot of each `VAR_OUTPUT`, by its lowered variable, which a call
+    /// reads its outputs from after the function returns.
+    pub(crate) outputs: HashMap<VarId, VarIndex>,
     /// Where in the data region each `STRING` or `WSTRING` `VAR_OUTPUT`
-    /// is, which a call the lowered route compiles reads it from after the
+    /// is, by its lowered variable, which a call reads it from after the
     /// function returns.
-    pub(crate) string_outputs: HashMap<Id, StringVarInfo>,
+    pub(crate) string_outputs: HashMap<VarId, StringVarInfo>,
 }
 
 /// Tracks state during compilation of a single program.
 /// Metadata for a function block instance variable.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FbInstanceInfo {
     /// Variable table index holding the data region offset.
     pub(crate) var_index: VarIndex,
@@ -971,12 +727,12 @@ pub(crate) struct FbInstanceInfo {
     pub(crate) type_id: FbTypeId,
     /// Data region byte offset where this instance's fields start.
     pub(crate) data_offset: u32,
-    /// Maps field name (lowercase) to field index.
-    pub(crate) field_indices: HashMap<String, FbFieldIndex>,
-    /// Maps field name (lowercase) to its declared type: the operation type
-    /// a value stored in the field or read from it is compiled at, and the
-    /// width a store narrows it to.
-    pub(crate) field_types: HashMap<String, VarTypeInfo>,
+    /// The index of each field of its block's lowered type that it keeps.
+    pub(crate) field_indices: HashMap<FieldIdx, FbFieldIndex>,
+    /// The declared type of each field of its block's lowered type that it
+    /// keeps: the operation type a value stored in the field or read from
+    /// it is compiled at, and the width a store narrows it to.
+    pub(crate) field_types: HashMap<FieldIdx, VarTypeInfo>,
     /// The instances its fields hold, and theirs, whose offsets the setup
     /// block stores in the fields that hold them (`held_instances.rs`).
     pub(crate) held: Vec<HeldInstance>,
@@ -986,30 +742,32 @@ pub(crate) struct FbInstanceInfo {
 /// `FB_LOAD_PARAM` and `FB_STORE_PARAM` name by a byte.
 pub(crate) type FbFieldIndex = u8;
 
+/// The type ID of the first user-defined function block; each next one, in
+/// library order, takes the next.
+pub(crate) const FIRST_USER_FB_TYPE_ID: FbTypeId = FbTypeId::new(0x1000);
+
 /// Metadata for a compiled user-defined function block type.
+#[derive(Debug, PartialEq)]
 pub(crate) struct UserFbTypeInfo {
     /// Unique type ID for FB_CALL dispatch (starts at 0x1000).
     pub(crate) type_id: FbTypeId,
     /// Number of data-region fields in each instance.
     pub(crate) num_fields: usize,
-    /// Maps field name (lowercase) to field index (ordinal position).
-    pub(crate) field_indices: HashMap<String, FbFieldIndex>,
+    /// The index of each field of the block's lowered type, its ordinal
+    /// position among the copy slots.
+    pub(crate) field_indices: HashMap<FieldIdx, FbFieldIndex>,
     /// Function ID of the compiled FB body in the container.
     pub(crate) function_id: FunctionId,
     /// Variable table offset where the FB body's slots start.
     pub(crate) var_offset: u16,
-    /// Maps field name (lowercase) to its declared type, as
+    /// The declared type of each field of the block's lowered type, as
     /// [`FbInstanceInfo::field_types`].
-    pub(crate) field_types: HashMap<String, VarTypeInfo>,
+    pub(crate) field_types: HashMap<FieldIdx, VarTypeInfo>,
     /// The fields that hold an instance of a block (`held_instances.rs`).
     pub(crate) held_fields: Vec<HeldField>,
-    /// Maps method name (lowercase) to compilation metadata (OOP
-    /// extension, ADR-0041 Phase 1). Populated in two steps: `function_id`,
-    /// `num_params`, `param_names_in_order`, and `has_return_value` are known
-    /// from the AST alone and set during the pre-scan registration pass;
-    /// `param_var_off` is set once the method body is actually compiled
-    /// and its scratch region is known (mirrors `var_offset` above).
-    pub(crate) methods: HashMap<String, UserMethodInfo>,
+    /// What a call of each of the block's methods needs, by the method's
+    /// lowered POU (OOP extension, ADR-0041 Phase 1).
+    pub(crate) methods: HashMap<PouId, UserMethodInfo>,
 }
 
 /// Compilation metadata for a single `METHOD` declared on a user-defined
@@ -1018,6 +776,7 @@ pub(crate) struct UserFbTypeInfo {
 /// (`UserFbTypeInfo::var_offset`/`num_fields`) for `self` access, and has
 /// its own additional, non-shared param/local scratch region allocated
 /// immediately after -- see `compile_method::compile_user_method`.
+#[derive(Debug, PartialEq)]
 pub(crate) struct UserMethodInfo {
     /// Function ID of the compiled method body in the container.
     pub(crate) function_id: FunctionId,
@@ -1028,40 +787,26 @@ pub(crate) struct UserMethodInfo {
     pub(crate) param_var_off: u16,
     /// Number of VAR_INPUT/VAR_IN_OUT parameters, in declaration order.
     pub(crate) num_params: u16,
-    /// The VAR_INPUT/VAR_IN_OUT parameters, in declaration order: the order
-    /// a call's normal form names them in.
-    pub(crate) params: Vec<UserMethodParam>,
+    /// How a call passes each VAR_INPUT and VAR_IN_OUT parameter, in
+    /// declaration order: the order a call's normal form names them in.
+    pub(crate) params: Vec<ParamPassing>,
     pub(crate) has_return_value: bool,
-    /// The slot of each `VAR_OUTPUT`, which a call reads its outputs from
-    /// after the method returns. Empty until the block is laid out.
-    pub(crate) outputs: HashMap<Id, VarIndex>,
+    /// The slot of each `VAR_OUTPUT`, by its lowered variable, which a call
+    /// reads its outputs from after the method returns.
+    pub(crate) outputs: HashMap<VarId, VarIndex>,
     /// Where in the data region each `STRING` or `WSTRING` `VAR_OUTPUT`
-    /// is, which a call the lowered route compiles reads it from after the
-    /// method returns. Empty until the block is laid out.
-    pub(crate) string_outputs: HashMap<Id, StringVarInfo>,
+    /// is, by its lowered variable, which a call reads it from after the
+    /// method returns.
+    pub(crate) string_outputs: HashMap<VarId, StringVarInfo>,
 }
 
-/// A VAR_INPUT or VAR_IN_OUT parameter of a user-defined method.
-pub(crate) struct UserMethodParam {
-    pub(crate) name: Id,
-    /// How a call site passes the argument for it. A string parameter is
-    /// passed by value until the method is compiled, which gives it the run
-    /// of the data region a call copies its argument into.
-    pub(crate) passing: ParamPassing,
-}
-
-pub(crate) struct CompileContext {
-    /// The program lowering made, which each top-level statement is read
-    /// from, when the route compiles statements from the lowered program;
-    /// `None` when every statement is compiled from the AST.
-    pub(crate) lowered_route: Option<crate::lowered::LoweredRoute>,
-    /// What the layout knows each id of the lowered program as, once the
-    /// layout is built; empty when every statement is compiled from the
-    /// AST.
-    pub(crate) lowered_ids: crate::layout::ids::LoweredIds,
-    /// The scope whose names are being laid out, or whose body is being
-    /// compiled: what the layout's entries are recorded under, and what
-    /// each lookup sees ([`crate::layout::names`]).
+pub(crate) struct CompileContext<'p> {
+    /// The lowered program every body is compiled from; `None` only for a
+    /// context made to test what does not read it.
+    pub(crate) program: Option<&'p Program>,
+    /// The scope whose body is being compiled: the lowered POU's, which is
+    /// the program's outside the other bodies once the layout is installed
+    /// ([`crate::layout::names`]).
     pub(crate) scope: ScopeId,
     /// The variable-table slot of each variable.
     pub(crate) variables: Scoped<VarIndex>,
@@ -1069,10 +814,6 @@ pub(crate) struct CompileContext {
     pub(crate) var_types: Scoped<VarTypeInfo>,
     /// Ordered list of constants added to the constant pool.
     pub(crate) constants: Vec<PoolConstant>,
-    /// Stack of the labels of the enclosing loops, for EXIT and CONTINUE
-    /// statement compilation. Each loop pushes its labels; EXIT and CONTINUE
-    /// jump to those of the top.
-    pub(crate) loop_labels: Vec<crate::compile_loop::LoopLabels>,
     /// Where in the data region each STRING variable is.
     pub(crate) string_vars: Scoped<StringVarInfo>,
     /// The layout of each FB instance variable.
@@ -1090,32 +831,6 @@ pub(crate) struct CompileContext {
     /// The descriptor that sizes the whole array or structure each
     /// reference variable whose target is an array or a structure refers to.
     pub(crate) region_refs: Scoped<u16>,
-    /// What every type is, by the id an expression's `expr_type` carries.
-    /// See [`crate::type_info::expr_type_info`].
-    pub(crate) types: HashMap<ironplc_dsl::type_id::TypeId, SemanticType>,
-    /// What an instance's value is read against: see
-    /// [`ironplc_lowering::initial_value::block_members`].
-    pub(crate) block_members: ironplc_lowering::initial_value::BlockMembers,
-    /// The name the arithmetic overloads know a value of each type by.
-    /// See [`crate::type_info::expr_operand_name`].
-    pub(crate) operand_names: HashMap<ironplc_dsl::type_id::TypeId, ironplc_dsl::common::TypeName>,
-    /// The operation each standard function stands for, by name, as the
-    /// analyzer's function environment states it. A call of a name that is
-    /// not here is a call of a user-defined function.
-    /// See [`crate::compile_call::builtin_functions_by_name`].
-    pub(crate) builtin_functions: HashMap<Id, BuiltinFunction>,
-    /// Which block declares the method a call reaches, by the block the
-    /// call's instance is declared as. The analyzer decides it
-    /// ([`MethodOwners`]); a method call asks it rather than looking the
-    /// method up itself.
-    pub(crate) method_owners: MethodOwners,
-    /// The behavior policies `STRING_TO_<numeric>` calls select their
-    /// builtin by (ADR-0049).
-    pub(crate) string_to_num: StringToNumPolicies,
-    /// The options the analyzer ran with. Codegen asks the arithmetic
-    /// overload resolver the analyzer asked, with the same options, for the
-    /// result type of each step of an arithmetic call.
-    pub(crate) compiler_options: CompilerOptions,
     /// Next available byte offset in the data region.
     pub(crate) data_region_offset: u32,
     /// Maximum string capacity across all STRING variables (for temp buffer sizing).
@@ -1127,22 +842,24 @@ pub(crate) struct CompileContext {
     pub(crate) debug_var_names: Vec<VarNameEntry>,
     /// Debug info: STRING variable data-region layouts collected during assign_variables.
     pub(crate) debug_string_layouts: Vec<StringLayoutEntry>,
+    /// Debug info: the ENUM_DEF entries of the lowered program.
+    pub(crate) debug_enum_defs: Vec<ironplc_container::debug_section::EnumDefEntry>,
     /// Debug info: registry mapping each referenced source `FileId` to its
     /// `SourceFileId` (debug section SOURCE_FILE_TABLE index) plus cached
-    /// source bytes for (line, column) conversion in `compile_statement`.
+    /// source bytes for (line, column) conversion in `record_position`.
     pub(crate) debug_source_files: crate::source_lookup::SourceFileRegistry,
-    /// Maps user-defined function name (lowercase) to compilation metadata.
-    pub(crate) user_functions: HashMap<String, UserFunctionInfo>,
+    /// What a call of each user-defined function needs, by its lowered POU.
+    pub(crate) user_functions: HashMap<PouId, UserFunctionInfo>,
     /// The most a call of each user function or method adds to its
     /// caller's stack: the deepest its body's stack goes, known once the
     /// body is compiled.
     pub(crate) function_stack_depths: HashMap<FunctionId, u16>,
-    /// Maps user-defined FB type name (uppercase) to compilation metadata.
-    pub(crate) user_fb_types: HashMap<String, UserFbTypeInfo>,
-    /// Maps standard FB type name (uppercase) to the block it is.
-    pub(crate) standard_blocks: HashMap<String, StandardFunctionBlock>,
-    /// Next available type ID for user-defined function blocks.
-    pub(crate) next_user_fb_type_id: FbTypeId,
+    /// What a call of each user-defined function block and its methods
+    /// needs, by the block's lowered POU.
+    pub(crate) user_fb_types: HashMap<PouId, UserFbTypeInfo>,
+    /// The standard function block each lowered POU without a declaration
+    /// of its own is.
+    pub(crate) standard_blocks: HashMap<PouId, StandardFunctionBlock>,
     /// When compiling a function body that returns a value, describes how an
     /// early `RETURN` statement should produce the return value before the
     /// `RET` opcode. `None` for programs and FBs (RETURN emits `RET_VOID`).
@@ -1171,9 +888,6 @@ pub(crate) struct CompileContext {
     /// [`in_out_ref_slot`]: CompileContext::in_out_ref_slot
     /// [`var_index`]: CompileContext::var_index
     pub(crate) in_out_params: Scoped<()>,
-    /// Where the call whose outputs are being stored leaves them, for the
-    /// `CallOutput` each output stores; `None` outside a call's outputs.
-    pub(crate) call_outputs: Option<crate::compile_call_output::CallOutputs>,
 }
 
 /// Describes how a `RETURN` statement should yield the function's value.
@@ -1189,16 +903,14 @@ pub(crate) enum CurrentFunctionReturn {
     String { data_offset: u32 },
 }
 
-impl CompileContext {
+impl<'p> CompileContext<'p> {
     pub(crate) fn new() -> Self {
         CompileContext {
-            lowered_route: None,
-            lowered_ids: crate::layout::ids::LoweredIds::default(),
-            scope: ScopeId::Program,
+            program: None,
+            scope: ScopeId::Global,
             variables: Scoped::default(),
             var_types: Scoped::default(),
             constants: Vec::new(),
-            loop_labels: Vec::new(),
             string_vars: Scoped::default(),
             fb_instances: Scoped::default(),
             array_vars: Scoped::default(),
@@ -1212,38 +924,16 @@ impl CompileContext {
             has_wide_string: false,
             debug_var_names: Vec::new(),
             debug_string_layouts: Vec::new(),
+            debug_enum_defs: Vec::new(),
             debug_source_files: crate::source_lookup::SourceFileRegistry::new(),
             user_functions: HashMap::new(),
             function_stack_depths: HashMap::new(),
             user_fb_types: HashMap::new(),
             standard_blocks: HashMap::new(),
-            next_user_fb_type_id: FbTypeId::new(0x1000),
-            types: HashMap::new(),
-            block_members: HashMap::new(),
-            operand_names: HashMap::new(),
-            builtin_functions: HashMap::new(),
-            method_owners: MethodOwners::default(),
-            string_to_num: StringToNumPolicies::default(),
-            compiler_options: CompilerOptions::default(),
             current_function_return: None,
             current_function_id: None,
             call_graph: HashMap::new(),
-            call_outputs: None,
         }
-    }
-
-    /// Returns the exit label for the innermost enclosing loop, if any.
-    pub(crate) fn current_loop_exit(&self) -> Option<crate::emit::Label> {
-        self.loop_labels.last().map(|labels| labels.exit)
-    }
-
-    /// Returns the label where the innermost enclosing loop goes on with its
-    /// next iteration, if any, and records that it is used.
-    pub(crate) fn current_loop_next(&mut self) -> Option<crate::emit::Label> {
-        self.loop_labels.last_mut().map(|labels| {
-            labels.next_used = true;
-            labels.next
-        })
     }
 
     /// Records a static call-graph edge from the function whose body is
@@ -1256,6 +946,12 @@ impl CompileContext {
         if let Some(caller) = self.current_function_id {
             self.call_graph.entry(caller).or_default().insert(callee);
         }
+    }
+
+    /// The lowered program every body is compiled from. It outlives the
+    /// borrow of `self`, so a caller reads it while it changes the context.
+    pub(crate) fn lowering(&self) -> Result<&'p Program, Diagnostic> {
+        self.program.ok_or_else(Diagnostic::internal_error)
     }
 
     /// Looks up a variable index by identifier, using the provided span for error reporting.
@@ -1271,7 +967,7 @@ impl CompileContext {
     /// variable inherited through `EXTENDS` or a `RESOURCE`'s `VAR_GLOBAL`, so
     /// it is reported as not implemented rather than as a mistake in the
     /// program.
-    pub(crate) fn var_index(&self, name: &Id) -> Result<VarIndex, Diagnostic> {
+    pub(crate) fn var_index(&self, name: &Named) -> Result<VarIndex, Diagnostic> {
         if self.is_in_out(name) {
             return Err(Diagnostic::not_implemented(Label::span(
                 name.span(),
@@ -1290,100 +986,83 @@ impl CompileContext {
     /// Returns the slot holding the reference when `name` is a `VAR_IN_OUT`
     /// parameter of the function being compiled, or `None` for any other
     /// variable.
-    pub(crate) fn in_out_ref_slot(&self, name: &Id) -> Option<VarIndex> {
+    pub(crate) fn in_out_ref_slot(&self, name: &Named) -> Option<VarIndex> {
         if !self.is_in_out(name) {
             return None;
         }
         self.slot(name)
     }
 
-    /// The slot of the variable `name` that the current scope sees.
-    fn slot(&self, name: &Id) -> Option<VarIndex> {
-        self.seen(&self.variables, names::SLOTS, name).copied()
+    /// The slot of the variable `name`.
+    fn slot(&self, name: &Named) -> Option<VarIndex> {
+        self.variables.get(&name.stored).copied()
     }
 
-    /// The entry of `map` for `name` that the current scope sees, which
-    /// `reach` says of the globals' and the program's.
-    fn seen<'m, V>(&self, map: &'m Scoped<V>, reach: names::Reach, name: &Id) -> Option<&'m V> {
-        names::lookup(map, &self.variables, reach, self.scope, name)
-    }
-
-    /// Whether the current scope sees the variable `name` that `scope`
-    /// declares: whether the name reaches that variable's slot here.
-    pub(crate) fn sees(&self, scope: ScopeId, name: &Id) -> bool {
-        let declared = names::lookup(&self.variables, &self.variables, names::SLOTS, scope, name);
-        declared.is_some() && declared == self.seen(&self.variables, names::SLOTS, name)
-    }
-
-    /// How many names have a slot that the current scope sees.
-    pub(crate) fn slot_count(&self) -> u16 {
-        names::slot_count(&self.variables, self.scope) as u16
-    }
-
-    /// The slot after the highest one the current scope sees: the next free
-    /// slot of the body being laid out.
-    pub(crate) fn next_free_slot(&self) -> VarIndex {
-        VarIndex::new(names::next_free_slot(&self.variables, self.scope))
-    }
-
-    /// Whether `name` has a slot in the variable table in the current scope,
-    /// a `VAR_IN_OUT`'s included.
-    pub(crate) fn has_slot(&self, name: &Id) -> bool {
+    /// Whether `name` has a slot in the variable table, a `VAR_IN_OUT`'s
+    /// included.
+    pub(crate) fn has_slot(&self, name: &Named) -> bool {
         self.slot(name).is_some()
     }
 
+    /// Whether the layout gives `stored` a slot in the variable table.
+    pub(crate) fn stores(&self, stored: &Stored) -> bool {
+        self.variables.get(stored).is_some()
+    }
+
     /// Whether `name` is a `VAR_IN_OUT` of the body being compiled.
-    pub(crate) fn is_in_out(&self, name: &Id) -> bool {
-        self.seen(&self.in_out_params, names::IN_OUTS, name)
-            .is_some()
+    pub(crate) fn is_in_out(&self, name: &Named) -> bool {
+        self.in_out_params.get(&name.stored).is_some()
     }
 
     /// Where the string variable `name` is held; `None` when it is no string.
-    pub(crate) fn string_var(&self, name: &Id) -> Option<&StringVarInfo> {
-        self.seen(&self.string_vars, names::SLOTS, name)
+    pub(crate) fn string_var(&self, name: &Named) -> Option<&StringVarInfo> {
+        self.string_vars.get(&name.stored)
     }
 
     /// How the strings the reference variable `name` refers to are reached
     /// through it; `None` when it refers to no string or array of strings.
-    pub(crate) fn string_ref(&self, name: &Id) -> Option<&crate::compile_reference::StringRefInfo> {
-        self.seen(&self.string_refs, names::SLOTS, name)
+    pub(crate) fn string_ref(
+        &self,
+        name: &Named,
+    ) -> Option<&crate::compile_reference::StringRefInfo> {
+        self.string_refs.get(&name.stored)
     }
 
     /// The descriptor that sizes the whole array or structure the reference
     /// variable `name` refers to; `None` when it refers to no such target.
-    pub(crate) fn region_ref(&self, name: &Id) -> Option<u16> {
-        self.seen(&self.region_refs, names::SLOTS, name).copied()
+    pub(crate) fn region_ref(&self, name: &Named) -> Option<u16> {
+        self.region_refs.get(&name.stored).copied()
     }
 
     /// The layout of the array variable `name`; `None` when it is no array.
-    pub(crate) fn array_var(&self, name: &Id) -> Option<&crate::compile_array::ArrayVarInfo> {
-        self.seen(&self.array_vars, names::ARRAYS, name)
+    pub(crate) fn array_var(&self, name: &Named) -> Option<&crate::compile_array::ArrayVarInfo> {
+        self.array_vars.get(&name.stored)
     }
 
     /// The layout of the structure variable `name`; `None` when it is no
     /// structure.
-    pub(crate) fn struct_var(&self, name: &Id) -> Option<&crate::compile_struct::StructVarInfo> {
-        self.seen(&self.struct_vars, names::SLOTS, name)
+    pub(crate) fn struct_var(&self, name: &Named) -> Option<&crate::compile_struct::StructVarInfo> {
+        self.struct_vars.get(&name.stored)
     }
 
     /// The layout of the variable `name`, an array of structures; `None`
     /// when it is no such array.
     pub(crate) fn struct_array_var(
         &self,
-        name: &Id,
+        name: &Named,
     ) -> Option<&crate::compile_array_struct::StructArrayVarInfo> {
-        self.seen(&self.struct_array_vars, names::SLOTS, name)
+        self.struct_array_vars.get(&name.stored)
     }
 
     /// The layout of the function block instance `name`; `None` when it is
     /// no instance.
-    pub(crate) fn fb_instance(&self, name: &Id) -> Option<&FbInstanceInfo> {
-        self.seen(&self.fb_instances, names::INSTANCES, name)
+    pub(crate) fn fb_instance(&self, name: &Named) -> Option<&FbInstanceInfo> {
+        self.fb_instances.get(&name.stored)
     }
 
-    /// The user-defined function named `name`, in lower case.
-    pub(crate) fn user_function(&self, name: &str) -> Option<&UserFunctionInfo> {
-        self.user_functions.get(name)
+    /// The user-defined function `pou`.
+    pub(crate) fn user_function(&self, pou: PouId) -> Option<&UserFunctionInfo> {
+        self.user_functions.get(&pou)
     }
 
     /// The most a call at `span` of the user function or method
@@ -1407,35 +1086,14 @@ impl CompileContext {
             })
     }
 
-    /// The user-defined function block type named `name`, in upper case.
-    pub(crate) fn user_fb_type(&self, name: &str) -> Option<&UserFbTypeInfo> {
-        self.user_fb_types.get(name)
+    /// The user-defined function block `pou`.
+    pub(crate) fn user_fb_type(&self, pou: PouId) -> Option<&UserFbTypeInfo> {
+        self.user_fb_types.get(&pou)
     }
 
     /// Looks up type information for a variable by identifier.
-    pub(crate) fn var_type_info(&self, name: &Id) -> Option<VarTypeInfo> {
-        self.seen(&self.var_types, names::SLOTS, name).copied()
-    }
-
-    /// Returns the op_type for a variable by identifier, falling back to defaults.
-    pub(crate) fn var_op_type(&self, name: &Id) -> OpType {
-        self.seen(&self.var_types, names::SLOTS, name)
-            .map(|info| (info.op_width, info.signedness))
-            .unwrap_or(DEFAULT_OP_TYPE)
-    }
-
-    /// Allocates a scratch variable with a synthetic name and returns its index.
-    ///
-    /// The scratch variable takes the [next free slot](Self::next_free_slot)
-    /// of the POU being laid out, which counts it in its run.
-    ///
-    /// The name uses a `$` prefix which is illegal in IEC 61131-3 identifiers,
-    /// guaranteeing no collision with user-defined variables.
-    pub(crate) fn allocate_scratch_variable(&mut self, suffix: &str) -> VarIndex {
-        let idx = self.next_free_slot();
-        self.variables
-            .insert(self.scope, Id::from(&format!("$scratch_{}", suffix)), idx);
-        idx
+    pub(crate) fn var_type_info(&self, name: &Named) -> Option<VarTypeInfo> {
+        self.var_types.get(&name.stored).copied()
     }
 
     /// Returns the index of an existing constant matching `matches`, or
@@ -1523,7 +1181,7 @@ impl CompileContext {
 mod tests {
     use super::*;
     use ironplc_dsl::common::Library;
-    use ironplc_dsl::core::FileId;
+    use ironplc_ir::FileId;
     use ironplc_parser::options::CompilerOptions;
     use ironplc_parser::parse_program;
 
@@ -1577,12 +1235,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         assert_eq!(container.header.num_variables, 1);
         assert_eq!(container.header.num_functions, 2);
@@ -1619,12 +1272,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         // Should have two functions (init + scan), both just RET_VOID
         assert_eq!(container.header.num_functions, 2);
@@ -1653,12 +1301,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         // Should only have one constant (10 is deduplicated)
         assert_eq!(container.constant_pool.len(), 1);
@@ -1677,12 +1320,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         assert_eq!(container.header.num_variables, 2);
         assert_eq!(container.header.num_functions, 2);
@@ -1719,12 +1357,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         assert_eq!(
             container
@@ -1755,11 +1388,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let result = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        );
+        let result = crate::test_support::compile_analyzed(&library, &context);
 
         assert!(result.is_ok());
     }
@@ -1778,11 +1407,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let result = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        );
+        let result = crate::test_support::compile_analyzed(&library, &context);
 
         assert!(result.is_err());
         let diagnostic = result.unwrap_err();
@@ -1800,12 +1425,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         assert_eq!(container.header.num_variables, 1);
         assert_eq!(
@@ -1828,12 +1448,7 @@ PROGRAM main
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         assert_eq!(container.header.num_variables, 1);
         assert_eq!(
@@ -1862,12 +1477,7 @@ END_VAR
 END_PROGRAM
 ";
         let (library, context) = parse(source);
-        let container = compile(
-            CleanAnalysis::new(&library, &context).unwrap(),
-            &CodegenOptions::default(),
-            &crate::EmptyLookup,
-        )
-        .unwrap();
+        let container = crate::test_support::compile_analyzed(&library, &context).unwrap();
 
         // Should have 3 functions: init, scan, SIGN_R
         assert_eq!(container.header.num_functions, 3);

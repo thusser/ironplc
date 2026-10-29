@@ -447,22 +447,24 @@ parser! {
         .with_position(i.span.clone())
     }
     // We want to be more flexible on identifiers for variable names
-    // because it is common to use variable names that are reserved names
-    rule variable_identifier() -> Id = identifier() / t:tok(TokenType::Step) { Id::from(t.text.as_str()) } / t:tok(TokenType::On) { Id::from(t.text.as_str()) } / t:tok(TokenType::REdge) { Id::from(t.text.as_str()) } / t:tok(TokenType::FEdge) { Id::from(t.text.as_str()) }
+    // because it is common to use variable names that are reserved names.
+    // The keyword keeps its position like any other identifier, so a
+    // diagnostic about the name points at it rather than at 1:1.
+    rule variable_identifier() -> Id = identifier() / t:(tok(TokenType::Step) / tok(TokenType::On) / tok(TokenType::REdge) / tok(TokenType::FEdge)) { Id::from(t.text.as_str()).with_position(t.span.clone()) }
     rule type_name() -> TypeName = i:identifier() { TypeName::from_id(&i) } / generic_type_name()
 
     // B.1.3.2 Generic data types - used for polymorphic function signatures
     rule generic_type_name() -> TypeName =
-        t:tok(TokenType::Any) { TypeName { name: Id::from("ANY").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyDerived) { TypeName { name: Id::from("ANY_DERIVED").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyElementary) { TypeName { name: Id::from("ANY_ELEMENTARY").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyMagnitude) { TypeName { name: Id::from("ANY_MAGNITUDE").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyNum) { TypeName { name: Id::from("ANY_NUM").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyReal) { TypeName { name: Id::from("ANY_REAL").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyInt) { TypeName { name: Id::from("ANY_INT").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyBit) { TypeName { name: Id::from("ANY_BIT").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyString) { TypeName { name: Id::from("ANY_STRING").with_position(t.span.clone()) } }
-        / t:tok(TokenType::AnyDate) { TypeName { name: Id::from("ANY_DATE").with_position(t.span.clone()) } }
+        t:tok(TokenType::Any) { TypeName { id: Id::from("ANY").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyDerived) { TypeName { id: Id::from("ANY_DERIVED").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyElementary) { TypeName { id: Id::from("ANY_ELEMENTARY").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyMagnitude) { TypeName { id: Id::from("ANY_MAGNITUDE").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyNum) { TypeName { id: Id::from("ANY_NUM").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyReal) { TypeName { id: Id::from("ANY_REAL").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyInt) { TypeName { id: Id::from("ANY_INT").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyBit) { TypeName { id: Id::from("ANY_BIT").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyString) { TypeName { id: Id::from("ANY_STRING").with_position(t.span.clone()) } }
+        / t:tok(TokenType::AnyDate) { TypeName { id: Id::from("ANY_DATE").with_position(t.span.clone()) } }
 
     // B.1.2 Constants
     // Every literal kind records the span of the tokens it matched. Recording
@@ -506,6 +508,8 @@ parser! {
     rule binary_integer() -> Integer =  n:tok(TokenType::BinDigits) {? Integer::try_binary(n.text.as_str()).map(|i| Integer { span: n.span.clone(), value: i.value }) }
     rule octal_integer() -> Integer = n:tok(TokenType::OctDigits) {? Integer::try_octal(n.text.as_str()).map(|i| Integer { span: n.span.clone(), value: i.value }) }
     rule hex_integer() -> Integer = n:tok(TokenType::HexDigits) {? Integer::try_hex(n.text.as_str()).map(|i| Integer { span: n.span.clone(), value: i.value }) }
+    // An unsigned integer written with a radix prefix (`2#`, `8#` or `16#`).
+    rule radix_integer() -> Integer = binary_integer() / octal_integer() / hex_integer()
     // real_literal_type is used specifically for real literals (returns RealTypeName)
     rule real_literal_type() -> (RealTypeName, &'input Token) =
       t:tok(TokenType::Real) { (RealTypeName::REAL, t) }
@@ -727,7 +731,11 @@ parser! {
         base_type_name,
       }
     }
-    rule simple_type_declaration__with_constant() -> SimpleDeclaration = type_name:simple_type_name() _ tok(TokenType::Colon) _ spec_and_init:simple_spec_init__with_constant() {
+    // A type default is an expression after an elementary base type (`TYPE
+    // MyInt : UDINT := C;`), as a variable initializer is. After a user type
+    // name only a literal: `MyInt : Other := Value` is an enumeration
+    // declaration to the alternative before this one.
+    rule simple_type_declaration__with_constant() -> SimpleDeclaration = type_name:simple_type_name() _ tok(TokenType::Colon) _ spec_and_init:(simple_spec_init__elementary_with_expression() / simple_spec_init__with_constant()) {
       SimpleDeclaration {
         type_name,
         spec_and_init,
@@ -760,6 +768,23 @@ parser! {
         initial_value: None,
       })
     }
+    // An elementary type with a value written as an expression: the shape a
+    // variable declaration and a type default share.
+    //
+    // A bare literal parses as ExprKind::Const via expression() too (it's
+    // one of its own alternatives), so this one rule handles both the
+    // standard literal-only case and the constant-expression extension
+    // (e.g. PI/180.0) — see allow_constant_initializer_expressions and
+    // xform_fold_initializer_expressions, which folds SimpleExpr back to
+    // Simple or diagnoses it.
+    //
+    // An elementary type name is a keyword, so its value cannot be an
+    // enumerated value: a bare identifier (`UDINT := C`) can only name a
+    // constant, and is kept as a constant expression for the fold to
+    // substitute, or to diagnose when the name is not a constant (P4038).
+    rule simple_spec_init__elementary_with_expression() -> InitialValueAssignmentKind = et:elementary_type_name() _ tok(TokenType::Assignment) _ e:expression() {
+      resolve_initializer_expr(et.into(), e)
+    }
     // For simple types, they are inherently unambiguous because simple types are keywords (e.g. INT)
     rule simple_spec_init__with_constant() -> InitialValueAssignmentKind = type_name:simple_specification() _ tok(TokenType::Assignment) _ constant:constant() {
       InitialValueAssignmentKind::Simple(SimpleInitializer {
@@ -782,7 +807,11 @@ parser! {
       = type_name:integer_type_name() _ tok(TokenType::LeftParen) _ subrange:subrange() _ tok(TokenType::RightParen) { SpecificationKind::Inline(SubrangeSpecification{ type_name, subrange }) }
     rule integer_ref() -> IntegerRef = i:integer() { IntegerRef::Literal(i) } / id:identifier() { IntegerRef::Constant(id) }
     rule signed_integer_ref() -> SignedIntegerRef = si:signed_integer() { SignedIntegerRef::Literal(si) } / id:identifier() { SignedIntegerRef::Constant(id) }
-    rule subrange() -> Subrange = start:signed_integer_ref() _ tok(TokenType::Range) _ end:signed_integer_ref() { Subrange{start, end} }
+    // A bound may also be a radix integer (`16#0F`), an extension that
+    // rule_token_radix_subrange_bound gates. It is unsigned, so it is never
+    // negative.
+    rule subrange_bound() -> SignedIntegerRef = signed_integer_ref() / value:radix_integer() { SignedIntegerRef::Literal(SignedInteger { value, is_neg: false }) }
+    rule subrange() -> Subrange = start:subrange_bound() _ tok(TokenType::Range) _ end:subrange_bound() { Subrange{start, end} }
 
     rule enumerated_type_declaration__with_value() -> EnumerationDeclaration =
       type_name:enumerated_type_name() _ tok(TokenType::Colon) _ spec:enumerated_specification() _ underlying_type:enum_underlying_type()? _ tok(TokenType::Assignment) _ def:enumerated_value() {
@@ -927,6 +956,7 @@ parser! {
           },
         }
       }
+      / string_spec__with_expression()
       / str_init:single_byte_string_spec() { InitialValueAssignmentKind::String(str_init) }
       / str_init:double_byte_string_spec() { InitialValueAssignmentKind::String(str_init) }
       / simple_spec_init__with_constant()
@@ -969,21 +999,16 @@ parser! {
     //
     // There is still value in trying to disambiguate early because it allows us to use
     // the parser definitions.
-    rule simple_or_enumerated_or_subrange_ambiguous_struct_spec_init() -> InitialValueAssignmentKind = s:simple_specification() _ tok(TokenType::Assignment) _ e:expression() {?
-      // A bare literal parses as ExprKind::Const via expression() too (it's
-      // one of its own alternatives), so this handles both the standard
-      // literal-only case and the constant-expression extension
-      // (e.g. PI/180.0) — see allow_constant_initializer_expressions and
-      // xform_fold_initializer_expressions, which folds SimpleExpr back to
-      // Simple or diagnoses it.
-      //
-      // A bare identifier (no operators) is rejected here (backtracking to
-      // the enumerated_specification alternative below) because `simple
-      //_specification` also matches an enum type name, and `identifier :=
-      // identifier` is inherently ambiguous between "simple type with a
-      // constant-expression initializer referencing a variable" and "enum
-      // type with an enum value default" — the latter interpretation must
-      // still win, matching pre-existing disambiguation behavior.
+    rule simple_or_enumerated_or_subrange_ambiguous_struct_spec_init() -> InitialValueAssignmentKind = simple_spec_init__elementary_with_expression()
+    / s:simple_type_name() _ tok(TokenType::Assignment) _ e:expression() {?
+      // A user type name takes the same expression shapes, except that a
+      // bare identifier (no operators) is rejected here (backtracking to
+      // the enumerated_specification alternative below) because
+      // `identifier := identifier` is inherently ambiguous between "alias
+      // of a simple type initialized from a named constant" and "enum type
+      // with an enum value default". The parser does not decide: the
+      // alternative below records the value for the type resolver
+      // (ADR-0050).
       if matches!(e.kind, ExprKind::Variable(_) | ExprKind::LateBound(_)) {
         Err("ambiguous with enumerated value initializer")
       } else {
@@ -1312,6 +1337,9 @@ parser! {
       / tok(TokenType::Ref) _ tok(TokenType::LeftParen) _ v:variable() _ tok(TokenType::RightParen) { ReferenceInitialValue::Ref(v) }
     rule ref_to_target() -> ReferenceTarget =
       subranges:array_subranges() { ReferenceTarget::Array(subranges) }
+      // A reference type spelled in place: `REF_TO REF_TO INT`, and the
+      // TwinCAT/CODESYS `POINTER TO POINTER TO INT`, at any depth.
+      / syntax:ref_to_keyword() _ target:ref_to_target() { ReferenceTarget::Reference(Box::new(ReferenceSpec { syntax, target })) }
       / tn:non_generic_type_name() { ReferenceTarget::Named(tn) }
     pub rule output_declarations() -> Vec<VarDecl> = tok(TokenType::VarOutput) _ qualifier:(tok(TokenType::Retain) {DeclarationQualifier::Retain} / tok(TokenType::NonRetain) {DeclarationQualifier::NonRetain})? _ declarations:semisep_or_empty(<var_init_decl()>) _ tok(TokenType::EndVar) {
       VarDeclarations::flat_map(declarations, VariableType::Output, qualifier)
@@ -1446,7 +1474,39 @@ parser! {
     rule located_var_spec_init() -> InitialValueAssignmentKind = arr:array_spec_init() { InitialValueAssignmentKind::Array(arr) } / simple:simple_spec_init() { simple }
     rule location() -> AddressAssignment = tok(TokenType::At) _ v:direct_variable() { v }
     rule global_var_list() -> Vec<Id> = names:global_var_name() ++ (_ tok(TokenType::Comma) _) { names }
-    rule string_var_declaration() -> Vec<UntypedVarDecl> = single_byte_string_var_declaration() / double_byte_string_var_declaration()
+    rule string_var_declaration() -> Vec<UntypedVarDecl> = string_var_declaration__with_expression() / single_byte_string_var_declaration() / double_byte_string_var_declaration()
+    rule string_var_declaration__with_expression() -> Vec<UntypedVarDecl> = names:var1_list() _ tok(TokenType::Colon) _ init:string_spec__with_expression() {
+      names.into_iter().map(|name| {
+        UntypedVarDecl {
+          location: None,
+          name,
+          initializer: init.clone(),
+        }
+      }).collect()
+    }
+    // A string initializer written as an expression, a constant's name in
+    // practice (`s : STRING[20] := DEFAULT_NAME;`), recorded as StringExpr
+    // for xform_fold_initializer_expressions to fold to a literal or to
+    // diagnose. Only a value that is not a literal is taken: a literal is
+    // the standard String shape of the alternatives after this one, and a
+    // literal of the wrong kind (`STRING := 5`) stays the syntax error it
+    // was rather than becoming a semantic error here.
+    //
+    // This comes before the literal alternatives because they succeed on a
+    // bare `STRING` without consuming the `:=` that follows, which commits
+    // the choice and leaves the `:=` to fail the declaration.
+    rule string_spec__with_expression() -> InitialValueAssignmentKind = width:(t:tok(TokenType::String) { (StringType::String, t) } / t:tok(TokenType::WString) { (StringType::WString, t) }) _ length:string_length_spec()? _ tok(TokenType::Assignment) _ e:expression() {?
+      if literal_value_of(&e).is_some() {
+        Err("a literal is a string initializer")
+      } else {
+        Ok(InitialValueAssignmentKind::StringExpr(StringExprInitializer {
+          length,
+          width: width.0,
+          initial_value: e,
+          keyword_span: width.1.span.clone(),
+        }))
+      }
+    }
     rule single_byte_string_var_declaration() -> Vec<UntypedVarDecl> = names:var1_list() _ tok(TokenType::Colon) _ spec:single_byte_string_spec() {
       names.into_iter().map(|name| {
         let span = name.span.clone();
@@ -2173,7 +2233,9 @@ parser! {
           let span = call.span();
           Expr::new(ExprKind::MethodCall(call)).with_span(span)
         }
-      / id:identifier() _ !(tok(TokenType::LeftParen) / tok(TokenType::LeftBracket) / tok(TokenType::Period) / tok(TokenType::Caret)) {
+      // `variable_identifier`, not `identifier`: a keyword accepted as a
+      // name (`On` of `TYPE M : (Off, On)`) may be an enumerated value too.
+      / id:variable_identifier() _ !(tok(TokenType::LeftParen) / tok(TokenType::LeftBracket) / tok(TokenType::Period) / tok(TokenType::Caret)) {
         Expr::new(ExprKind::LateBound(LateBound{ value: id }))
       }
       / variable:variable() {
@@ -2239,9 +2301,14 @@ parser! {
           span: eq.span.clone(),
         })
       }
-      / var:variable() _ tok(TokenType::Caret) _ assign:tok(TokenType::Assignment) _ expr:expression() {
+      // A store through a reference: `p^ := v`, and through a reference a
+      // reference refers to, `pp^^ := v`. The last caret is the store
+      // through the reference; each caret before it dereferences the
+      // variable, so the target of `pp^^ := v` is the variable `pp^`.
+      / var:variable() carets:(_ c:tok(TokenType::Caret) { c })+ _ assign:tok(TokenType::Assignment) _ expr:expression() {
+        let target = carets.iter().skip(1).fold(var, |var, _| var.dereferenced());
         StmtKind::Assignment(Assignment {
-          target: var,
+          target,
           deref: true,
           ref_bind: false,
           set_bind: false,
@@ -2351,7 +2418,7 @@ parser! {
     // literals are already lexically distinct tokens from plain decimal
     // digits, so this alternative can only ever fire for the genuinely
     // new shape.
-    rule case_bit_string_literal() -> BitStringLiteral = value:(bi:binary_integer() { bi } / oi:octal_integer() { oi } / hi:hex_integer() { hi }) {
+    rule case_bit_string_literal() -> BitStringLiteral = value:radix_integer() {
       BitStringLiteral { value, data_type: None }
     }
 

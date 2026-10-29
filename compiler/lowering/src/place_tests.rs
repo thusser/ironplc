@@ -149,6 +149,29 @@ fn lower_statement_when_dereference_then_deref() {
     );
 }
 
+/// REQ-LOW-lowering-202: what a reference a reference refers to refers to
+/// is a `Deref` of the `Deref`, read and written, through the dereferenced
+/// expression `pp^^` and the dereferenced variable of `pp^^ := v`.
+#[test]
+fn lower_statement_when_dereference_of_dereference_then_deref_of_deref() {
+    let outcome = lower(
+        "PROGRAM main VAR x : DINT; p : REF_TO DINT; pp : REF_TO REF_TO DINT; END_VAR
+            pp^^ := pp^^ + 1;
+            x := (pp^)^;
+            pp^ := p;
+         END_PROGRAM",
+        "main",
+    );
+    assert_eq!(
+        outcome.statements,
+        [
+            "assign v0^.f2^^ (add i32s (read i32s v0^.f2^^) (const i32s 1))",
+            "assign v0^.f0 (read i32s v0^.f2^^)",
+            "assign v0^.f2^ (read ref v0^.f1)",
+        ]
+    );
+}
+
 /// What `REF(x)` refers to is `x` itself, read as `x` is, as is what a
 /// `VAR_IN_OUT`'s `REF` refers to.
 #[test]
@@ -245,7 +268,7 @@ fn lower_statement_when_bits_of_element_through_reference_written_then_assign_bi
 }
 
 /// Bits of the whole of what a reference refers to, `p^.3`, are not lowered
-/// while codegen's AST route does not address them.
+/// yet.
 #[test]
 fn lower_statement_when_bits_written_through_reference_then_unsupported() {
     let outcome = lower(

@@ -16,8 +16,8 @@
 //! into a compiler diagnostic.
 
 use ironplc_container::{Container, FunctionId};
-use ironplc_dsl::core::FileId;
-use ironplc_dsl::diagnostic::{Diagnostic, Label};
+use ironplc_ir::FileId;
+use ironplc_ir::{Diagnostic, Label};
 
 /// Verifies operand-stack discipline across every function in `container`.
 ///
@@ -103,7 +103,7 @@ mod tests {
     /// Wraps an emitter's finished bytecode in a runnable single-function
     /// container, declaring the stack depth the emitter itself computed.
     ///
-    /// This is the same sequence `compile_program_with_functions` performs,
+    /// This is the same sequence `compile` performs (`finalize_function`),
     /// reduced to one function — so what these tests feed the verifier is
     /// what codegen would have shipped.
     fn container_from(emitter: &mut Emitter, num_params: u16) -> ironplc_container::Container {

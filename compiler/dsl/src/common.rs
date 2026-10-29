@@ -689,19 +689,17 @@ impl fmt::Display for BitStringLiteral {
 #[derive(Clone, Debug, PartialEq, Recurse, Located)]
 pub struct TypeName {
     #[located(delegate)]
-    pub name: Id,
+    pub id: Id,
 }
 
 impl TypeName {
     /// Converts a `&str` into an `Identifier`.
     pub fn from(str: &str) -> Self {
-        Self {
-            name: Id::from(str),
-        }
+        Self { id: Id::from(str) }
     }
 
-    pub fn from_id(name: &Id) -> Self {
-        Self { name: name.clone() }
+    pub fn from_id(id: &Id) -> Self {
+        Self { id: id.clone() }
     }
 }
 
@@ -709,13 +707,13 @@ impl Eq for TypeName {}
 
 impl Hash for TypeName {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
+        self.id.hash(state);
     }
 }
 
 impl fmt::Display for TypeName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+        write!(f, "{}", self.id)
     }
 }
 
@@ -1452,8 +1450,9 @@ impl Located for LateBoundDeclaration {
 
 /// The target of a REF_TO declaration.
 ///
-/// A reference can point to either a named type (e.g., `REF_TO INT`) or an
-/// inline array type (e.g., `REF_TO ARRAY[1..10] OF INT`).
+/// A reference can point to a named type (`REF_TO INT`), an inline array
+/// type (`REF_TO ARRAY[1..10] OF INT`), or a reference type spelled in
+/// place (`REF_TO REF_TO INT`).
 ///
 /// See IEC 61131-3 Edition 3, section 2.3.3.1.
 #[derive(Clone, Debug, PartialEq, Recurse)]
@@ -1462,16 +1461,44 @@ pub enum ReferenceTarget {
     Named(TypeName),
     /// Reference to an inline array type: `REF_TO ARRAY[1..10] OF INT`
     Array(ArraySubranges),
+    /// Reference to a reference type spelled in place: the `REF_TO INT` of
+    /// `REF_TO REF_TO INT`, or the `POINTER TO INT` of
+    /// `POINTER TO POINTER TO INT`.
+    Reference(Box<ReferenceSpec>),
 }
 
 impl ReferenceTarget {
-    /// Returns the type name for named targets, or `None` for inline array targets.
+    /// Returns the type name for named targets, or `None` for inline array
+    /// and reference targets.
     pub fn type_name(&self) -> Option<&TypeName> {
         match self {
             ReferenceTarget::Named(tn) => Some(tn),
-            ReferenceTarget::Array(_) => None,
+            ReferenceTarget::Array(_) | ReferenceTarget::Reference(_) => None,
         }
     }
+
+    /// The named type the target is spelled from: the type itself, the
+    /// element type of an inline array, or the named type a reference
+    /// spelled in place ends in (`INT` for `REF_TO REF_TO INT`).
+    pub fn innermost_type_name(&self) -> TypeName {
+        match self {
+            ReferenceTarget::Named(tn) => tn.clone(),
+            ReferenceTarget::Array(subranges) => subranges.type_name.to_type_name(),
+            ReferenceTarget::Reference(spec) => spec.target.innermost_type_name(),
+        }
+    }
+}
+
+/// A reference type spelled in place as what another reference refers to:
+/// the `ref_spec` of IEC 61131-3 Edition 3, section 2.3.3.1, with the
+/// keyword that spelled it. `REF_TO REF_TO INT` is a `ReferenceTarget`
+/// holding the spec `REF_TO INT`.
+#[derive(Clone, Debug, PartialEq, Recurse)]
+pub struct ReferenceSpec {
+    /// The surface keyword that produced this level.
+    #[recurse(ignore)]
+    pub syntax: RefSyntax,
+    pub target: ReferenceTarget,
 }
 
 /// The surface syntax that produced a reference declaration or initializer.
@@ -2084,7 +2111,8 @@ pub struct VarDecl {
     pub type_id: Option<TypeId>,
     /// Whether the variable starts again at its initial value every time
     /// its POU is called -- a function's or method's `VAR`, `VAR_TEMP` and
-    /// result -- rather than once, when the program starts. Set by the
+    /// result, and the `VAR_TEMP` of any body -- rather than once, when the
+    /// program starts. A program is called once each scan. Set by the
     /// analyzer and left out of `PartialEq` like `type_id`.
     #[recurse(ignore)]
     pub reset_on_call: bool,
@@ -2627,6 +2655,12 @@ pub enum InitialValueAssignmentKind {
     /// `xform_fold_initializer_expressions` before any other pass runs;
     /// no other code should ever match on this variant.
     SimpleExpr(SimpleExprInitializer),
+    /// A string initializer written as a constant expression, not yet
+    /// folded to a literal: the same extension, for a string, which has a
+    /// length that `SimpleExpr` cannot hold. Always normalized to `String`
+    /// by `xform_fold_initializer_expressions` before any other pass runs;
+    /// no other code should ever match on this variant.
+    StringExpr(StringExprInitializer),
 }
 
 /// A declaration against a user-defined type name, before the type is known.
@@ -2709,6 +2743,9 @@ impl InitialValueAssignmentKind {
             InitialValueAssignmentKind::SimpleExpr(simple_expr_initializer) => {
                 TypeReference::Named(simple_expr_initializer.type_name.clone())
             }
+            InitialValueAssignmentKind::StringExpr(string_expr_initializer) => {
+                TypeReference::Named(string_expr_initializer.type_name())
+            }
         }
     }
 
@@ -2732,7 +2769,8 @@ impl InitialValueAssignmentKind {
             | InitialValueAssignmentKind::FunctionBlockCall(_)
             | InitialValueAssignmentKind::Interface(_)
             | InitialValueAssignmentKind::LateResolvedType(_)
-            | InitialValueAssignmentKind::SimpleExpr(_) => false,
+            | InitialValueAssignmentKind::SimpleExpr(_)
+            | InitialValueAssignmentKind::StringExpr(_) => false,
         }
     }
 
@@ -2870,6 +2908,35 @@ impl StringInitializer {
             StringType::String => TypeName::from("string"),
             StringType::WString => TypeName::from("wstring"),
         }
+    }
+}
+
+/// A string variable initializer written as a constant expression (a
+/// constant's name, `s : STRING[20] := DEFAULT_NAME;`) rather than a
+/// literal: the extension [`SimpleExprInitializer`] is, for a string, which
+/// keeps a length a `SimpleInitializer` cannot hold.
+///
+/// Parsed unconditionally; `xform_fold_initializer_expressions` folds it to
+/// a [`StringInitializer`] or emits a diagnostic, depending on
+/// `allow_constant_initializer_expressions`.
+#[derive(Clone, PartialEq, Debug, Recurse, Located)]
+pub struct StringExprInitializer {
+    /// Maximum length of the string.
+    pub length: Option<IntegerRef>,
+    /// The size of a single 'character'
+    #[recurse(ignore)]
+    pub width: StringType,
+    /// The expression the initial value is written as.
+    pub initial_value: Expr,
+
+    #[located(position)]
+    pub keyword_span: SourceSpan,
+}
+
+impl StringExprInitializer {
+    /// The string type the initializer declares, by its keyword.
+    pub fn type_name(&self) -> TypeName {
+        TypeName::from(self.width.keyword())
     }
 }
 

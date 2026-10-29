@@ -1,8 +1,8 @@
 //! Starting values: `init`, the statements that run once, before the first
 //! round, and give every global and every field of every program instance
-//! the value it starts with, and each function's and method's prologue,
-//! which gives each of its variables that starts again on every call its
-//! value (`specs/design/lowered-program.md`, "Initial values").
+//! the value it starts with, and each body's prologue, which gives each of
+//! its variables that starts again on every call its value
+//! (`specs/design/lowered-program.md`, "Initial values").
 //!
 //! The analyzer completes each declaration's initializer
 //! ([`crate::initial_value`]): every field and element is listed, and every
@@ -24,32 +24,34 @@
 //! A function's or method's prologue stores the value of each `VAR`,
 //! `VAR_TEMP` and `VAR_OUTPUT` the analyzer flags as starting again on every
 //! call, in declaration order, then of its result, as codegen's prologue
-//! does (REQ-LOW-lowering-195).
+//! does (REQ-LOW-lowering-195). A program's or function block's prologue
+//! stores the value of each of its `VAR_TEMP`, which the analyzer flags the
+//! same way, in declaration order (REQ-LOW-lowering-201).
 
 use std::collections::HashMap;
 
 use ironplc_dsl::common::{VarDecl, VariableType};
-use ironplc_dsl::core::{Id, Located, SourceSpan};
+use ironplc_dsl::core::{Located, SourceSpan};
 use ironplc_dsl::diagnostic::Diagnostic;
 use ironplc_dsl::textual::{SymbolicVariableKind, Variable};
 use ironplc_dsl::type_id::TypeId as AstTypeId;
 use ironplc_ir::execution::{ExecutionModel, InstanceOf};
 use ironplc_ir::lowered::{
-    ExecutionBindings, Expr, ExprKind, Owner, Place, Projection, ScalarType, Signedness, Stmt,
-    StrExpr, TypeKind, VarId,
+    ExecutionBindings, Expr, Owner, Place, ScalarType, Signedness, Stmt, StrExpr, TypeKind, VarId,
 };
 
+use crate::execution_model::Declarations;
 use crate::initial_value::{self, BlockMembers, FieldValue, InitialValue, ReferenceValue, Scalar};
 use crate::variables::BodyFrame;
-use crate::{Body, Lowering};
+use crate::{Body, Lowered, Lowering, Unlowered};
 
 /// What lowering made of the starting values of `init` or of a prologue:
-/// the statements of each value it lowered, in order, and where each
-/// declaration is whose value it does not express yet.
+/// the statements of each value it lowered, in order, and a P9999 at each
+/// declaration whose value it does not express yet.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Stores {
     pub(crate) statements: Vec<Stmt>,
-    pub(crate) unsupported: Vec<SourceSpan>,
+    pub(crate) unsupported: Vec<Diagnostic>,
 }
 
 impl Stores {
@@ -85,32 +87,30 @@ impl Values {
 enum Reach<'f> {
     /// A global's initializer, which names other globals.
     Global,
-    /// The initializer of a field of the program instance, the variable,
-    /// whose body is the frame: it names the program's variables, reached
-    /// through the instance, as `init` runs in no body.
-    Instance(&'f BodyFrame, VarId),
+    /// The initializer of a field of a program instance, in `init`, which
+    /// runs in no body: the frame of the program's body held by the
+    /// variable that holds the instance ([`BodyFrame::held_by`]), so that
+    /// the program's variables are reached through the instance itself.
+    Init(&'f BodyFrame<'f>),
     /// The initializer of a variable of the body of the frame, which runs
     /// in that body.
-    Body(&'f BodyFrame),
+    Body(&'f BodyFrame<'f>),
 }
-
-/// A store lowering made, `None` when it cannot express it yet, or a P9998.
-type Made = Result<Option<()>, Diagnostic>;
 
 impl<'a> Lowering<'a> {
     /// The statements of `init` for the globals and program instances of
-    /// `execution`, which `bindings` binds to the program's variables.
+    /// `execution`, whose ids name `declarations` and which `bindings` binds
+    /// to the program's variables.
     pub(crate) fn lower_init(
         &mut self,
         execution: &ExecutionModel,
+        declarations: &Declarations<'a>,
         bindings: &ExecutionBindings,
         values: &Values,
     ) -> Result<Stores, Diagnostic> {
         let mut init = Stores::default();
         for (id, _) in execution.globals() {
-            let (Some(var), Some(decl)) =
-                (bindings.global(id), self.analysis.global_declaration(id))
-            else {
+            let (Some(var), Some(decl)) = (bindings.global(id), declarations.global(id)) else {
                 continue;
             };
             let place = self.program.var(var, &decl.identifier.span())?;
@@ -120,14 +120,13 @@ impl<'a> Lowering<'a> {
             let InstanceOf::Program(id) = &instance.program else {
                 continue;
             };
-            let (Some(var), Some(program)) = (
-                bindings.instance(position),
-                self.analysis.program_declaration(*id),
-            ) else {
+            let (Some(var), Some(program)) =
+                (bindings.instance(position), declarations.program(*id))
+            else {
                 continue;
             };
             let pou = self.body_pou(Body::Program(program));
-            let Some(Some(frame)) = self.bodies.get(&pou).cloned() else {
+            let Some(Ok(frame)) = self.bodies.get(&pou).cloned() else {
                 continue;
             };
             for decl in &program.variables {
@@ -153,12 +152,11 @@ impl<'a> Lowering<'a> {
             return Ok(());
         };
         let span = name.span();
-        let place = match decl.var_type {
-            VariableType::Var | VariableType::Input | VariableType::Output => {
-                let this = self.program.var(instance, &span)?;
-                self.field_named(this, name, &span)?
-            }
-            VariableType::Global => self.named_place(frame, name, &span)?,
+        match decl.var_type {
+            VariableType::Var
+            | VariableType::Input
+            | VariableType::Output
+            | VariableType::Global => {}
             // A `VAR_IN_OUT` is bound by a call, a `VAR_TEMP` starts again
             // in each scan, a `VAR_EXTERNAL` is its global's and an access
             // path names another variable.
@@ -166,23 +164,21 @@ impl<'a> Lowering<'a> {
             | VariableType::VarTemp
             | VariableType::External
             | VariableType::Access => return Ok(()),
-        };
-        match place {
-            Some(place) => {
-                self.store_declaration(Reach::Instance(frame, instance), place, decl, values, init)
-            }
-            None => {
-                init.unsupported.push(span);
+        }
+        let held = frame.held_by(self.program.var(instance, &span)?);
+        match self.named_place(&held, name, &span) {
+            Ok(place) => self.store_declaration(Reach::Init(&held), place, decl, values, init),
+            Err(unlowered) => {
+                init.unsupported.push(unlowered.not_yet_at(span)?);
                 Ok(())
             }
         }
     }
 
-    /// The prologue of the function or method `body`, whose frame is
-    /// `frame`: the store of the value each of its declarations that starts
-    /// again on every call starts with, in declaration order, then its
-    /// result's (REQ-LOW-lowering-195). A program's or function block's
-    /// body has none yet.
+    /// The prologue of `body`, whose frame is `frame`: the store of the
+    /// value each of its declarations that starts again on every call starts
+    /// with, in declaration order, then a function's or method's result's
+    /// (REQ-LOW-lowering-195, REQ-LOW-lowering-201).
     pub(crate) fn lower_prologue(
         &mut self,
         body: Body<'a>,
@@ -193,26 +189,29 @@ impl<'a> Lowering<'a> {
         let (variables, result) = match body {
             Body::Function(function) => (&function.variables, function.result.variable()),
             Body::Method { method, .. } => (&method.variables, method.result.variable()),
-            Body::Program(_) | Body::FunctionBlock(_) => return Ok(prologue),
+            Body::Program(program) => (&program.variables, None),
+            Body::FunctionBlock(block) => (&block.variables, None),
         };
         let reset = variables.iter().filter(|decl| decl.reset_on_call);
         for decl in reset.chain(result) {
             let Some(name) = decl.identifier.symbolic_id() else {
                 continue;
             };
-            match self.named_place(frame, name, &name.span())? {
-                Some(place) => {
+            match self.named_place(frame, name, &name.span()) {
+                Ok(place) => {
                     self.store_declaration(Reach::Body(frame), place, decl, values, &mut prologue)?
                 }
-                None => prologue.unsupported.push(name.span()),
+                Err(unlowered) => prologue
+                    .unsupported
+                    .push(unlowered.not_yet_at(name.span())?),
             }
         }
         Ok(prologue)
     }
 
     /// Adds the stores of the value `decl` starts with, at `place`, to
-    /// `stores`, or `decl`'s span to what it does not express yet. A
-    /// variable the value names is reached as `reach` says.
+    /// `stores`, or the P9999 at `decl` when it does not express the value
+    /// yet. A variable the value names is reached as `reach` says.
     fn store_declaration(
         &mut self,
         reach: Reach<'_>,
@@ -224,9 +223,9 @@ impl<'a> Lowering<'a> {
         let span = decl.identifier.span();
         let value = initial_value::read(decl, &values.types, &values.blocks)?;
         let mut statements = Vec::new();
-        match self.store_value(reach, place, &value, &span, &mut statements)? {
-            Some(()) => stores.statements.extend(statements),
-            None => stores.unsupported.push(span),
+        match self.store_value(reach, place, &value, &span, &mut statements) {
+            Ok(()) => stores.statements.extend(statements),
+            Err(unlowered) => stores.unsupported.push(unlowered.not_yet_at(span)?),
         }
         Ok(())
     }
@@ -239,20 +238,20 @@ impl<'a> Lowering<'a> {
         value: &InitialValue,
         span: &SourceSpan,
         statements: &mut Vec<Stmt>,
-    ) -> Made {
+    ) -> Lowered<()> {
         match value {
             InitialValue::Scalar(scalar) => {
-                let Some(operated) = self.program.types().operation_type(place.ty()) else {
-                    return Ok(None);
-                };
-                let Some(expr) = scalar_expr(scalar.value, operated, span)? else {
-                    return Ok(None);
-                };
+                let operated = self
+                    .program
+                    .types()
+                    .operation_type(place.ty())
+                    .ok_or(Unlowered::NotYet)?;
+                let expr = scalar_expr(scalar.value, operated, span)?;
                 statements.push(self.assign_value(place, expr, span.clone())?);
             }
             InitialValue::String(string) => {
                 let Some(TypeKind::String(shape)) = self.program.types().kind(place.ty()) else {
-                    return Ok(None);
+                    return Err(Unlowered::NotYet);
                 };
                 let literal = StrExpr::literal(string.chars.clone(), shape.encoding, span.clone())?;
                 statements.push(self.program.assign_str(place, literal, span.clone())?);
@@ -261,9 +260,7 @@ impl<'a> Lowering<'a> {
                 let value = match reference {
                     ReferenceValue::Null => Expr::null(span.clone()),
                     ReferenceValue::To(variable) => {
-                        let Some(target) = self.reference_target(reach, variable)? else {
-                            return Ok(None);
-                        };
+                        let target = self.reference_target(reach, variable)?;
                         Expr::ref_to(target, span.clone())
                     }
                 };
@@ -273,11 +270,9 @@ impl<'a> Lowering<'a> {
                 let Some(TypeKind::Array { dimensions, .. }) =
                     self.program.types().kind(place.ty()).cloned()
                 else {
-                    return Ok(None);
+                    return Err(Unlowered::NotYet);
                 };
-                let Some(elements) = subscripted(&dimensions, elements) else {
-                    return Ok(None);
-                };
+                let elements = subscripted(&dimensions, elements).ok_or(Unlowered::NotYet)?;
                 for (subscripts, element) in elements {
                     let subscripts = subscripts
                         .into_iter()
@@ -290,143 +285,72 @@ impl<'a> Lowering<'a> {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let at = self.program.index(place.clone(), subscripts, span)?;
-                    if self
-                        .store_value(reach, at, element, span, statements)?
-                        .is_none()
-                    {
-                        return Ok(None);
-                    }
+                    self.store_value(reach, at, element, span, statements)?;
                 }
             }
             InitialValue::Structure(fields) => {
                 for FieldValue { name, value } in fields {
-                    let Some(field) = self.field_named(place.clone(), name, span)? else {
-                        return Ok(None);
-                    };
-                    if self
-                        .store_value(reach, field, value, span, statements)?
-                        .is_none()
-                    {
-                        return Ok(None);
-                    }
+                    let field = self.field_of(place.clone(), name, span)?;
+                    self.store_value(reach, field, value, span, statements)?;
                 }
             }
             // A member initializer that is an expression is lowered in the
-            // body it runs in. One in `init` would read the places its body
-            // names through the body's instance parameter, which `init`
-            // does not have; lowering does not rebase them yet.
+            // body it runs in. One of a field of a program instance, in
+            // `init`, reads the program's variables through the instance
+            // itself, as `init` has no instance parameter. One of a global
+            // is not lowered yet.
             InitialValue::Expression(expr) => {
-                let Reach::Body(frame) = reach else {
-                    return Ok(None);
+                let frame = match reach {
+                    Reach::Body(frame) | Reach::Init(frame) => frame,
+                    Reach::Global => return Err(Unlowered::NotYet),
                 };
-                let Some(stmt) = self.store_at(frame, place, expr, span.clone())? else {
-                    return Ok(None);
-                };
-                statements.push(stmt);
+                statements.extend(self.store_at(frame, place, expr, span.clone())?);
             }
         }
-        Ok(Some(()))
-    }
-
-    /// The field `name` of the record at `place`, matched without regard to
-    /// case as IEC identifiers are; `None` when it has none of that name.
-    fn field_named(
-        &self,
-        place: Place,
-        name: &Id,
-        span: &SourceSpan,
-    ) -> Result<Option<Place>, Diagnostic> {
-        let wanted = name.to_string().to_lowercase();
-        let Some(position) = self.program.types().fields(place.ty()).and_then(|fields| {
-            fields
-                .iter()
-                .position(|field| field.name.to_string().to_lowercase() == wanted)
-        }) else {
-            return Ok(None);
-        };
-        let Some(field) = self.program.field_idx(place.ty(), position) else {
-            return Ok(None);
-        };
-        self.program.field(place, field, span).map(Some)
+        Ok(())
     }
 
     /// The place `REF(variable)` refers to, reached as `reach` says: a
-    /// global, what a body names, or, in the initializer of a field of a
-    /// program instance, what the program's body names reached through the
-    /// instance rather than the body's instance parameter; `None` for any
-    /// other place.
-    fn reference_target(
-        &mut self,
-        reach: Reach<'_>,
-        variable: &Variable,
-    ) -> Result<Option<Place>, Diagnostic> {
-        let (frame, instance) = match reach {
-            Reach::Global => {
-                return match variable {
-                    Variable::Symbolic(SymbolicVariableKind::Named(named)) => {
-                        self.global_place(&named.name, &named.name.span())
-                    }
-                    Variable::Symbolic(_) | Variable::Direct(_) => Ok(None),
-                };
-            }
-            Reach::Body(frame) => return self.variable_place(frame, variable),
-            Reach::Instance(frame, instance) => (frame, instance),
-        };
-        let Some(place) = self.variable_place(frame, variable)? else {
-            return Ok(None);
-        };
-        let span = variable.span();
-        let owner = self
-            .program
-            .variables()
-            .get(place.root())
-            .map(|var| var.owner());
-        let this = frame.instance.as_ref().map(|instance| instance.this);
-        if owner == Some(Owner::Global) {
-            return Ok(Some(place));
-        }
-        let ([Projection::Deref, path @ ..], true) = (place.path(), this == Some(place.root()))
-        else {
-            return Ok(None);
-        };
-        let mut rebased = self.program.var(instance, &span)?;
-        for projection in path {
-            rebased = match projection {
-                Projection::Field(field) => self.program.field(rebased, *field, &span)?,
-                Projection::Deref => self.program.deref(rebased, &span)?,
-                Projection::Index(subscripts) => {
-                    // A subscript that reads a place would read it through
-                    // the instance parameter too.
-                    let constant = subscripts
-                        .iter()
-                        .all(|subscript| matches!(subscript.kind(), ExprKind::Const(_)));
-                    if !constant {
-                        return Ok(None);
-                    }
-                    self.program.index(rebased, subscripts.clone(), &span)?
+    /// global, what a body names, or, in `init`, what the program's body
+    /// names, reached through the instance itself. `init` runs in no body,
+    /// so a variable a body owns is no place it reaches.
+    fn reference_target(&mut self, reach: Reach<'_>, variable: &Variable) -> Lowered<Place> {
+        match reach {
+            Reach::Global => match variable {
+                Variable::Symbolic(SymbolicVariableKind::Named(named)) => {
+                    self.global_place(&named.name, &named.name.span())
                 }
-            };
+                Variable::Symbolic(_) | Variable::Direct(_) => Err(Unlowered::NotYet),
+            },
+            Reach::Body(frame) => self.variable_place(frame, variable),
+            Reach::Init(frame) => {
+                let place = self.variable_place(frame, variable)?;
+                let owner = self
+                    .program
+                    .variables()
+                    .get(place.root())
+                    .map(|var| var.owner());
+                if owner != Some(Owner::Global) {
+                    return Err(Unlowered::NotYet);
+                }
+                Ok(place)
+            }
         }
-        Ok(Some(rebased))
     }
 }
 
 /// The constant `value` at `operated`, the operation type of the place it
-/// is stored in; `None` when the type does not hold such a value.
-fn scalar_expr(
-    value: Scalar,
-    operated: ScalarType,
-    span: &SourceSpan,
-) -> Result<Option<Expr>, Diagnostic> {
+/// is stored in. A value the type does not hold is not lowered.
+fn scalar_expr(value: Scalar, operated: ScalarType, span: &SourceSpan) -> Lowered<Expr> {
     let span = span.clone();
     Ok(match (value, operated) {
-        (Scalar::Bool(value), ScalarType::Bool) => Some(Expr::boolean(value, span)),
+        (Scalar::Bool(value), ScalarType::Bool) => Expr::boolean(value, span),
         (Scalar::Integer(value), ScalarType::I32(_) | ScalarType::I64(_)) => {
-            Some(Expr::integer(value, operated, span)?)
+            Expr::integer(value, operated, span)?
         }
-        (Scalar::Real32(value), ScalarType::F32) => Some(Expr::real(value.into(), operated, span)?),
-        (Scalar::Real64(value), ScalarType::F64) => Some(Expr::real(value, operated, span)?),
-        _ => None,
+        (Scalar::Real32(value), ScalarType::F32) => Expr::real(value.into(), operated, span)?,
+        (Scalar::Real64(value), ScalarType::F64) => Expr::real(value, operated, span)?,
+        _ => return Err(Unlowered::NotYet),
     })
 }
 

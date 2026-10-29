@@ -263,17 +263,23 @@ Options
    this flag.
 
 ``--allow-constant-initializer-expressions``
-   Allow a ``VAR`` initializer to be a constant expression (e.g.
-   ``scaled : LREAL := SCALE*4.0;``) rather than only a bare literal.
+   Allow a ``VAR`` initializer or a ``TYPE`` default to be a constant
+   expression: the name of a ``CONSTANT`` variable (e.g.
+   ``level : UDINT := DEFAULT_LEVEL;``) or
+   arithmetic over literals and constants (e.g.
+   ``scaled : LREAL := SCALE*4.0;``), rather than only a bare literal.
    Folded to a literal at compile time; produces
    :doc:`P4037 </reference/compiler/problems/P4037>` when used without this
-   flag, or :doc:`P4038 </reference/compiler/problems/P4038>` if the
-   expression does not fully reduce to a constant.
+   flag, :doc:`P4038 </reference/compiler/problems/P4038>` if the
+   expression does not fully reduce to a constant, or
+   :doc:`P4022 </reference/compiler/problems/P4022>` if a named constant's
+   type is not compatible with the variable's.
 
-``--allow-bit-string-case-labels``
+``--allow-radix-case-labels``
    Allow a hex, binary, or octal bit-string literal (e.g. ``16#D012``,
-   ``2#1010``) as a ``CASE`` label. The IEC 61131-3 standard permits only a
-   subrange, decimal integer, or enumerated value here. Produces
+   ``2#1010``) as a ``CASE`` label or as a bound of a subrange label. The
+   IEC 61131-3 standard permits only a subrange of decimal integers, a
+   decimal integer, or an enumerated value here. Produces
    :doc:`P4041 </reference/compiler/problems/P4041>` when used without this
    flag.
 
@@ -283,6 +289,13 @@ Options
    brackets. The IEC 61131-3 standard declares a string length only with
    brackets; the parenthesis form is an extension. Produces
    :doc:`P4042 </reference/compiler/problems/P4042>` when used without this
+   flag.
+
+``--allow-radix-subrange-bounds``
+   Allow a hex, binary, or octal literal (e.g. ``16#FF``, ``2#1010``) as a
+   bound of a subrange type or of an array dimension. The IEC 61131-3
+   standard permits only decimal integers here. Produces
+   :doc:`P4096 </reference/compiler/problems/P4096>` when used without this
    flag.
 
 ``--allow-struct-initializer-expressions``
@@ -334,6 +347,13 @@ Options
    the innermost ``FOR``, ``WHILE``, or ``REPEAT`` loop. ``CONTINUE`` was added
    in IEC 61131-3:2013 (Edition 3); without this flag it is an ordinary
    identifier.
+
+``--allow-keywords-as-names``
+   Allow the keywords ``ON``, ``STEP``, ``R_EDGE`` and ``F_EDGE`` as names of
+   variables and enumeration members (e.g. ``(Off, On)``). IEC 61131-3
+   reserves its keywords, so this is an extension. Produces
+   :doc:`P4095 </reference/compiler/problems/P4095>` when used without this
+   flag.
 
 ``--policy-string-to-num-non-numeric`` *ALTERNATIVE*
    Select what ``STRING_TO_<numeric>`` treats as convertible when the string

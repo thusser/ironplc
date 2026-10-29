@@ -27,7 +27,6 @@ mod clean_analysis;
 mod constant_folding;
 mod enumerated_value_type;
 pub mod enumeration_members;
-pub mod execution_model;
 mod function_environment;
 mod result;
 mod rule_abstract_not_instantiated;
@@ -39,7 +38,7 @@ mod rule_assignment_aggregate_type_compat;
 mod rule_bit_and_partial_access_range;
 mod rule_bit_shift_input_type;
 mod rule_call_input_type;
-mod rule_case_bit_string_label;
+mod rule_case_radix_label;
 mod rule_case_selector_type;
 mod rule_comparison_operand_type;
 mod rule_condition_type;
@@ -53,13 +52,16 @@ mod rule_enumeration_values_unique;
 mod rule_extends_base_declared;
 mod rule_extends_field_duplicated;
 mod rule_for_control_type;
+mod rule_for_step_nonzero;
 mod rule_function_block_call_unsupported;
 mod rule_function_block_invocation;
 mod rule_function_call_declared;
 mod rule_function_call_in_out_argument;
 mod rule_function_call_type_check;
+mod rule_function_inputs_common_type;
 mod rule_interface_conformance;
 mod rule_interface_conversion;
+mod rule_keyword_name_allowed;
 mod rule_loop_control_inside_loop;
 mod rule_member_qualifier_allowed;
 mod rule_member_qualifier_invalid;
@@ -72,6 +74,7 @@ mod rule_pou_hierarchy;
 mod rule_program_task_definition_exists;
 mod rule_program_var_hides_global;
 mod rule_range_limits;
+mod rule_real_literal_integer_position;
 mod rule_real_literal_range;
 mod rule_ref_to;
 mod rule_return_type_declared;
@@ -142,6 +145,9 @@ pub use builtin_function::{
 };
 pub use callee_resolution::MethodOwners;
 pub use clean_analysis::CleanAnalysis;
+// The options an analysis ran with, which `SemanticContext::compiler_options`
+// gives, re-exported so that a pass after the analyzer names them through
+// this crate.
 pub use function_environment::{
     FunctionEnvironment, FunctionEnvironmentBuilder, FunctionSignature,
 };
@@ -150,6 +156,7 @@ pub use intermediates::arithmetic_overload::{
     TypedOverload,
 };
 pub use intermediates::operator_function_form::FormOf;
+pub use ironplc_parser::options::CompilerOptions;
 pub use semantic_context::{SemanticContext, SemanticContextBuilder};
 pub use semantic_type::SemanticType;
 pub use standard_function_block::{CounterWidth, StandardFunctionBlock};

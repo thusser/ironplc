@@ -159,13 +159,7 @@ impl ImplicitConversions<'_> {
         let one_type = builtin
             .as_ref()
             .and_then(BuiltinFunction::inputs_of_one_type);
-        let typed_pair = match func.param_assignment.as_slice() {
-            [left, right, ..] => match (left.input_expr(), right.input_expr()) {
-                (Some(left), Some(right)) => self.is_typed_operator_pair(func, left, right),
-                _ => false,
-            },
-            _ => false,
-        };
+        let typed_pair = self.is_typed_pair(func);
         let mut inputs: Vec<&mut Expr> = func.inputs_mut().collect();
         let dint = self.dint();
         // An operation on one value computes at its own numeric type, and any
@@ -286,21 +280,18 @@ impl ImplicitConversions<'_> {
                     };
                     self.type_literals(arg, at);
                 }),
+                // `SIZEOF` measures its argument rather than computing it,
+                // so no backend compiles the argument; the literals of its
+                // subscripts are typed all the same, so that none is left
+                // at a generic category.
                 BuiltinFunction::Trunc
                 | BuiltinFunction::IntToBcd
                 | BuiltinFunction::Time { .. }
                 | BuiltinFunction::DtToDate
-                | BuiltinFunction::DtToTod => inputs.into_iter().for_each(|arg| self.type_own(arg)),
-                BuiltinFunction::Sizeof => {}
+                | BuiltinFunction::DtToTod
+                | BuiltinFunction::Sizeof => inputs.into_iter().for_each(|arg| self.type_own(arg)),
             },
         }
-    }
-
-    /// Returns `true` when `func` is the function form of an arithmetic
-    /// operator whose first two inputs have a typed overload.
-    fn is_typed_operator_pair(&self, func: &Function, left: &Expr, right: &Expr) -> bool {
-        super::arithmetic::arithmetic_operator(func)
-            .is_some_and(|op| self.has_typed_overload(&op, left, right))
     }
 
     /// Types the literals of the arguments of a method call by the method's

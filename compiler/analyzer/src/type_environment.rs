@@ -254,7 +254,7 @@ static ELEMENTARY_TYPES_LOWER_CASE: [(&str, ElementaryTypeName, SemanticType); 2
 pub fn elementary_type(type_name: &TypeName) -> Option<&'static SemanticType> {
     ELEMENTARY_TYPES_LOWER_CASE
         .iter()
-        .find(|(name, _, _)| type_name.name.lower_case == *name)
+        .find(|(name, _, _)| type_name.id.lower_case == *name)
         .map(|(_, _, elem_type)| elem_type)
 }
 
@@ -379,7 +379,7 @@ impl TypeEnvironment {
         };
         self.duplicates.push(duplicate_declaration(
             problem,
-            &type_name.name,
+            &type_name.id,
             existing
                 .name
                 .as_ref()
@@ -667,6 +667,38 @@ impl TypeEnvironment {
                         .clone()),
                 }
             }
+            // A reference spelled in place: REF_TO REF_TO INT
+            ReferenceTarget::Reference(spec) => Ok(SemanticType::Reference {
+                target_type: Box::new(self.resolve_reference_target(declaring, &spec.target)?),
+            }),
+        }
+    }
+
+    /// The id of the type the reference target `target` names, entering a
+    /// reference spelled in place (`REF_TO REF_TO INT`) as the one
+    /// reference type to its target (see [`Self::reference_to`]). `None`
+    /// for a named type this environment does not have, and for an inline
+    /// array, which has no id until the declaration that spells it enters
+    /// it.
+    pub fn reference_target_id(&mut self, target: &ReferenceTarget) -> Option<TypeId> {
+        match target {
+            ReferenceTarget::Named(type_name) => self.id_of(type_name),
+            ReferenceTarget::Array(_) => None,
+            ReferenceTarget::Reference(spec) => {
+                let referenced = self.reference_target_id(&spec.target)?;
+                self.reference_to(referenced)
+            }
+        }
+    }
+
+    /// Records that the named reference type `reference` refers to the type
+    /// `target`, so that [`Self::referenced_type`] answers for it by id, as
+    /// it does for a reference type from [`Self::reference_to`]. A named
+    /// reference type's representation holds its target's structure but not
+    /// its id, which a target that is itself a reference, or an array, needs.
+    pub fn record_declared_reference_target(&mut self, reference: &TypeName, target: TypeId) {
+        if let Some(reference) = self.id_of(reference) {
+            self.referenced.insert(reference, target);
         }
     }
 

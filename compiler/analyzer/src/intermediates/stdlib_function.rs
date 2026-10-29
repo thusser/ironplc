@@ -12,7 +12,7 @@
 //! These functions are automatically available in the function environment
 //! and do not need to be declared by the user.
 
-use ironplc_dsl::common::TypeName;
+use ironplc_dsl::common::{ElementaryTypeName, GenericTypeName, TypeName};
 use ironplc_dsl::core::Id;
 
 use crate::builtin_function::{BitShift, BuiltinFunction, NumericFunction, StringFunction};
@@ -20,17 +20,33 @@ use crate::function_environment::FunctionSignature;
 use crate::intermediates::operator_function_form;
 use crate::intermediates::stdlib_conversion_function;
 use crate::intermediates::stdlib_time_function;
-use crate::semantic_type::SemanticFunctionParameter;
+use crate::semantic_type::{ParameterType, SemanticFunctionParameter};
+use crate::type_id;
 
-/// Helper to create an input parameter.
+/// Helper to create an input parameter of the generic category or
+/// elementary type `param_type_name`.
 pub(super) fn input_param(name: &str, param_type_name: &str) -> SemanticFunctionParameter {
     SemanticFunctionParameter {
         name: Id::from(name),
-        param_type: TypeName::from(param_type_name),
+        param_type: stdlib_parameter_type(param_type_name),
         is_input: true,
         is_output: false,
         is_inout: false,
         is_reference: false,
+    }
+}
+
+/// The type a standard function's parameter is declared as `name`: a generic
+/// category or an elementary type, both of which the type environment knows
+/// without a library.
+pub(crate) fn stdlib_parameter_type(name: &str) -> ParameterType {
+    let id = Id::from(name);
+    if let Ok(generic) = GenericTypeName::try_from(&id) {
+        return ParameterType::Generic(generic);
+    }
+    match ElementaryTypeName::try_from(&id) {
+        Ok(elementary) => ParameterType::Type(type_id::elementary(&elementary)),
+        Err(()) => ParameterType::Unresolved(TypeName::from(name)),
     }
 }
 
@@ -85,15 +101,15 @@ fn get_numeric_functions() -> Vec<FunctionSignature> {
                 input_param("MX", "ANY_NUM"),
             ],
         ),
-        // SEL: binary selection (BOOL, ANY_NUM, ANY_NUM -> ANY_NUM)
+        // SEL: binary selection (BOOL, ANY, ANY -> ANY)
         FunctionSignature::stdlib(
             "SEL",
             BuiltinFunction::Numeric(NumericFunction::Sel),
-            TypeName::from("ANY_NUM"),
+            TypeName::from("ANY"),
             vec![
                 input_param("G", "BOOL"),
-                input_param("IN0", "ANY_NUM"),
-                input_param("IN1", "ANY_NUM"),
+                input_param("IN0", "ANY"),
+                input_param("IN1", "ANY"),
             ],
         ),
         // LN: natural logarithm (ANY_REAL -> ANY_REAL)
@@ -187,22 +203,23 @@ fn get_numeric_functions() -> Vec<FunctionSignature> {
 ///
 /// MUX is an extensible multiplexer that selects one of N inputs based on
 /// an integer selector K. Unlike SEL (which uses a BOOL selector and exactly
-/// 2 inputs), MUX uses an ANY_INT selector and supports 2..16 inputs.
+/// 2 inputs), MUX uses an ANY_INT selector and supports 2..16 inputs. Its
+/// inputs are of any type (`ANY`), as SEL's are.
 ///
 /// The declared parameters define the minimum (K + 2 IN values = 3 args).
 /// Additional IN arguments are accepted because the signature is extensible.
 fn get_selection_functions() -> Vec<FunctionSignature> {
     vec![
-        // MUX: multiplexer (ANY_INT, ANY_NUM, ANY_NUM, ... -> ANY_NUM)
+        // MUX: multiplexer (ANY_INT, ANY, ANY, ... -> ANY)
         // MUX supports K + 2..16 IN values = 3..17 total input arguments
         FunctionSignature::stdlib_extensible(
             "MUX",
             BuiltinFunction::Mux,
-            TypeName::from("ANY_NUM"),
+            TypeName::from("ANY"),
             vec![
                 input_param("K", "ANY_INT"),
-                input_param("IN0", "ANY_NUM"),
-                input_param("IN1", "ANY_NUM"),
+                input_param("IN0", "ANY"),
+                input_param("IN1", "ANY"),
             ],
             Some(17),
         ),
@@ -215,17 +232,16 @@ fn get_selection_functions() -> Vec<FunctionSignature> {
 
 /// Returns the MOVE standard function definition.
 ///
-/// MOVE copies the input value to the output, equivalent to assignment.
-/// IEC 61131-3 defines MOVE as operating on ANY type, but since the codegen
-/// currently supports numeric types we use ANY_NUM here.
+/// MOVE copies the input value to the output, equivalent to assignment, and
+/// IEC 61131-3 declares it on any type (`ANY`).
 fn get_assignment_functions() -> Vec<FunctionSignature> {
     vec![
-        // MOVE: assignment (ANY_NUM -> ANY_NUM)
+        // MOVE: assignment (ANY -> ANY)
         FunctionSignature::stdlib(
             "MOVE",
             BuiltinFunction::Move,
-            TypeName::from("ANY_NUM"),
-            vec![input_param("IN", "ANY_NUM")],
+            TypeName::from("ANY"),
+            vec![input_param("IN", "ANY")],
         ),
     ]
 }
@@ -686,6 +702,47 @@ mod tests {
     }
 
     #[test]
+    fn stdlib_parameter_type_when_generic_category_then_generic() {
+        assert_eq!(
+            stdlib_parameter_type("ANY_NUM"),
+            ParameterType::Generic(GenericTypeName::AnyNum)
+        );
+    }
+
+    #[test]
+    fn stdlib_parameter_type_when_elementary_then_type_id_of_elementary() {
+        assert_eq!(
+            stdlib_parameter_type("TIME_OF_DAY"),
+            ParameterType::Type(type_id::elementary(&ElementaryTypeName::TimeOfDay))
+        );
+    }
+
+    #[test]
+    fn stdlib_parameter_type_when_unknown_name_then_unresolved() {
+        assert_eq!(
+            stdlib_parameter_type("NOPE"),
+            ParameterType::Unresolved(TypeName::from("NOPE"))
+        );
+    }
+
+    #[test]
+    fn stdlib_functions_when_any_parameter_then_type_or_generic_category() {
+        let functions = get_all_stdlib_functions()
+            .into_iter()
+            .chain(get_compiler_intrinsic_functions());
+        for function in functions {
+            for parameter in &function.parameters {
+                assert!(
+                    !matches!(parameter.param_type, ParameterType::Unresolved(_)),
+                    "{}.{} does not resolve",
+                    function.name,
+                    parameter.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stdlib_functions_have_builtin_span() {
         for func in get_all_stdlib_functions() {
             assert!(
@@ -706,7 +763,10 @@ mod tests {
             .unwrap();
         assert!(trunc.is_stdlib());
         assert_eq!(trunc.input_parameter_count(), 1);
-        assert_eq!(trunc.parameters[0].param_type, TypeName::from("ANY_REAL"));
+        assert_eq!(
+            trunc.parameters[0].param_type,
+            ParameterType::Generic(GenericTypeName::AnyReal)
+        );
         assert_eq!(
             trunc.return_type,
             Some(FunctionReturnType::Named(TypeName::from("ANY_REAL")))
@@ -718,8 +778,14 @@ mod tests {
             .unwrap();
         assert!(fmod.is_stdlib());
         assert_eq!(fmod.input_parameter_count(), 2);
-        assert_eq!(fmod.parameters[0].param_type, TypeName::from("ANY_REAL"));
-        assert_eq!(fmod.parameters[1].param_type, TypeName::from("ANY_REAL"));
+        assert_eq!(
+            fmod.parameters[0].param_type,
+            ParameterType::Generic(GenericTypeName::AnyReal)
+        );
+        assert_eq!(
+            fmod.parameters[1].param_type,
+            ParameterType::Generic(GenericTypeName::AnyReal)
+        );
         assert_eq!(
             fmod.return_type,
             Some(FunctionReturnType::Named(TypeName::from("ANY_REAL")))

@@ -26,7 +26,7 @@ Related documents:
 - `REF_TO` of function block instance fields (restrict to simple variables initially)
 - `REF()` of array elements (e.g., `REF(arr[3])`) — array elements use descriptors, not simple variable indices; requires a (var_index, flat_offset) pair which the current reference representation cannot encode
 - `REF()` of structure fields (e.g., `REF(my_struct.field)`) — depends on how structure fields map to variable slots
-- Nested `REF_TO REF_TO` (multi-level indirection) — the grammar and type system support it, but codegen/VM testing is deferred to a follow-up; the semantic analyzer rejects nested `REF_TO` in this initial implementation
+- An array, structure or string reached through a nested reference (`rr^^[i]`, `rr^^.f`) — the opcodes that reach an aggregate through a reference take the reference variable's index as an immediate, so a reference that is only a value (`rr^`) cannot name one yet; lowering reports P9999. Scalar targets of nested references are in scope (see [Nested References](#nested-references))
 - Beckhoff `REFERENCE TO` / `POINTER TO` dialect syntax — maps to the same AST but requires dialect-specific parser productions (deferred to dialect implementation work)
 
 ## IEC 61131-3 Edition 3 REF_TO Features
@@ -61,7 +61,8 @@ Safety is the guiding principle. PLCs control physical machinery — null derefe
 | **Addressable operands only**: `REF(1+2)` is rejected | Only variables have stable addresses |
 | **No REF of ephemeral variables**: `REF(temp)` in a FUNCTION is rejected for VAR_TEMP; `REF(input)` in a FUNCTION is rejected for VAR_INPUT/VAR_OUTPUT | Prevents dangling references — these variables are stack-allocated in FUNCTIONs (not FUNCTION_BLOCKs) and destroyed when the function returns. VAR_INPUT/VAR_OUTPUT in FUNCTION_BLOCKs are persistent and therefore safe. |
 | **No REF of array elements**: `REF(arr[i])` is rejected | Array elements use descriptor-based indexing, not simple variable-table indices; a reference cannot encode the element offset |
-| **No nested REF_TO**: `REF_TO REF_TO INT` is rejected | Multi-level indirection is deferred; single-level only in this implementation |
+| **Each level of a nested reference is typed**: `REF(r)` of a reference `r` is a `REF_TO REF_TO T`, stored only in a reference to a reference, and `rr^` is checked as the reference it is | A reference to a reference stored in a `REF_TO INT` would be followed as a reference to the `INT`, reading whatever `r` holds as a variable index (#2285) |
+| **No nested `REFERENCE TO`**: `REFERENCE TO IntRef` and `POINTER TO REFERENCE TO INT` are rejected | TwinCAT declares neither, and a `REFERENCE TO` auto-dereferences by its own declaration, which a reference reached through another has not |
 | **NULL type restriction**: `x := NULL` where x is INT is rejected | NULL only assignable to reference types |
 | **Comparison restrictions**: `ref < other_ref` is rejected | Only `=` and `<>` are meaningful for references |
 
@@ -81,7 +82,7 @@ References allow aliasing: two references can point to the same variable, and mo
 
 ### Scope and Reference Validity
 
-All variable-table indices are global to a program instance. References created inside a function block scope remain valid after the function block call returns, because the referenced variable persists in the flat variable table. `LOAD_INDIRECT` and `STORE_INDIRECT` check the target index against the program instance's scope (its shared globals and its own partition of the variable table), not against the current frame's scope. This means cross-scope references are valid — a reference obtained in one function block can be used in another, and a function can write through a reference to a variable in its caller's frame — while another program instance's variables stay out of reach.
+All variable-table indices are global to a program instance. References created inside a function block scope remain valid after the function block call returns, because the referenced variable persists in the flat variable table. Every instruction that follows a variable reference — `LOAD_INDIRECT` and `STORE_INDIRECT`, `LOAD_ARRAY_DEREF` and `STORE_ARRAY_DEREF`, `STR_LOAD_ARRAY_DEREF` and `STR_STORE_ARRAY_DEREF`, and `COPY_REGION_DEREF` — checks the target index against the program instance's scope (its shared globals and its own partition of the variable table), not against the current frame's scope. This means cross-scope references are valid — a reference obtained in one function block can be used in another, and a function can write through a reference to a variable in its caller's frame — while another program instance's variables stay out of reach.
 
 `VAR_IN_OUT` parameters of functions use this mechanism: each is an implicit reference, never null and never reassigned, bound by the caller. See [VAR_IN_OUT parameters](var-in-out-parameters.md).
 
@@ -204,7 +205,7 @@ This naturally handles:
 - `a XOR b` → `BinaryOp(Xor, a, b)` — XOR still works (no postfix `^` consumed)
 - `a^ XOR b` → `BinaryOp(Xor, Deref(a), b)` — dereference binds tighter
 
-The loop (`*`) also handles the case where nested REF_TO is supported in the future: `p^^` would parse as `Deref(Deref(p))`. Even though nested REF_TO is rejected by the semantic analyzer in this initial implementation, parsing it correctly avoids confusing error messages.
+The loop (`*`) handles nested references: `pp^^` parses as `Deref(Deref(pp))`. As an assignment target, `pp^^ := v` keeps the one `deref` flag of `Assignment` for the store, and each caret before the last dereferences the target variable, so the target is the variable `pp^` (`SymbolicVariableKind::Deref`).
 
 ## AST Representation
 
@@ -301,14 +302,29 @@ This approach works because references are type-erased at the bytecode level (al
 | REF operand must be a simple variable | P2028 | `REF(1+2)` — operand is not an addressable variable |
 | No REF of ephemeral variables | P2029 | `REF(temp)` for VAR_TEMP in any FUNCTION; `REF(input)` for VAR_INPUT/VAR_OUTPUT in a FUNCTION (not FB) — these are stack-allocated and destroyed when the function returns |
 | No REF of array elements | P2030 | `REF(arr[3])` — array elements use descriptor-based access, not simple variable indices |
-| Deref requires reference type | P2031 | `x^` where x has type INT — dereference is only valid on reference types |
+| Deref requires reference type | P2031 | `x^` where x has type INT, or `r^^` where `r^` is the INT — dereference is only valid on reference types, whatever expression names the value |
+| Reference type compatibility at each level | P2032 | `r := REF(r)` stores a `REF_TO REF_TO INT` in a `REF_TO INT`; `rr^ := 5` stores a value where `rr^`, a `REF_TO INT`, takes a reference — the place an assignment stores to is the target's type, or what it refers to for a store through a dereference |
 | Reference type compatibility | P2032 | Assigning `REF_TO INT` to `REF_TO REAL` — target types must match exactly |
 | No arithmetic on references | P2033 | `ref + 1` — arithmetic operators applied to reference type |
 | NULL only for reference types | P2034 | `x := NULL` where x has type INT — NULL is only assignable to reference types |
 | Only = and <> on references | P2035 | `ref < other_ref` — ordering comparison on references (only `=` and `<>` are allowed) |
-| No nested REF_TO | P2036 | `REF_TO REF_TO INT`, or a type or variable declared `REF_TO RP` where `RP` is a reference type — multi-level indirection is not supported in this implementation |
+| No nested `REFERENCE TO` | P2036 | `REFERENCE TO RP` where `RP` is a reference type, or a reference whose target is spelled `REFERENCE TO` (`POINTER TO REFERENCE TO INT`) — TwinCAT declares neither; `REF_TO REF_TO INT` and `POINTER TO POINTER TO INT` nest |
 
 These codes are in the P2000-P3999 range (type system errors), continuing from the existing highest code P2027.
+
+## Nested References
+
+A reference to a reference (`REF_TO REF_TO INT`, spelled in place or through a named reference type, and the CODESYS `POINTER TO POINTER TO INT`) is a reference like any other: its slot holds the variable index of a reference variable, and following it is one more `LOAD_INDIRECT`. Nothing in the VM is specific to nesting; each level null-checks and range-checks as a single level does.
+
+| Stage | What nesting needs |
+|---|---|
+| AST and parser | `ReferenceTarget::Reference(ReferenceSpec)` carries a reference spelled in place as the target of another, with its own keyword, so `POINTER TO POINTER TO INT` renders back as written. `pp^^ := v` is an `Assignment` with the one `deref` flag and the target variable `pp^` |
+| Type environment | `reference_to(target)` interns a reference type by its target's id, so `REF_TO REF_TO INT` is one type however often it is spelled, and `referenced_type` answers for it by id. A named reference type (`TYPE RR : REF_TO IntRef`) records its target's id at declaration (`record_declared_reference_target`), since its representation holds the target's structure but not its id |
+| Analyzer | `rule_ref_to` types a place through `variable_type::type_id` and the resolved expression types, so the place a store goes to is the target's type or what it refers to, and a reference type is the same as another when what they refer to is (`same_type`). `REF(r)` is a `REF_TO REF_TO INT`, and `r := REF(r)` a P2032 mismatch |
+| Lowering | `pp^^` is a `Deref` of the `Deref` (REQ-LOW-lowering-202) |
+| Codegen | A read of `pp^^` loads `pp`, follows it to the reference with `LOAD_INDIRECT` and follows that again; a store pushes the value, loads the reference the same way and stores through it with `STORE_INDIRECT` (REQ-LOW-codegen-203) |
+
+The only limit is an aggregate reached through a nested reference, which the Scope section records.
 
 ## Opcode Design — `compiler/container/src/opcode.rs`
 
@@ -337,7 +353,9 @@ Both opcodes are untyped — they operate on 64-bit Slots, same as all existing 
 
 The null sentinel is `u64::MAX`. It cannot collide with a valid variable index because the variable table uses u16 indices (max 65535), and `u64::MAX` is far outside that range.
 
-## Code Generation — `compiler/codegen/src/compile.rs`
+## Code Generation
+
+Codegen compiles the lowered program (`ironplc_ir::lowered`), so a reference reaches it as lowering left it: `REF(var)` as `ExprKind::RefTo` of a place, `NULL` as `ExprKind::Null`, and `ref^` as a place with a `Projection::Deref` (`compiler/lowering/src/expr.rs`, `compiler/lowering/src/place.rs`).
 
 ### VarTypeInfo Integration
 
@@ -345,22 +363,22 @@ Reference variables use `VarTypeInfo { op_width: W64, signedness: Unsigned, stor
 
 ### Expression Compilation
 
-New arms in the `compile_expr` match on `ExprKind`:
+`emit_expr` (`compiler/codegen/src/lowered/expr.rs`) emits each reference expression:
 
-- **`ExprKind::Ref(var)`**: Resolve the variable's index at compile time, emit `LOAD_CONST_I64 index`. This is a compile-time constant — the variable index is known statically.
-- **`ExprKind::Null`**: Emit `LOAD_CONST_I64 u64::MAX`.
-- **`ExprKind::Deref(expr)`** (r-value — reading through a reference): Compile the inner expression (pushes the reference index onto the stack), then emit `LOAD_INDIRECT`.
+- **`ExprKind::RefTo(place)`**: `emit_ref` pushes the reference to the variable `place` names, a compile-time constant, as `LOAD_CONST_I64`: the variable's index, or for a string a data-region reference to its header (`reference_to` in `compiler/codegen/src/compile_reference.rs`). What a `VAR_IN_OUT` parameter refers to is already a reference in the parameter's slot, and is loaded from it with `LOAD_VAR_I64`.
+- **`ExprKind::Null`**: `emit_null` emits `LOAD_CONST_I64 u64::MAX`.
+- **A read of a dereferenced place** (r-value — reading through a reference): the place resolves to an indirect address (`compiler/codegen/src/lowered/place.rs`), whose load pushes the reference from its slot and emits `LOAD_INDIRECT` (`Place::emit_load` in `compiler/codegen/src/compile_place.rs`).
 
 ### Default Initialization
 
-During variable initialization (the codegen phase that emits initial values for all variables), reference variables without an explicit initializer must be initialized to NULL:
+The analyzer gives a reference variable without an explicit initializer the initial value `NULL` (`compiler/analyzer/src/xform_resolve_initial_values/`), and lowering initializes each reference variable with an `Assign` of `Null`, or of `RefTo` the variable it is initialized to (`compiler/lowering/src/init.rs`). Codegen emits that assignment as any other, so a variable without an initializer, or with `:= NULL`, starts as:
 
 ```
 LOAD_CONST_I64 u64::MAX
 STORE_VAR_I64 ref_slot
 ```
 
-Reference variables with `:= NULL` emit the same code. Reference variables with `:= REF(var)` emit:
+and one with `:= REF(var)` as:
 
 ```
 LOAD_CONST_I64 var_index
@@ -369,16 +387,11 @@ STORE_VAR_I64 ref_slot
 
 ### L-Value Dereference (Assignment Through a Reference)
 
-The assignment `ref^ := value` requires a new code path in the assignment compiler (`StmtKind::Assignment`). The existing assignment flow resolves the target to a static variable index via `resolve_variable_name()` and emits `STORE_VAR`. But `ref^` as a target doesn't resolve to a static index — it requires evaluating the reference expression at runtime.
+The assignment `ref^ := value` lowers to an `Assign` whose place ends in a `Projection::Deref`. That place does not resolve to a static variable index: codegen resolves it to an indirect address through the slot that holds the reference (`Address::Indirect` in `compiler/codegen/src/compile_place.rs`), and its store:
 
-**Detection:** Before the normal assignment flow, check if the assignment target is a `Deref` expression (i.e., the outermost node of the target is `ExprKind::Deref`). If so, use the indirect store path.
-
-**Indirect store path:**
-1. Compile the value expression (pushes value onto the stack)
-2. Compile the inner expression of the `Deref` (pushes the reference index)
-3. Emit `STORE_INDIRECT` (pops ref, pops value, stores value at the referenced index)
-
-This is a new branch at the top of the assignment handler, before `resolve_variable_name()`.
+1. Compiles the value expression (pushes value onto the stack)
+2. Loads the reference from its slot (`LOAD_VAR_I64 ref_slot`)
+3. Emits `STORE_INDIRECT` (pops ref, pops value, stores value at the referenced index)
 
 ### Compilation Rules Summary
 

@@ -4,6 +4,7 @@ use ironplc_parser::options::CompilerOptions;
 use rstest::rstest;
 
 use crate::common::assert_run_with;
+use crate::compile_body::compile_and_run;
 
 e2e_i32!(
     end_to_end_when_case_matches_first_arm_then_executes_body,
@@ -116,12 +117,12 @@ END_PROGRAM
     &[("x", 3), ("y", 50)],
 );
 
-/// Options enabling only the bit-string CASE label extension, on the
+/// Options enabling only the radix CASE label extension, on the
 /// default Edition 2 base. The selector is a standard integer type (`DINT`);
 /// only the radix-prefixed *label* form is the extension under test.
-fn opts_with_bit_string_case_labels() -> CompilerOptions {
+fn opts_with_radix_case_labels() -> CompilerOptions {
     CompilerOptions {
-        allow_bit_string_case_labels: true,
+        allow_radix_case_labels: true,
         ..CompilerOptions::default()
     }
 }
@@ -132,7 +133,7 @@ fn opts_with_bit_string_case_labels() -> CompilerOptions {
 // that everything but the label form stays standard.
 e2e_i32_with!(
     end_to_end_when_case_label_is_hex_literal_then_matches_correct_arm,
-    opts_with_bit_string_case_labels(),
+    opts_with_radix_case_labels(),
     "
 PROGRAM main
   VAR
@@ -151,7 +152,7 @@ END_PROGRAM
 
 e2e_i32_with!(
     end_to_end_when_case_label_is_binary_literal_then_matches_correct_arm,
-    opts_with_bit_string_case_labels(),
+    opts_with_radix_case_labels(),
     "
 PROGRAM main
   VAR
@@ -170,7 +171,7 @@ END_PROGRAM
 
 e2e_i32_with!(
     end_to_end_when_case_label_is_hex_literal_and_no_match_then_no_arm_executes,
-    opts_with_bit_string_case_labels(),
+    opts_with_radix_case_labels(),
     "
 PROGRAM main
   VAR
@@ -220,7 +221,7 @@ END_PROGRAM
 "
     );
 
-    assert_run_with::<i32>(&source, &opts_with_bit_string_case_labels(), &[("y", 1)]);
+    assert_run_with::<i32>(&source, &opts_with_radix_case_labels(), &[("y", 1)]);
 }
 
 /// A label on a signed 64-bit selector is narrowed to the selector's width as
@@ -249,4 +250,50 @@ END_PROGRAM
     );
 
     assert_run_with::<i32>(&source, &CompilerOptions::default(), &[("y", 1)]);
+}
+
+/// REQ-LOW-codegen-124: a selector with a side effect runs once, whichever
+/// way through the labels the `CASE` takes: the first label, a label before
+/// the last of its arm or the last, a range, a range failing at either
+/// bound, with or without an `ELSE`. `NEXT_VAL` counts its calls in
+/// `calls`, so `calls` ends one above where it started, and a selector left
+/// on the operand stack fails the test.
+#[rstest]
+#[case::first_label(4, "ELSE y := -1;", 5, 5)]
+#[case::label_before_last_of_arm(5, "ELSE y := -1;", 6, 6)]
+#[case::last_label_of_arm(6, "ELSE y := -1;", 7, 6)]
+#[case::range(8, "ELSE y := -1;", 9, 8)]
+#[case::below_range_runs_else(0, "ELSE y := -1;", 1, -1)]
+#[case::above_range_runs_else(20, "ELSE y := -1;", 21, -1)]
+#[case::no_match_without_else(20, "", 21, 0)]
+fn end_to_end_when_case_selector_has_side_effect_then_evaluated_once(
+    #[case] start: i64,
+    #[case] otherwise: &str,
+    #[case] calls: i64,
+    #[case] y: i64,
+) {
+    let snapshot = compile_and_run(&format!(
+        "
+FUNCTION NEXT_VAL : DINT
+  VAR_IN_OUT c : DINT; END_VAR
+  c := c + 1;
+  NEXT_VAL := c;
+END_FUNCTION
+PROGRAM main
+  VAR
+    calls : DINT := {start};
+    y : DINT;
+  END_VAR
+  CASE NEXT_VAL(c := calls) OF
+    5: y := 5;
+    6, 7: y := 6;
+    8..10: y := 8;
+  {otherwise}
+  END_CASE;
+END_PROGRAM
+"
+    ));
+
+    assert_eq!(snapshot.read_as::<i64>("calls"), calls);
+    assert_eq!(snapshot.read_as::<i64>("y"), y);
 }

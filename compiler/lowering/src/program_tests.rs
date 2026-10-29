@@ -2,10 +2,10 @@
 //! program it makes, and what it reports when a part does not lower yet.
 
 use ironplc_dsl::diagnostic::Diagnostic;
-use ironplc_ir::lowered::{Owner, PouId, Section};
+use ironplc_ir::lowered::{Declaration, Owner, PouId, Section, StandardFunctionBlock};
 
 use crate::test_support::lower_whole;
-use crate::{Declaration, PartialProgram, StatementLowering};
+use crate::PartialProgram;
 
 /// One task running the instance `inst` of the program `main`.
 const CONFIGURATION: &str = "
@@ -59,9 +59,9 @@ FUNCTION Twice : INT
 END_FUNCTION
 
 FUNCTION_BLOCK Counter
-  VAR_INPUT step : INT; END_VAR
+  VAR_INPUT delta : INT; END_VAR
   VAR count : INT; END_VAR
-  count := count + step;
+  count := count + delta;
   METHOD Bump : INT
     VAR_INPUT n : INT; END_VAR
     VAR_TEMP t : INT; END_VAR
@@ -87,7 +87,7 @@ END_PROGRAM
   t0 \"dint\" i32
   t1 \"int\" i16
   t2 \"Counter\" function-block pou0
-    f0 step : t1 input
+    f0 delta : t1 input
     f1 count : t1 local
   t3 ref non-null t2
   t4 ref non-null t2
@@ -282,9 +282,8 @@ END_PROGRAM
 }
 
 /// REQ-LOW-lowering-110, REQ-LOW-lowering-111: each statement that does not
-/// lower yet is a P9999 of its own, in every POU, and the rest of each body
-/// still lowers. The AST keeps no span for these statements, so each points
-/// at its POU.
+/// lower yet is a P9999 of its own, at the statement, in every POU, and the
+/// rest of each body still lowers.
 #[test]
 fn into_program_when_statements_in_two_pous_unsupported_then_p9999_at_each() {
     let source = "
@@ -302,22 +301,23 @@ END_PROGRAM
 ";
     let program = whole(source);
     let f = pou(&program, "F");
-    assert!(matches!(
-        program.statement(f, 0),
-        Some(StatementLowering::Unsupported)
-    ));
-    assert!(matches!(
-        program.statement(f, 1),
-        Some(StatementLowering::Lowered(_))
-    ));
+    assert!(matches!(program.statement(f, 0), Some(Err(_))));
+    assert!(matches!(program.statement(f, 1), Some(Ok(_))));
     assert!(program.statement(f, 2).is_none());
 
-    assert_eq!(unsupported_at(program, source), ["F", "main"]);
+    assert_eq!(
+        unsupported_at(program, source),
+        [
+            "FOR a := 1 TO 3 BY x DO r := r; END_FOR",
+            "FOR a := 1 TO 3 BY a DO r := r; END_FOR"
+        ]
+    );
 }
 
 /// REQ-LOW-lowering-112: a declaration lowering does not express yet leaves
 /// the declarations incomplete, which is reported once at its POU, not an
-/// error; a call of that POU does not lower either.
+/// error; a call of that POU does not lower either, and is reported at the
+/// statement, whose span is its assignment's `:=`.
 #[test]
 fn lower_program_when_declaration_not_lowered_then_declarations_incomplete() {
     let source = "
@@ -334,36 +334,46 @@ END_PROGRAM
     let program = whole(source);
     assert!(!program.declarations_complete());
     let main = pou(&program, "main");
-    assert!(matches!(
-        program.statement(main, 0),
-        Some(StatementLowering::Unsupported)
-    ));
-    assert!(matches!(
-        program.statement(main, 1),
-        Some(StatementLowering::Lowered(_))
-    ));
+    assert!(matches!(program.statement(main, 0), Some(Err(_))));
+    assert!(matches!(program.statement(main, 1), Some(Ok(_))));
     assert!(program.statement(pou(&program, "F"), 0).is_none());
 
-    assert_eq!(unsupported_at(program, source), ["F", "main"]);
+    assert_eq!(unsupported_at(program, source), ["F", ":="]);
 }
 
-/// A standard function block has no body in the library, so a program
-/// that declares one is not whole yet.
+/// REQ-LOW-ir-203: a standard function block has no body in the library,
+/// so its POU stands for the block, which the type of its name is, and the
+/// program is whole without a body for it.
 #[test]
-fn into_program_when_standard_function_block_then_p9999() {
+fn into_program_when_standard_function_block_then_pou_names_block() {
     let program = whole(
         "
+FUNCTION_BLOCK CTU_INT
+  VAR_INPUT CU : BOOL; END_VAR
+END_FUNCTION_BLOCK
 PROGRAM main
-  VAR timer : TON; END_VAR
+  VAR timer : TON; counter : CTU_INT; END_VAR
   timer(IN := TRUE, PT := T#1s);
+  counter(CU := TRUE);
 END_PROGRAM
 ",
     );
-    assert!(program.declarations_complete());
+    let ton = pou(&program, "TON");
+    let user = pou(&program, "CTU_INT");
+    assert_eq!(
+        program.standard_block(ton),
+        Some(StandardFunctionBlock::Ton)
+    );
+    assert_eq!(program.standard_block(user), None);
 
-    let diagnostics = program.into_program().unwrap_err();
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].code, "P9999");
+    let whole = program.into_program().unwrap();
+
+    assert_eq!(
+        whole.pous().standard_block(ton),
+        Some(StandardFunctionBlock::Ton)
+    );
+    assert!(whole.parts(ton).is_none());
+    assert!(whole.parts(user).is_some());
 }
 
 /// What each declaration of the body of the POU `name` declares, by kind
@@ -504,4 +514,29 @@ END_PROGRAM
             Declaration::Variable(var) | Declaration::External(var) => program.is_declared(*var),
             Declaration::Field(_) => true,
         }));
+}
+
+/// Each top-level statement keeps its own span, which a backend's line map
+/// reads; a `RETURN`, which the AST keeps no span for, has an empty one.
+#[test]
+fn statement_span_when_statements_then_each_its_own() {
+    let source = "
+FUNCTION F : DINT
+  F := 1;
+  RETURN;
+END_FUNCTION
+PROGRAM main
+  VAR a : DINT; END_VAR
+  a := F();
+END_PROGRAM
+";
+    let program = whole(source);
+    let f = pou(&program, "F");
+
+    let first = program.statement_span(f, 0).unwrap();
+    assert_eq!(&source[first.start..first.end], ":=");
+    assert_eq!(first.start, source.find(":= 1").unwrap());
+    let ret = program.statement_span(f, 1).unwrap();
+    assert_eq!(ret.start, ret.end);
+    assert!(program.statement_span(f, 2).is_none());
 }

@@ -19,9 +19,10 @@ use crate::function_environment::FunctionEnvironment;
 use crate::intermediates::arithmetic_overload::{
     resolve_arithmetic_fold, resolve_arithmetic_overload, Overload,
 };
-use crate::intermediates::common_operand::common_operand_of;
+use crate::intermediates::common_operand::{common_operand_of, CommonOperand};
 use crate::intermediates::numeric_operation::literal_default_type;
 use crate::intermediates::operator_function_form::{operator_function_form, FormOf};
+use crate::semantic_type::ParameterType;
 use crate::symbol_environment::{ScopeTracker, SymbolEnvironment};
 use crate::type_environment::{MethodSignature, TypeEnvironment};
 use crate::value_type::operand_type_name;
@@ -212,9 +213,11 @@ impl ExprTypeResolver<'_> {
                 // whose parameter declaration type matches the generic return type.
                 // This correctly skips selector parameters whose type differs from
                 // the return type (e.g., BOOL for SEL, ANY_INT for MUX).
+                let generic =
+                    ParameterType::Generic(GenericTypeName::try_from(&return_type.id).ok()?);
                 sig.inputs_of(&f.param_assignment)
                     .find_map(|(param, expr)| {
-                        if param.param_type == return_type {
+                        if param.param_type == generic {
                             expr.expr_type.clone()
                         } else {
                             None
@@ -290,12 +293,9 @@ impl ExprTypeResolver<'_> {
                     .parameters
                     .iter()
                     .find(|parameter| parameter.is_output && parameter.name == *output)?;
-                let declared = self.type_environment.id_of(&parameter.param_type)?;
-                // A `REF_TO` parameter records the type it references.
-                if parameter.is_reference {
-                    self.type_environment.reference_to(declared)
-                } else {
-                    Some(declared)
+                match parameter.param_type {
+                    ParameterType::Type(declared) => Some(declared),
+                    ParameterType::Generic(_) | ParameterType::Unresolved(_) => None,
                 }
             }
             CallFrame::Method {
@@ -394,7 +394,7 @@ impl ExprTypeResolver<'_> {
     /// The type `type_name` names: a literal of the category a generic name
     /// names, else the named type.
     fn expr_type_named(&self, type_name: TypeName) -> Option<ExprType> {
-        if let Ok(generic) = GenericTypeName::try_from(&type_name.name) {
+        if let Ok(generic) = GenericTypeName::try_from(&type_name.id) {
             return Some(ExprType::Literal(generic));
         }
         self.type_environment
@@ -444,7 +444,7 @@ impl ExprTypeResolver<'_> {
             Some(ExprType::Literal(generic)) => literal_default_type(generic)?.into(),
             _ => self.operand_name(input)?,
         };
-        let bit_string = match ElementaryTypeName::try_from(&name.name).ok()? {
+        let bit_string = match ElementaryTypeName::try_from(&name.id).ok()? {
             ElementaryTypeName::SINT | ElementaryTypeName::USINT => ElementaryTypeName::BYTE,
             ElementaryTypeName::INT | ElementaryTypeName::UINT => ElementaryTypeName::WORD,
             ElementaryTypeName::DINT | ElementaryTypeName::UDINT => ElementaryTypeName::DWORD,
@@ -457,13 +457,16 @@ impl ExprTypeResolver<'_> {
     /// The type of a call to a function of several inputs of one type, whose
     /// inputs are `inputs`: the type every input of that type widens to, or
     /// for `EXPT` its first input's (see [`BuiltinFunction::inputs_of_one_type`]).
-    /// `MAX(i, l)` on an `INT` and an `LINT` is an `LINT`.
+    /// `MAX(i, l)` on an `INT` and an `LINT` is an `LINT`, and `MIN(i, 1.5)`
+    /// on an `INT` is a `REAL`, the type the literal defaults to, as `i * 1.5`
+    /// is (see `intermediates::common_operand`).
     ///
     /// When no input's type accepts every other one -- a `DINT` and a `UDINT`
     /// -- the call has the type of its first concrete input, else of its
-    /// first, as a comparison of such a pair compares at its concrete left
-    /// operand's. Unlike the comparison, the call is not reported yet
-    /// (#2127).
+    /// first, so later passes see a type, as a comparison of such a pair
+    /// compares at its concrete left operand's;
+    /// `rule_function_inputs_common_type` reports the call, as the
+    /// comparison rule reports the comparison.
     fn inputs_of_one_type_result(
         &self,
         inputs: &[&Expr],
@@ -478,16 +481,19 @@ impl ExprTypeResolver<'_> {
                     .map(|input| self.operand_name(input))
                     .collect();
                 let names: Vec<Option<&TypeName>> = names.iter().map(Option::as_ref).collect();
-                common_operand_of(&names, &self.options)
-                    .or_else(|| {
-                        inputs.iter().position(|input| {
+                match common_operand_of(&names, &self.options) {
+                    Some(CommonOperand::Input(index)) => index,
+                    Some(CommonOperand::Type(name)) => return self.expr_type_named(name),
+                    None => inputs
+                        .iter()
+                        .position(|input| {
                             matches!(
                                 input.expr_type,
                                 Some(ExprType::Concrete(_) | ExprType::Inferred(_))
                             )
                         })
-                    })
-                    .unwrap_or(0)
+                        .unwrap_or(0),
+                }
             }
         };
         inputs.get(index)?.expr_type.clone()

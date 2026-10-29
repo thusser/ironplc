@@ -43,6 +43,11 @@ Example
 Multi-dimensional arrays use comma-separated ranges in the index
 specification.
 
+Each subscript is an integer. A ``BOOL`` subscript is error
+:doc:`P4086 </reference/compiler/problems/P4086>`, and a real literal
+subscript such as ``values[1.5]`` is error
+:doc:`P4094 </reference/compiler/problems/P4094>`.
+
 Arrays of Arrays
 ----------------
 
@@ -100,6 +105,23 @@ flag. The constant must be declared in a
    PROGRAM main
      VAR
        instance : fb1;
+     END_VAR
+   END_PROGRAM
+
+Radix Bounds (Language Extension)
+---------------------------------
+
+.. include:: ../../../../includes/requires-dialect-extension.rst
+
+With the ``--allow-radix-subrange-bounds`` flag, a bound can be written in
+hex, binary, or octal. Without the flag, such a bound is reported as
+:doc:`P4096 </reference/compiler/problems/P4096>`.
+
+.. code-block::
+
+   PROGRAM main
+     VAR
+       nibbles : ARRAY[16#0..16#F] OF BYTE;
      END_VAR
    END_PROGRAM
 

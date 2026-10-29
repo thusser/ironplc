@@ -8,7 +8,7 @@ use ironplc_container::opcode;
 use ironplc_container::{
     CharWidth, FbTypeId, FunctionId, SourceColumn, SourceFileId, SourceLine, VarIndex,
 };
-use ironplc_dsl::diagnostic::Diagnostic;
+use ironplc_ir::Diagnostic;
 
 use crate::optimize::OffsetMap;
 
@@ -219,9 +219,9 @@ impl Emitter {
         }
     }
 
-    // Source-map recording. `compile_stmt` sets a position per statement,
-    // `compile.rs` carries the entries through the optimizer's offset
-    // remapping into the container's LINE_MAP (tag 1), and
+    // Source-map recording. `compile_stmt::record_position` sets a position
+    // per statement, `compile.rs` carries the entries through the
+    // optimizer's offset remapping into the container's LINE_MAP (tag 1), and
     // `codegen/tests/it/end_to_end_debug_line_map.rs` asserts the result
     // against real source. See `specs/design/debugger-support.md`
     // §"Source Position Tracking".

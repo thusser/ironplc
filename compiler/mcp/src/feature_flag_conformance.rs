@@ -138,10 +138,13 @@ const FLAG_FIXTURES: &[FlagFixture] = &[
         source: "PROGRAM main\nVAR\nx : INT;\np : POINTER TO INT;\nEND_VAR\np := ADR(x);\nEND_PROGRAM",
     },
     // Arithmetic on a REF_TO type (P2033). Needs REF_TO to parse at all.
+    // Lowering does not lower it yet, so it is in a block no program
+    // instantiates: `check` lowers only what a program reaches, and reports
+    // here only what analysis decides.
     FlagFixture {
         key: "allow_ref_arithmetic",
         prereqs: &["allow_ref_to"],
-        source: "PROGRAM Main\nVAR\nx : INT;\nr : REF_TO INT := REF(x);\ny : INT;\nEND_VAR\ny := r + 1;\nEND_PROGRAM",
+        source: "FUNCTION_BLOCK Unused\nVAR\nx : INT;\nr : REF_TO INT := REF(x);\ny : INT;\nEND_VAR\ny := r + 1;\nEND_FUNCTION_BLOCK\nPROGRAM Main\nEND_PROGRAM",
     },
     // REF() on a stack-allocated (function VAR_INPUT) variable (P2029).
     FlagFixture {
@@ -242,7 +245,7 @@ const FLAG_FIXTURES: &[FlagFixture] = &[
     // accepts it unconditionally; the flag gates a semantic rule (P4041 when
     // off).
     FlagFixture {
-        key: "allow_bit_string_case_labels",
+        key: "allow_radix_case_labels",
         prereqs: &[],
         source: "PROGRAM main\nVAR\nx : DINT;\ny : DINT;\nEND_VAR\nCASE x OF\n16#D012: y := 1;\nEND_CASE;\nEND_PROGRAM",
     },
@@ -257,11 +260,12 @@ const FLAG_FIXTURES: &[FlagFixture] = &[
     // A general expression (pointer deref + member access) as a struct/FB
     // initializer value. The parser accepts it unconditionally; a semantic
     // rule rejects it (P4043) when the flag is off. Requires allow_ref_to for
-    // the REF_TO deref in the value expression.
+    // the REF_TO deref in the value expression. Lowering does not lower such
+    // an initializer yet, so it is in a block no program instantiates.
     FlagFixture {
         key: "allow_struct_initializer_expressions",
         prereqs: &["allow_ref_to"],
-        source: "FUNCTION_BLOCK FB_Device\nVAR_INPUT\nDelta : INT;\nEND_VAR\nEND_FUNCTION_BLOCK\nTYPE MyStruct :\nSTRUCT\nx : INT;\nEND_STRUCT;\nEND_TYPE\nPROGRAM main\nVAR\npDevice : REF_TO FB_Device;\ns : MyStruct := (x := pDevice^.Delta);\nEND_VAR\nEND_PROGRAM",
+        source: "FUNCTION_BLOCK FB_Device\nVAR_INPUT\nDelta : INT;\nEND_VAR\nEND_FUNCTION_BLOCK\nTYPE MyStruct :\nSTRUCT\nx : INT;\nEND_STRUCT;\nEND_TYPE\nFUNCTION_BLOCK Unused\nVAR\npDevice : REF_TO FB_Device;\ns : MyStruct := (x := pDevice^.Delta);\nEND_VAR\nEND_FUNCTION_BLOCK\nPROGRAM main\nEND_PROGRAM",
     },
     // The IEC 61131-3:2013 EXTENDS clause on a FUNCTION_BLOCK header. With the
     // flag off, EXTENDS demotes to a plain identifier, so two consecutive
@@ -290,6 +294,14 @@ const FLAG_FIXTURES: &[FlagFixture] = &[
         prereqs: &[],
         source: "TYPE\nE_Small : (A, B) WORD;\nEND_TYPE\nPROGRAM main\nEND_PROGRAM",
     },
+    // A keyword (ON, STEP, R_EDGE, F_EDGE) as a name. The parser accepts it
+    // unconditionally; a semantic rule rejects it (P4095) when the flag is
+    // off.
+    FlagFixture {
+        key: "allow_keywords_as_names",
+        prereqs: &[],
+        source: "TYPE\nM : (Off, On);\nEND_TYPE\nPROGRAM main\nEND_PROGRAM",
+    },
     // The Beckhoff TwinCAT/CODESYS PERSISTENT variable qualifier. With the
     // flag off, PERSISTENT demotes to a plain identifier, so it collides with
     // the following declaration name and fails to parse. With the flag on,
@@ -305,6 +317,14 @@ const FLAG_FIXTURES: &[FlagFixture] = &[
         key: "allow_continue",
         prereqs: &[],
         source: "PROGRAM main\nVAR i : INT; END_VAR\nFOR i := 1 TO 3 DO\nCONTINUE;\nEND_FOR;\nEND_PROGRAM",
+    },
+    // A hex bound on an array dimension. The grammar accepts it
+    // unconditionally; a token-stream rule rejects it (P4096) when the flag
+    // is off. A decimal bound is always accepted.
+    FlagFixture {
+        key: "allow_radix_subrange_bounds",
+        prereqs: &[],
+        source: "PROGRAM main\nVAR\na : ARRAY[16#0..16#F] OF INT;\nEND_VAR\nEND_PROGRAM",
     },
 ];
 

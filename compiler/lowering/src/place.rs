@@ -1,52 +1,33 @@
 //! Places named in the source: a variable, a field of a structure, an
 //! element of an array, and what a reference refers to.
 
-use ironplc_dsl::core::{Id, Located};
-use ironplc_dsl::diagnostic::Diagnostic;
+use ironplc_dsl::core::{Id, Located, SourceSpan};
 use ironplc_dsl::textual::{Expr as AstExpr, SymbolicVariableKind};
-use ironplc_ir::lowered::{Expr, Place};
+use ironplc_ir::lowered::{Expr, Field, FieldIdx, Place};
 
 use crate::variables::BodyFrame;
-use crate::Lowering;
-
-/// A lowered node, `None` when lowering does not support it, or something
-/// inside it, yet.
-type Made<T> = Result<Option<T>, Diagnostic>;
+use crate::{Lowered, Lowering, Unlowered};
 
 impl Lowering<'_> {
-    /// The place `symbolic` names in the body of `frame`.
+    /// The place `symbolic` names in the body of `frame`. The bits a bit or
+    /// partial access selects are read from and written to a place rather
+    /// than being one (`bits.rs`), and `THIS^` and `SUPER^` are not lowered
+    /// yet.
     pub(crate) fn symbolic_place(
         &mut self,
         frame: &BodyFrame,
         symbolic: &SymbolicVariableKind,
-    ) -> Made<Place> {
+    ) -> Lowered<Place> {
         match symbolic {
             SymbolicVariableKind::Named(named) => {
                 self.named_place(frame, &named.name, &named.name.span())
             }
             SymbolicVariableKind::Structured(structured) => {
-                let Some(record) = self.symbolic_place(frame, &structured.record)? else {
-                    return Ok(None);
-                };
-                let Some(position) = self.program.types().fields(record.ty()).and_then(|fields| {
-                    fields
-                        .iter()
-                        .position(|field| Id::from(&field.name.to_string()) == structured.field)
-                }) else {
-                    return Ok(None);
-                };
-                let Some(field) = self.program.field_idx(record.ty(), position) else {
-                    return Ok(None);
-                };
-                self.program
-                    .field(record, field, &structured.field.span())
-                    .map(Some)
+                let record = self.symbolic_place(frame, &structured.record)?;
+                self.field_of(record, &structured.field, &structured.field.span())
             }
             SymbolicVariableKind::Array(array) => {
-                let Some(mut base) = self.symbolic_place(frame, &array.subscripted_variable)?
-                else {
-                    return Ok(None);
-                };
+                let mut base = self.symbolic_place(frame, &array.subscripted_variable)?;
                 // A subscript of a reference to an array indexes the array it
                 // refers to, as `r^[i]` does: a TwinCAT `REFERENCE TO`, and a
                 // `REF_TO` the analyzer lets a subscript follow without `^`.
@@ -55,25 +36,37 @@ impl Lowering<'_> {
                 }
                 let mut subscripts = Vec::with_capacity(array.subscripts.len());
                 for subscript in &array.subscripts {
-                    let Some(subscript) = self.subscript(frame, subscript)? else {
-                        return Ok(None);
-                    };
-                    subscripts.push(subscript);
+                    subscripts.push(self.subscript(frame, subscript)?);
                 }
-                self.program
-                    .index(base, subscripts, &array.span())
-                    .map(Some)
+                Ok(self.program.index(base, subscripts, &array.span())?)
             }
             SymbolicVariableKind::Deref(deref) => {
-                let Some(reference) = self.symbolic_place(frame, &deref.variable)? else {
-                    return Ok(None);
-                };
-                self.program.deref(reference, &deref.span()).map(Some)
+                let reference = self.symbolic_place(frame, &deref.variable)?;
+                Ok(self.program.deref(reference, &deref.span())?)
             }
             SymbolicVariableKind::BitAccess(_)
             | SymbolicVariableKind::PartialAccess(_)
-            | SymbolicVariableKind::SelfRef(_) => Ok(None),
+            | SymbolicVariableKind::SelfRef(_) => Err(Unlowered::NotYet),
         }
+    }
+
+    /// The field `name` of the record at `record`, named at `span`. A record
+    /// whose type has no field of that name is not lowered.
+    pub(crate) fn field_of(&self, record: Place, name: &Id, span: &SourceSpan) -> Lowered<Place> {
+        let (field, _) = self.field_named(&record, name).ok_or(Unlowered::NotYet)?;
+        Ok(self.program.field(record, field, span)?)
+    }
+
+    /// The field `name` of the record at `record`, matched without regard to
+    /// case as IEC identifiers are, with its index; `None` when the type of
+    /// `record` is no record, or has no field of that name.
+    pub(crate) fn field_named(&self, record: &Place, name: &Id) -> Option<(FieldIdx, &Field)> {
+        let fields = self.program.types().fields(record.ty())?;
+        let position = fields
+            .iter()
+            .position(|field| Id::from(&field.name.to_string()) == *name)?;
+        let field = self.program.field_idx(record.ty(), position)?;
+        Some((field, &fields[position]))
     }
 
     /// A subscript, a `DINT` (REQ-LOW-lowering-161). The analyzer converts a
@@ -82,7 +75,7 @@ impl Lowering<'_> {
     /// rejects a `BOOL` one (P4086). A subscript of another type the analyzer
     /// did not convert is a defect, which building the `Index` reports
     /// (REQ-LOW-lowering-094).
-    fn subscript(&mut self, frame: &BodyFrame, subscript: &AstExpr) -> Made<Expr> {
+    fn subscript(&mut self, frame: &BodyFrame, subscript: &AstExpr) -> Lowered<Expr> {
         self.expr(frame, subscript)
     }
 }
