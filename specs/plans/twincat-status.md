@@ -77,11 +77,31 @@ error per file is seen, so fixing one may expose the next.
   argument is dropped), #2586 (#2580, `;` after the block header), #2587
   (#2576, `RETURN(cond)`). Not started: #2578 (`FB_X(THIS)`, needs `THIS` typed
   as `POINTER TO` the block) and #2579 (`SUPER^()`, needs a node for calling the
-  base body); both overlap #2369 and #1870. `VAR_INST` was already #1425. Only
-  #2576 is checked against XAE (4024.66): `RETURN(cond)` is a conditional
-  return, not a value return, and the argument must be BOOL (the issue was
-  retitled). It parses as `IF cond THEN RETURN; END_IF` and is not gated to the
-  TwinCAT dialect. The other eight are not checked against XAE.
+  base body); both overlap #2369 and #1870. `VAR_INST` was already #1425.
+  All nine are checked against XAE (4024.66, compile and runtime):
+  - #2576: `RETURN(cond)` is a conditional return, not a value return, and the
+    argument must be BOOL (the issue was retitled). It parses as
+    `IF cond THEN RETURN; END_IF` and is not gated to the TwinCAT dialect.
+  - #2572, #2573, #2574, #2577, #2580: accepted by XAE with the meaning the PRs
+    assume. An omitted input keeps its previous value (not the declared
+    default), `()` takes the declared defaults, `PERSISTENT` on an output
+    survives a restart and a PLC reset like `VAR PERSISTENT`. XAE rejects
+    `action`, `program` and `function` as FOR counters, `PERSISTENT` on
+    `VAR_INST` and on a function's `VAR_INPUT`, and `()` on a whole array or a
+    scalar; #2581 and #2582 are wider on the first two (not yet checked).
+  - #2575: XAE rejects an array at a bit address in a function block
+    (`AT %QX0.0 : ARRAY ...`, "not possible on Bit-Adress"); `%Q*`, `%I*` and
+    `%QB0` arrays are accepted. #2584 parses all of them. The bit-address case
+    stays a known gap: rejecting it only for TwinCAT needs a new option (the
+    options have no dialect field), and CODESYS 3.x behaviour is unverified.
+    The issue's table was wrong on it.
+  - #2578: the parentheses in `s : FB_S(THIS)` are `FB_init` parameters, not
+    `VAR_INPUT` values. It compiles only when `FB_S` has an `FB_init` with a
+    `POINTER TO` parameter; `THIS` has type `POINTER TO` the enclosing block.
+    The issue's repro used a `VAR_INPUT` and needs correcting.
+  - #2579: `SUPER^();` calls the base body (once per call, also from a method,
+    twice if written twice, not implied when omitted). XAE rejects it in a
+    block with no base and in a PROGRAM.
 - **#2331.** The P9998 no longer reproduces (all four shapes are P9999). What is
   left is copying a function block's whole structure or array output, which
   needs a data region for the output field on the lowered route.
