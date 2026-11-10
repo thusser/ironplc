@@ -102,6 +102,28 @@ error per file is seen, so fixing one may expose the next.
   - #2579: `SUPER^();` calls the base body (once per call, also from a method,
     twice if written twice, not implied when omitted). XAE rejects it in a
     block with no base and in a PROGRAM.
+- **P2008 classification (28 files, `main` @ `e206fc883`).** All unknown type
+  names, no compiler bug: 11 are declared in a file of the same solution that
+  does not parse (cascade), 11 are BROTLib types used from IAG50cm, HalfBROT
+  and MONETcommon (`PlaceholderReference` to a sibling project, which nothing
+  resolves; P6011 is not scored), 10 are vendor library types (Tc2_MC2,
+  Tc2_SerialCom, Tc3_IotBase, plus `TIMESTRUCT`, `TC_Restart`,
+  `FB_GetHostName` and `FB_FormatString`, which the bundled Tc2_System and
+  Tc2_Utilities lack). The groups overlap. Bundling vendor types is Tier B
+  clean-room work (spec commit first, public docs only, no exported `.library`
+  files), and the sibling-project reference needs Garret's view.
+- **Qualified names, PR #2588** (part 1 of #1430). `TcUnit.FB_X`, `Lib.E_Blink`
+  and `Type.value` parse; the prefix is kept for `plc2plc` and ignored for
+  lookup. Files with a syntax error went 91 to 44, but passes stay 95/232:
+  the freed files now fail on P2008 (28 to 54) because the TcUnit base block
+  and the BROTLib project are unresolved. XAE (4024.66) rejects `Type#value`
+  for enumerations, so `plc2plc` keeps the spelling it was given; it accepts
+  `on` as a member name; it checks a library prefix against the real library
+  (`Nonsense.TON` rejected), which IronPLC does not; the project's own name is
+  not a valid prefix. Next steps: resolve prefixes against referenced
+  libraries, a TcUnit interface shim from public docs (the corpus only has
+  `tcunit.library`, a forbidden input), and #2589 (`a : INT := GVL.cLimit`
+  gives P4038, XAE accepts it).
 - **#2331.** The P9998 no longer reproduces (all four shapes are P9999). What is
   left is copying a function block's whole structure or array output, which
   needs a data region for the output field on the lowered route.
