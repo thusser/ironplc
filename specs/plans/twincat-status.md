@@ -6,6 +6,75 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-11-10: corpus re-checked on a changed corpus; review replies; global string and structure initializers
+
+**Corpus.** `~/code/brotlib` changed a lot since the last run (the repos were
+last updated 2026-10-17 to 2026-11-04), so earlier numbers are not comparable.
+It is now 232 files (`.TcPOU`, `.TcGVL`, `.TcDUT`, `.TcIO`) in 12 projects.
+Method: `ironplcc check --dialect twincat` once per project directory; a file
+fails if any diagnostic has its primary location in it (P6011 and P6007 are not
+scored). Two builds, same files:
+
+| Build | Pass | P0002 | P2008 | P9999 |
+|---|---|---|---|---|
+| `main` @ `be6c29bf1` (2026-10-17) | 77/232 | 93 | 26 | 18 |
+| `main` @ `e206fc883` (0.253.0) | 95/232 | 91 | 28 | 0 |
+
+The 18 new passes are BROTLib (29 to 43 of 64) and IAG50cm (11 to 15 of 50).
+Every file that had P9999 on the old build is gone from that list. I did not
+check which PRs did it. The syntax errors barely moved (93 to 91), so parser
+work is not what gained the files. The four `*Tests` projects are 0 of 49.
+
+**The 91 syntax errors** (first P0002 per file, classified by a regular
+expression on the offending line, so approximate):
+
+| Cause | Files |
+|---|---|
+| `EXTENDS TcUnit.FB_...` (qualified base, #1430) | 40 |
+| Method call on a pointer, array element or field (#1422, plan #2369) | 17 |
+| Qualified name elsewhere (type `BROTLib.E_Blink`, `MC_HomingMode.MC_DefaultHoming`, CASE label `e_blink.slow`) | 12 |
+| `IMPLEMENTS` with a qualified name | 3 |
+| `FB_X(THIS)` as an initializer | 3 |
+| `SUPER^()` | 2 |
+| `AT %Q*` wildcard address | 2 |
+| Empty argument (`JogForward :=,`) | 2 |
+| `RETURN(value)` | 1 |
+| Other | 9 |
+
+Qualified names are 55 of the 91. The 9 others include `FOR step := 0 TO 1 DO`
+(`step` is a keyword; the clash guess from 2026-10-17 is confirmed),
+`fbRTC(EN := b, ...)` (#2549), `VAR_OUTPUT PERSISTENT`,
+`fbClient : FB_IotHttpClient :=();` and `roofs[i].Reset();`. Two of them
+(a `VAR_INPUT` and a `n : INT;` line) I have not read in context. Only the first
+error per file is seen, so fixing one may expose the next.
+
+**Reviews.** garretfick reviewed #2369 on 2026-10-26 (six inline comments) and
+#1870 on 2026-10-01. Answered 2026-11-10:
+
+- **#2369.** The plan keeps `MethodReceiver`, as a head plus steps (field,
+  subscript, deref), instead of replacing it with `SymbolicVariableKind`, which
+  allows `BitAccess` and `PartialAccess`. The AST route item and the gating
+  question are gone (no new allow flag). A call through `POINTER TO FB_Base`
+  (or an interface) is rejected, with a new problem code, when a derived block
+  overrides the method; otherwise the static call is exact. Chaining
+  (`a.At(1).Start()`) is out of scope and becomes an issue. Open question 4
+  records the risk that the class hierarchy is not fully known at analysis time.
+- **#1870.** The three open points are restated with proposals. Garret's tier-1
+  comment (an interface that is never used) is not covered by the design doc.
+
+**PRs and issues.**
+
+- **#2568** moves the `stages.rs` tests to `stages/tests.rs` (closes #2408).
+- **#2570** parses string and structure initial values in a `VAR_GLOBAL`
+  (closes #2506, part of #1937). **#2571**, stacked on it, parses a sized
+  `STRING` or `WSTRING` in a `VAR_EXTERNAL` (closes #2569). Together they
+  complete #1937.
+- **#2331.** The P9998 no longer reproduces (all four shapes are P9999). What is
+  left is copying a function block's whole structure or array output, which
+  needs a data region for the output field on the lowered route.
+- **#2545 and #2546.** s-celles proposed a tri-state `TIMER_RUNNING` fix for TOF
+  and TP. Replied that an interim PR in `vm/src/intrinsic.rs` is welcome.
+
 ## 2026-10-29: synced to upstream `main` @ `8a75b19e7`
 
 `twincat-dev` merged `upstream/main` (`ironplc/ironplc`, 64 commits) with no
