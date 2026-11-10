@@ -69,6 +69,17 @@ error per file is seen, so fixing one may expose the next.
   (closes #2506, part of #1937). **#2571**, stacked on it, parses a sized
   `STRING` or `WSTRING` in a `VAR_EXTERNAL` (closes #2569). Together they
   complete #1937.
+- **Parser gaps from the 91 syntax errors.** Issues #2572 to #2580, one per
+  shape, each with a minimal repro. Fixed by PRs (all `just` passing):
+  #2581 (#2572, FOR counter `step`), #2582 (#2573, `PERSISTENT` on
+  `VAR_INPUT`/`VAR_OUTPUT`), #2583 (#2574, `:= ()`), #2584 (#2575, located
+  `ARRAY` in a mixed `VAR` block), #2585 (#2577, omitted call arguments, the
+  argument is dropped), #2586 (#2580, `;` after the block header). Not started:
+  #2576 (`RETURN(value)`, needs an XAE check of what it means), #2578
+  (`FB_X(THIS)`, needs `THIS` typed as `POINTER TO` the block) and #2579
+  (`SUPER^()`, needs a node for calling the base body); the last two overlap
+  #2369 and #1870. `VAR_INST` was already #1425. None of the nine is checked
+  against XAE.
 - **#2331.** The P9998 no longer reproduces (all four shapes are P9999). What is
   left is copying a function block's whole structure or array output, which
   needs a data region for the output field on the lowered route.
