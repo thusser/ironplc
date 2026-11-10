@@ -120,10 +120,11 @@ error per file is seen, so fixing one may expose the next.
   for enumerations, so `plc2plc` keeps the spelling it was given; it accepts
   `on` as a member name; it checks a library prefix against the real library
   (`Nonsense.TON` rejected), which IronPLC does not; the project's own name is
-  not a valid prefix. Next steps: resolve prefixes against referenced
-  libraries, a TcUnit interface shim from public docs (the corpus only has
-  `tcunit.library`, a forbidden input), and #2589 (`a : INT := GVL.cLimit`
-  gives P4038, XAE accepts it).
+  not a valid prefix. Next steps, filed: #2590 (resolve prefixes and
+  sibling-project references, needs Garret on how a reference finds its
+  source), #2591 (TcUnit interface shim from public docs; the corpus only has
+  `tcunit.library`, a forbidden input; depends on #2590) and #2589
+  (`a : INT := GVL.cLimit` gives P4038, XAE accepts it).
 - **#2331.** The P9998 no longer reproduces (all four shapes are P9999). What is
   left is copying a function block's whole structure or array output, which
   needs a data region for the output field on the lowered route.
