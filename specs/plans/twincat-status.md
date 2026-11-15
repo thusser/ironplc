@@ -67,8 +67,24 @@ than P6011 and P6007 has its primary location in it. This covers 420 files, not
 - The six `*Tests` projects pass 6 of 166 files.
 - The merged build used a hand merge of the additive conflicts in
   `problem-codes.csv`, `options.rs`, the CLI args and the docs, only for scoring.
-- **Next biggest gain:** resolving types across sibling projects (#2590), ahead of
-  the library spec PR.
+- **Correction (same day):** sibling-project resolution is not the big gain I
+  claimed here. Naming a sibling as another path already loads its sources, and
+  scoring each project with its referenced siblings (transitively) gives 153/420
+  against 156/420 alone. IAG50cm holds its own copies of POUs that BROTLib also
+  defines (`F_HourAngleOffsetOnAxis`, `NCError_TO_STRING`,
+  `FB_PointingModelForward`), so loading both gives P4013/P4014/P4016 duplicates
+  (IAG50cm 20 to 18, MONETcommon 17 to 14, BROTLibTests 1 to 3). Whether XAE also
+  rejects those copies is unchecked. Calls through `I_Comm` then stop on P9999
+  (dynamic dispatch, #1870), and the remaining P2008 are other unbundled libraries
+  (Tc2_MC2, Tc3_IotBase, the Tc2_System gaps), so the library spec PR and #1870
+  come before more resolution work.
+- **Branch `sibling-project-references`** (pushed to `fork`, no PR yet, one commit
+  `0f8b79532`): item 1 of #2590 only. A `PlaceholderReference` whose name equals
+  the `<Name>` (else file stem) of a project loaded alongside is satisfied, so it
+  no longer gives a false P6011; a sibling shadows a bundled library of the same
+  name. References are resolved once all CLI paths are known. New
+  `REQ-CL-sources-009`. Item 2 (a prefix must name a referenced library, as XAE
+  does) is not started and could turn passing files into failures.
 
 
 ## 2026-11-10: corpus re-checked on a changed corpus; review replies; global string and structure initializers
