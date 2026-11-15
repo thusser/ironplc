@@ -22,12 +22,25 @@ passes. Not yet re-scored on the corpus.
     P4098 without it. Untested in XAE: inside CASE, actions, properties.
   - #2600 (open) replaces #2586: the `;` after a POU header behind
     `--allow-pou-header-semicolon`, for PROGRAM, FUNCTION and METHOD too.
-- **Decision to expect on our remaining parser PRs:** Garret gates extensions
-  behind an `--allow-*` flag that the dialects turn on. #2584 (located array),
-  #2585 (omitted argument) and #2588 (qualified names) are not gated yet.
-- **Rebased onto the new `main`:** #2584, #2585 (one conflict in
+- **Pattern:** Garret gates extensions behind an `--allow-*` flag that the
+  codesys and twincat dialects turn on. Closed #2582 and #2587 as superseded.
+  #2586 stays open until #2600 merges.
+- **Rebased onto the new `main` and force-pushed:** #2584, #2585 (one conflict in
   `subprogram_control_statement`, kept main's RETURN rule), #2588. Tests pass on
-  each. Not force-pushed yet.
+  each.
+- **Gated with one flag per extension** (pushed, descriptions updated):
+  - #2585: `--allow-omitted-call-argument` (P4101) and
+    `--allow-trailing-call-comma` (P4102), token rules. P4100 is left for #2600.
+  - #2588: `--allow-qualified-type-names` (P4103) and
+    `--allow-dotted-enum-value` (P4104), analyzer rules, since the AST keeps the
+    prefix and `dotted`. A dotted name that resolves to a constant or member is
+    not flagged.
+  - #2584: no flag. The standard's `located_var_spec_init` (Ed. 2, B.1.4.3)
+    includes `array_spec_init`, so the mixed-block rule was only missing a
+    standard alternative. From memory of the grammar, not checked against the
+    text.
+  - Not done: Sphinx build, corpus re-score. The P-codes will conflict in
+    `problem-codes.csv` once these merge.
 - **Opened by Garret:** #2567 (initial value on a variable of a named array
   type).
 - Removed the `ironplc-fix-2576` worktree (14 GB). `/home` was at 99%.
