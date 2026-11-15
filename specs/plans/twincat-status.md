@@ -45,6 +45,31 @@ passes. Not yet re-scored on the corpus.
   type).
 - Removed the `ironplc-fix-2576` worktree (14 GB). `/home` was at 99%.
 
+**Corpus re-score, new method, not comparable to 95/232.** The scoring script
+from 2026-11-10 was lost, so I rewrote it: `ironplcc check --dialect twincat`
+once per `.plcproj` directory (14 of them), a file fails if a diagnostic other
+than P6011 and P6007 has its primary location in it. This covers 420 files, not
+232. I could not tell why the totals differ. The repos' last commits are
+2026-11-09 and 2026-11-10. Same corpus, three builds:
+
+| Build | Pass | P0002 | P2008 | P4088 |
+|---|---|---|---|---|
+| `main` @ `e206fc883` (0.253.0) | 156/420 | 198 | 36 | 3 |
+| `main` @ `08bfbe790` (includes #2581, #2583, #2599, #2601) | 156/420 | 196 | 38 | not recorded |
+| `main` plus #2570, #2571, #2584, #2585, #2586, #2588 (temporary merge) | 160/420 | 73 | 102 | 40 |
+
+("P0002" etc. count files by their first problem.)
+
+- Parser work freed about 125 files from syntax errors, but only 4 pass, because
+  they now stop on unresolved names: P2008 (36 to 102) and P4088, EXTENDS of a
+  base that lives in a sibling project (`EXTENDS BROTLib.FB_BaseAxis`), 3 to 40.
+  P4070 (IMPLEMENTS) adds 9. These are #2590 and #2591.
+- The six `*Tests` projects pass 6 of 166 files.
+- The merged build used a hand merge of the additive conflicts in
+  `problem-codes.csv`, `options.rs`, the CLI args and the docs, only for scoring.
+- **Next biggest gain:** resolving types across sibling projects (#2590), ahead of
+  the library spec PR.
+
 
 ## 2026-11-10: corpus re-checked on a changed corpus; review replies; global string and structure initializers
 
