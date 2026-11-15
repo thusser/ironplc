@@ -6,6 +6,29 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-11-15 (later): synced to `main` @ `048528065`; corpus unchanged at 156/420
+
+Merged `origin/main` into `twincat-dev` (`7ce1d627a`, no conflicts); build and
+`cargo test --workspace` pass on the new pinned toolchain (`rust-toolchain.toml`,
+Rust 1.100.0).
+
+- **Merged since the section below:** ours #2570, #2584, #2603; Garret's #2567
+  (named-array initial values), #2600 (POU header semicolon, behind
+  `--allow-pou-header-semicolon`, P4100) and #2608 (sized STRING in VAR_EXTERNAL,
+  supersedes our #2571). #2571 and #2586 are closed.
+- **Corpus:** 156/420, identical to `main` @ `08bfbe790` in every project and in
+  the first-problem-code counts (P0002 196, P2008 38). None of the newly merged
+  work changes a result on this corpus. The 160/420 build needed #2585 and
+  #2588, which are still open, so those two are the next movement.
+- **Open ours:** #2585 (Garret asked on 11-15 whether XAE 4024.66 compiles empty
+  values in declaration initializers, `t1 : TON := (PT := , IN := FALSE);` and
+  `t2 : TON := (PT := T#1S, );`; if XAE rejects them, `fb_call_style_init_params`
+  goes back to `param_assignment() ** ","`), #2588 (no review), #2568 (blocked, no
+  review), #1870 and #2369 (waiting on Garret).
+- **Local branches that can go:** `fix-located-array`, `global-var-initializers`,
+  `external-string-spec`, `fix-semicolon-after-fb-header`,
+  `sibling-project-references`, `fix-conditional-return`.
+
 ## 2026-11-15: synced to `main` @ `08bfbe790`; Garret merged and gated three parser PRs
 
 Merged `origin/main` into `twincat-dev` (no conflicts); `cargo test --workspace`
