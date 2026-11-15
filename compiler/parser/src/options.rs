@@ -384,7 +384,7 @@ define_compiler_options! {
     [Codesys, TwinCat],
     allow_adr,
 
-    "Allow the PERSISTENT variable qualifier (Beckhoff TwinCAT/CODESYS extension)",
+    "Allow the PERSISTENT variable qualifier, alone or combined with RETAIN",
     "--allow-persistent-var",
     [Codesys, TwinCat],
     allow_persistent_var,
@@ -508,6 +508,11 @@ define_compiler_options! {
     "--allow-radix-subrange-bounds",
     [Rusty, Codesys, TwinCat],
     allow_radix_subrange_bounds,
+
+    "Allow RETURN(condition), a RETURN that happens only when the BOOL condition is TRUE",
+    "--allow-conditional-return",
+    [Codesys, TwinCat],
+    allow_conditional_return,
 
     policies {
         "What STRING_TO_<numeric> treats as convertible when the string has non-numeric characters",

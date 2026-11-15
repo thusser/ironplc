@@ -2,8 +2,6 @@
 //!
 //! See section 2.
 use core::str::FromStr;
-use lazy_static::lazy_static;
-use regex::Regex;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 
@@ -19,6 +17,7 @@ use crate::time::*;
 use crate::type_id::TypeId;
 use crate::visitor::Visitor;
 
+pub use crate::direct_address::{AddressAssignment, LocationPrefix, SizePrefix};
 pub use crate::oop::*;
 
 /// Container for elementary constants.
@@ -116,19 +115,15 @@ impl Located for ConstantKind {
 impl fmt::Display for ConstantKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConstantKind::IntegerLiteral(lit) => write!(f, "{}", lit.value),
-            ConstantKind::RealLiteral(lit) => write!(f, "{}", lit.value),
-            ConstantKind::Boolean(lit) => write!(f, "{}", lit.value),
-            ConstantKind::CharacterString(lit) => {
-                let delimiter = lit.width.delimiter();
-                let text = crate::string_escape::encode(&lit.value, &lit.width);
-                write!(f, "{delimiter}{text}{delimiter}")
-            }
-            ConstantKind::Duration(lit) => write!(f, "{:?}", lit),
-            ConstantKind::TimeOfDay(lit) => write!(f, "{:?}", lit),
-            ConstantKind::Date(lit) => write!(f, "{:?}", lit),
-            ConstantKind::DateAndTime(lit) => write!(f, "{:?}", lit),
-            ConstantKind::BitStringLiteral(lit) => write!(f, "{:?}", lit),
+            ConstantKind::IntegerLiteral(lit) => write!(f, "{lit}"),
+            ConstantKind::RealLiteral(lit) => write!(f, "{lit}"),
+            ConstantKind::Boolean(lit) => write!(f, "{lit}"),
+            ConstantKind::CharacterString(lit) => write!(f, "{lit}"),
+            ConstantKind::Duration(lit) => write!(f, "{lit}"),
+            ConstantKind::TimeOfDay(lit) => write!(f, "{lit}"),
+            ConstantKind::Date(lit) => write!(f, "{lit}"),
+            ConstantKind::DateAndTime(lit) => write!(f, "{lit}"),
+            ConstantKind::BitStringLiteral(lit) => write!(f, "{lit}"),
         }
     }
 }
@@ -593,9 +588,16 @@ impl RealLiteral {
 
 impl fmt::Display for RealLiteral {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.data_type {
-            Some(dt) => write!(f, "{}#{}", dt, self.value),
-            None => write!(f, "{}", self.value),
+        if let Some(dt) = &self.data_type {
+            write!(f, "{dt}#")?;
+        }
+        // A real literal always carries a decimal point; `f64::to_string`
+        // drops it for whole values.
+        let value = self.value.to_string();
+        if self.value.is_finite() && !value.contains(['.', 'e', 'E']) {
+            write!(f, "{value}.0")
+        } else {
+            write!(f, "{value}")
         }
     }
 }
@@ -658,10 +660,12 @@ impl CharacterStringLiteral {
 }
 
 impl fmt::Display for CharacterStringLiteral {
+    /// The literal's spelling: its characters, `$`-escaped where they cannot
+    /// appear as themselves, inside the delimiter its width selects.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s: String = self.value.iter().collect();
         let delimiter = self.width.delimiter();
-        write!(f, "{delimiter}{s}{delimiter}")
+        let text = crate::string_escape::encode(&self.value, &self.width);
+        write!(f, "{delimiter}{text}{delimiter}")
     }
 }
 
@@ -1891,89 +1895,6 @@ pub struct StringDeclaration {
     pub init: Option<CharacterStringLiteral>,
 }
 
-/// Location prefix for directly represented variables.
-///
-/// See section 2.4.1.1.
-#[derive(Clone, Debug, PartialEq)]
-pub enum LocationPrefix {
-    /// Input location
-    I,
-    /// Output location
-    Q,
-    /// Memory location
-    M,
-}
-
-impl TryFrom<Option<char>> for LocationPrefix {
-    type Error = &'static str;
-
-    fn try_from(value: Option<char>) -> Result<Self, Self::Error> {
-        match value {
-            Some('I') => Ok(LocationPrefix::I),
-            Some('Q') => Ok(LocationPrefix::Q),
-            Some('M') => Ok(LocationPrefix::M),
-            _ => Err("Value must be one of I, Q, M"),
-        }
-    }
-}
-
-impl TryFrom<&str> for LocationPrefix {
-    type Error = &'static str;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let c = value.chars().nth(0);
-        LocationPrefix::try_from(c)
-    }
-}
-
-/// Size prefix for directly represented variables. Defines how many bits
-/// are associated with the variable.
-///
-/// See section 2.4.1.1.
-#[derive(Clone, Debug, PartialEq)]
-pub enum SizePrefix {
-    /// Unspecified (indicated by asterisk)
-    Unspecified,
-    /// Single bit size
-    Nil,
-    /// Single bit size
-    X,
-    /// 8-bit size
-    B,
-    /// 16-bit size
-    W,
-    /// 32-bit size
-    D,
-    /// 64-bit size
-    L,
-}
-
-impl TryFrom<Option<char>> for SizePrefix {
-    type Error = &'static str;
-
-    fn try_from(value: Option<char>) -> Result<Self, Self::Error> {
-        match value {
-            Some('*') => Ok(SizePrefix::Unspecified),
-            Some('X') => Ok(SizePrefix::X),
-            Some('B') => Ok(SizePrefix::B),
-            Some('W') => Ok(SizePrefix::W),
-            Some('D') => Ok(SizePrefix::D),
-            Some('L') => Ok(SizePrefix::L),
-            None => Ok(SizePrefix::Nil),
-            _ => Err("Value must be one of *, X, B, W, D, L, NIL"),
-        }
-    }
-}
-
-impl TryFrom<&str> for SizePrefix {
-    type Error = &'static str;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let c = value.chars().nth(0);
-        SizePrefix::try_from(c)
-    }
-}
-
 /// Array specification: either a reference to a named array type
 /// or an inline array definition with explicit subranges.
 ///
@@ -2515,96 +2436,13 @@ pub enum DeclarationQualifier {
     /// Stored so that the value is NOT retained through power loss.
     NonRetain,
     /// Stored so that the value survives a download, reset, or power loss
-    /// (Beckhoff TwinCAT/CODESYS extension, not part of the IEC standard).
+    /// (`--allow-persistent-var` extension, not part of the IEC standard).
     Persistent,
-}
-
-/// Location assignment for a variable.
-///
-/// See section 2.4.3.1.
-#[derive(Clone, PartialEq, Recurse)]
-pub struct AddressAssignment {
-    #[recurse(ignore)]
-    pub location: LocationPrefix,
-    #[recurse(ignore)]
-    pub size: SizePrefix,
-    #[recurse(ignore)]
-    pub address: Vec<u32>,
-    pub position: SourceSpan,
-}
-
-impl AddressAssignment {
-    /// Returns this address with `position` as its source position.
-    ///
-    /// [`AddressAssignment::try_from`] parses the address out of the token
-    /// text alone, which carries no position, so the caller puts the token's
-    /// span back.
-    pub fn with_position(mut self, position: SourceSpan) -> Self {
-        self.position = position;
-        self
-    }
-}
-
-lazy_static! {
-    static ref DIRECT_ADDRESS_UNASSIGNED: Regex = Regex::new(r"%([IQM])\*").unwrap();
-    // Accepts what the `DirectAddress` token accepts, so `[0-9]` rather than
-    // the Unicode-aware `\d`.
-    static ref DIRECT_ADDRESS: Regex =
-        Regex::new(r"%([IQM])([XBWDL])?([0-9](\.[0-9])*)").unwrap();
-}
-
-impl TryFrom<&str> for AddressAssignment {
-    type Error = &'static str;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if let Some(cap) = DIRECT_ADDRESS_UNASSIGNED.captures(value) {
-            let location_prefix = LocationPrefix::try_from(&cap[1])?;
-            return Ok(AddressAssignment {
-                location: location_prefix,
-                size: SizePrefix::Unspecified,
-                address: vec![],
-                position: SourceSpan::default(),
-            });
-        }
-
-        if let Some(cap) = DIRECT_ADDRESS.captures(value) {
-            let location_prefix = LocationPrefix::try_from(&cap[1])?;
-            // The size letter is optional (`%I1`); without it the size is `Nil`.
-            let size_prefix = SizePrefix::try_from(cap.get(2).map_or("", |m| m.as_str()))?;
-            let pos = cap[3]
-                .split('.')
-                .map(|v| v.parse::<u32>())
-                .collect::<Result<Vec<u32>, _>>()
-                .map_err(|_| "Address field is not a number")?;
-
-            return Ok(AddressAssignment {
-                location: location_prefix,
-                size: size_prefix,
-                address: pos,
-                position: SourceSpan::default(),
-            });
-        }
-
-        Err("Value not convertible to direct variable")
-    }
-}
-
-impl fmt::Debug for AddressAssignment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AddressAssignment")
-            .field("location", &self.location)
-            .field("size", &self.size)
-            .finish()
-    }
-}
-
-impl fmt::Display for AddressAssignment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AddressAssignment")
-            .field("location", &self.location)
-            .field("size", &self.size)
-            .finish()
-    }
+    /// `RETAIN PERSISTENT` or `PERSISTENT RETAIN`: both keywords on one
+    /// block (`--allow-persistent-var` extension). The two orders mean the
+    /// same thing, and CODESYS documents the combination as having the same
+    /// effect as `PERSISTENT` alone.
+    RetainPersistent,
 }
 
 // Container for variable specifications.
@@ -3360,19 +3198,6 @@ mod tests {
         let span = identifier.span();
         assert_eq!(span.start, 50);
         assert_eq!(span.end, 56);
-    }
-
-    #[test]
-    fn try_from_when_no_size_prefix_then_size_is_nil() {
-        let address = AddressAssignment::try_from("%I1").unwrap();
-        assert_eq!(address.location, LocationPrefix::I);
-        assert_eq!(address.size, SizePrefix::Nil);
-        assert_eq!(address.address, vec![1]);
-    }
-
-    #[test]
-    fn try_from_when_non_ascii_digit_then_err() {
-        assert!(AddressAssignment::try_from("%IX\u{0663}").is_err());
     }
 
     #[test]

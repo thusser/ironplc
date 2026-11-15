@@ -243,6 +243,7 @@ END_CONFIGURATION"
     in_program,
     CompilerOptions::default
 )]
+#[case::conditional_return("RETURN·(·r·)·;", in_program, opts_with_conditional_return)]
 #[case::for_statement(
     "FOR v·:=·0· TO 3· DO b := 1;· END_FOR;",
     in_program,
@@ -255,6 +256,21 @@ END_CONFIGURATION"
 )]
 #[case::var_declaration(
     "PROGRAM main VAR x·:·INT·:=·1·; END_VAR x := 2; END_PROGRAM",
+    verbatim,
+    CompilerOptions::default
+)]
+#[case::var_declaration_inline_subrange(
+    "PROGRAM main VAR x·:·INT·(·0·..·15·)·:=·3·; END_VAR x := 2; END_PROGRAM",
+    verbatim,
+    CompilerOptions::default
+)]
+#[case::global_declaration_inline_subrange(
+    "CONFIGURATION config VAR_GLOBAL g·:·INT·(·0·..·15·)·:=·3·; END_VAR RESOURCE res ON PLC PROGRAM p : main; END_RESOURCE END_CONFIGURATION",
+    verbatim,
+    CompilerOptions::default
+)]
+#[case::external_declaration_inline_subrange(
+    "PROGRAM main VAR_EXTERNAL g·:·INT·(·0·..·15·)·; END_VAR g := 2; END_PROGRAM",
     verbatim,
     CompilerOptions::default
 )]
@@ -341,6 +357,16 @@ END_CONFIGURATION"
 #[case::step_association(
     "INITIAL_STEP Start: END_STEP STEP Idle·:·DoIt(N)·;·END_STEP",
     in_sfc,
+    CompilerOptions::default
+)]
+// ---------------------------------------------------------------------
+// Issue #1913: a located `VAR_GLOBAL` declaration was a syntax error. The
+// gap between the name and `AT` is required, not optional, so it is not
+// marked; the gaps after it are.
+// ---------------------------------------------------------------------
+#[case::global_var_located(
+    "CONFIGURATION config VAR_GLOBAL lamp AT·%QX0.0·:·BOOL·:=·TRUE·; END_VAR RESOURCE r1 ON PLC PROGRAM a : p; END_RESOURCE END_CONFIGURATION",
+    verbatim,
     CompilerOptions::default
 )]
 fn parse_when_gap_filled_then_same_ast(

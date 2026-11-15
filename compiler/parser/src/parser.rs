@@ -803,6 +803,12 @@ parser! {
     rule subrange_spec_init__with_range() -> (SubrangeSpecificationKind, Option<SignedInteger>) = spec:subrange_specification__with_range() _ default:(tok(TokenType::Assignment) _ def:signed_integer() { def })? {
       (spec, default)
     }
+    // An integer type keyword followed by `(` can only start a subrange, so
+    // trying this ahead of the elementary type alternatives changes no other
+    // declaration's meaning.
+    rule subrange_spec_init__inline() -> InitialValueAssignmentKind = subrange:subrange_spec_init__with_range() {
+      InitialValueAssignmentKind::Subrange(SubrangeInitialValueAssignment { spec: subrange.0, initial_value: subrange.1 })
+    }
     rule subrange_specification__with_range() -> SubrangeSpecificationKind
       = type_name:integer_type_name() _ tok(TokenType::LeftParen) _ subrange:subrange() _ tok(TokenType::RightParen) { SpecificationKind::Inline(SubrangeSpecification{ type_name, subrange }) }
     rule integer_ref() -> IntegerRef = i:integer() { IntegerRef::Literal(i) } / id:identifier() { IntegerRef::Constant(id) }
@@ -941,7 +947,7 @@ parser! {
     rule structure_element_declaration() -> StructureElementDeclaration = name:structure_element_name() _ tok(TokenType::Colon) _ init:(
       arr:array_spec_init() { InitialValueAssignmentKind::Array(arr) }
       // handle the initial value
-      / subrange:subrange_spec_init__with_range() { InitialValueAssignmentKind::Subrange(SubrangeInitialValueAssignment { spec: subrange.0, initial_value: subrange.1 }) }
+      / subrange_spec_init__inline()
       / i:initialized_structure__without_ambiguous() { late_resolved_members(i) }
       / spec_init:enumerated_spec_init__with_value() {
         match spec_init.0 {
@@ -968,7 +974,7 @@ parser! {
         }
     }
     rule structure_element_name() ->Id = identifier()
-    rule structure_initialization() -> Vec<StructureElementInit> = tok(TokenType::LeftParen) _ elems:structure_element_initialization() ++ (_ tok(TokenType::Comma) _) _ tok(TokenType::RightParen) { elems }
+    rule structure_initialization() -> Vec<StructureElementInit> = tok(TokenType::LeftParen) _ elems:structure_element_initialization() ** (_ tok(TokenType::Comma) _) _ tok(TokenType::RightParen) { elems }
     // `constant()` and a qualified `Type#VALUE` are grammatically a strict
     // subset of `expression()` (e.g. a bare identifier is a valid, but
     // truncated, match for `pDevice^.Delta`) -- the trailing lookahead
@@ -999,7 +1005,8 @@ parser! {
     //
     // There is still value in trying to disambiguate early because it allows us to use
     // the parser definitions.
-    rule simple_or_enumerated_or_subrange_ambiguous_struct_spec_init() -> InitialValueAssignmentKind = simple_spec_init__elementary_with_expression()
+    rule simple_or_enumerated_or_subrange_ambiguous_struct_spec_init() -> InitialValueAssignmentKind = subrange_spec_init__inline()
+    / simple_spec_init__elementary_with_expression()
     / s:simple_type_name() _ tok(TokenType::Assignment) _ e:expression() {?
       // A user type name takes the same expression shapes, except that a
       // bare identifier (no operators) is rejected here (backtracking to
@@ -1183,7 +1190,7 @@ parser! {
     rule field_selector() -> Id = identifier()
 
     // B.1.4.3 Declarations and initialization
-    rule input_declarations() -> Vec<VarDeclarations> = tok(TokenType::VarInput) _ qualifier:(tok(TokenType::Retain) {DeclarationQualifier::Retain} / tok(TokenType::NonRetain) {DeclarationQualifier::NonRetain})? _ declarations:semisep_or_empty(<input_declaration()>) _ tok(TokenType::EndVar) {
+    rule input_declarations() -> Vec<VarDeclarations> = tok(TokenType::VarInput) _ qualifier:retention_qualifier()? _ declarations:semisep_or_empty(<input_declaration()>) _ tok(TokenType::EndVar) {
       VarDeclarations::with(declarations, qualifier.unwrap_or(DeclarationQualifier::Unspecified))
     }
     rule input_declaration() -> VarDeclarations =
@@ -1341,7 +1348,7 @@ parser! {
       // TwinCAT/CODESYS `POINTER TO POINTER TO INT`, at any depth.
       / syntax:ref_to_keyword() _ target:ref_to_target() { ReferenceTarget::Reference(Box::new(ReferenceSpec { syntax, target })) }
       / tn:non_generic_type_name() { ReferenceTarget::Named(tn) }
-    pub rule output_declarations() -> Vec<VarDecl> = tok(TokenType::VarOutput) _ qualifier:(tok(TokenType::Retain) {DeclarationQualifier::Retain} / tok(TokenType::NonRetain) {DeclarationQualifier::NonRetain})? _ declarations:semisep_or_empty(<var_init_decl()>) _ tok(TokenType::EndVar) {
+    pub rule output_declarations() -> Vec<VarDecl> = tok(TokenType::VarOutput) _ qualifier:retention_qualifier()? _ declarations:semisep_or_empty(<var_init_decl()>) _ tok(TokenType::EndVar) {
       VarDeclarations::flat_map(declarations, VariableType::Output, qualifier)
     }
     pub rule input_output_declarations() -> Vec<VarDecl> = tok(TokenType::VarInOut) _ declarations:semisep_or_empty(<var_declaration()>) _ tok(TokenType::EndVar) {
@@ -1388,10 +1395,21 @@ parser! {
       let qualifier = Option::Some(DeclarationQualifier::Retain);
       VarDeclarations::Var(VarDeclarations::flat_map(declarations, VariableType::Var, qualifier))
     }
-    rule persistent_var_declarations() -> VarDeclarations = tok(TokenType::Var) _ tok(TokenType::Persistent) _ declarations:semisep_or_empty(<var_init_decl()>) _ tok(TokenType::EndVar) {
-      let qualifier = Option::Some(DeclarationQualifier::Persistent);
-      VarDeclarations::Var(VarDeclarations::flat_map(declarations, VariableType::Var, qualifier))
+    rule persistent_var_declarations() -> VarDeclarations = tok(TokenType::Var) _ qualifier:persistent_qualifier() _ declarations:semisep_or_empty(<var_init_decl()>) _ tok(TokenType::EndVar) {
+      VarDeclarations::Var(VarDeclarations::flat_map(declarations, VariableType::Var, Some(qualifier)))
     }
+    // The storage qualifier of a variable block: IEC 61131-3 `RETAIN` and
+    // `NON_RETAIN`, or one of the `PERSISTENT` forms.
+    rule retention_qualifier() -> DeclarationQualifier = persistent_qualifier() / tok(TokenType::Retain) { DeclarationQualifier::Retain } / tok(TokenType::NonRetain) { DeclarationQualifier::NonRetain }
+    // `--allow-persistent-var` extension, not part of IEC 61131-3:
+    // `PERSISTENT`, or `PERSISTENT` combined with `RETAIN` in either order
+    // (CODESYS and TwinCAT accept both orders and give them one meaning).
+    // With the flag off, `PERSISTENT` is demoted to an identifier, so none
+    // of these alternatives can match.
+    rule persistent_qualifier() -> DeclarationQualifier =
+      tok(TokenType::Retain) _ tok(TokenType::Persistent) { DeclarationQualifier::RetainPersistent }
+      / tok(TokenType::Persistent) _ tok(TokenType::Retain) { DeclarationQualifier::RetainPersistent }
+      / tok(TokenType::Persistent) { DeclarationQualifier::Persistent }
     rule located_var_declarations() -> VarDeclarations = tok(TokenType::Var) _ qualifier:(tok(TokenType::Constant) { DeclarationQualifier::Constant } / tok(TokenType::Retain) {DeclarationQualifier::Retain} / tok(TokenType::NonRetain) {DeclarationQualifier::NonRetain})? _ declarations:semisep_or_empty(<located_var_decl()>) _ tok(TokenType::EndVar) {
       let qualifier = qualifier.unwrap_or(DeclarationQualifier::Unspecified);
       VarDeclarations::Located(VarDeclarations::map(declarations, &qualifier))
@@ -1413,8 +1431,10 @@ parser! {
       let qualifier = qualifier.unwrap_or(DeclarationQualifier::Unspecified);
       VarDeclarations::External(VarDeclarations::map(declarations, &qualifier))
     }
-    // TODO external_declaration_spec needs subrange_specification, structure_type_name and others
-    rule external_declaration_spec() -> InitialValueAssignmentKind = spec:array_specification() {
+    // TODO external_declaration_spec needs structure_type_name and others
+    rule external_declaration_spec() -> InitialValueAssignmentKind = spec:subrange_specification__with_range() {
+      InitialValueAssignmentKind::Subrange(SubrangeInitialValueAssignment::bare(spec))
+    } / spec:array_specification() {
       InitialValueAssignmentKind::Array(ArrayInitialValueAssignment {
         spec,
         initial_values: vec![],
@@ -1437,7 +1457,7 @@ parser! {
       }
     }
     rule global_var_name() -> Id = i:identifier() { i }
-    rule global_var_declarations__qualifier() -> DeclarationQualifier = tok(TokenType::Constant) { DeclarationQualifier::Constant } / tok(TokenType::Retain) { DeclarationQualifier::Retain } / tok(TokenType::Persistent) { DeclarationQualifier::Persistent }
+    rule global_var_declarations__qualifier() -> DeclarationQualifier = tok(TokenType::Constant) { DeclarationQualifier::Constant } / persistent_qualifier() / tok(TokenType::Retain) { DeclarationQualifier::Retain }
     pub rule global_var_declarations() -> Vec<VarDecl> = tok(TokenType::VarGlobal) _ qualifier:global_var_declarations__qualifier()? _ declarations:semisep_or_empty(<global_var_decl()>) _ tok(TokenType::EndVar) {
       // TODO set the options - this is pretty similar to VarInit - maybe it should be the same
       let declarations = declarations.into_iter().flatten();
@@ -1448,9 +1468,18 @@ parser! {
         declaration
       }).collect()
     }
-    // TODO this doesn't pass all information. I suspect the rule from the description is not right
-    rule global_var_decl() -> (Vec<VarDecl>) = vs:global_var_spec() _ tok:tok(TokenType::Colon) _ initializer:(l:located_var_spec_init() { l } / f:function_block_type_name() { InitialValueAssignmentKind::FunctionBlock(FunctionBlockInitialValueAssignment{type_name: f, init: vec![] })})? {
-      vs.0.into_iter().map(|name| {
+    // IEC 61131-3 Ed. 2, B.1.4.3 spells this as one rule,
+    //   global_var_decl ::= global_var_spec ':' [ located_var_spec_init | function_block_type_name ]
+    //   global_var_spec ::= global_var_list | [global_var_name] location
+    // but a PEG choice inside global_var_spec cannot backtrack once
+    // global_var_list has consumed the name of `name AT %IX0.0 : BOOL`. So the
+    // located form is its own alternative, tried first. It is exactly the
+    // located_var_decl of a VAR block, declared as a global.
+    rule global_var_decl() -> (Vec<VarDecl>) = d:located_var_decl() {
+      vec![VarDecl { var_type: VariableType::Global, ..d }]
+    } / symbolic_global_var_decl()
+    rule symbolic_global_var_decl() -> (Vec<VarDecl>) = names:global_var_list() _ tok:tok(TokenType::Colon) _ initializer:(l:located_var_spec_init() { l } / f:function_block_type_name() { InitialValueAssignmentKind::FunctionBlock(FunctionBlockInitialValueAssignment{type_name: f, init: vec![] })})? {
+      names.into_iter().map(|name| {
         let init = initializer.clone().unwrap_or(InitialValueAssignmentKind::None(SourceSpan::join(&tok.span, &tok.span)));
         VarDecl {
           identifier: VariableIdentifier::Symbol(name),
@@ -1464,14 +1493,8 @@ parser! {
         }
       }).collect()
      }
-    rule global_var_spec() -> (Vec<Id>, Option<AddressAssignment>) = names:global_var_list() {
-      (names, None)
-    } / global_var_name()? location() {
-      // TODO this is clearly wrong, but it feel like the spec is wrong here
-      (vec![Id::from("")], None)
-    }
     // TODO this is completely fabricated - it isn't correct.
-    rule located_var_spec_init() -> InitialValueAssignmentKind = arr:array_spec_init() { InitialValueAssignmentKind::Array(arr) } / simple:simple_spec_init() { simple }
+    rule located_var_spec_init() -> InitialValueAssignmentKind = subrange_spec_init__inline() / arr:array_spec_init() { InitialValueAssignmentKind::Array(arr) } / simple:simple_spec_init() { simple }
     rule location() -> AddressAssignment = tok(TokenType::At) _ v:direct_variable() { v }
     rule global_var_list() -> Vec<Id> = names:global_var_name() ++ (_ tok(TokenType::Comma) _) { names }
     rule string_var_declaration() -> Vec<UntypedVarDecl> = string_var_declaration__with_expression() / single_byte_string_var_declaration() / double_byte_string_var_declaration()
@@ -1854,7 +1877,7 @@ parser! {
 
     // A VAR block in a program that may contain both located and non-located
     // declarations (e.g. `Motor : FB; xStart AT %IX0.0 : BOOL;`).
-    rule program_var_declarations() -> Vec<VarDeclarations> = tok(TokenType::Var) _ qualifier:(tok(TokenType::Constant) { DeclarationQualifier::Constant } / tok(TokenType::Retain) { DeclarationQualifier::Retain } / tok(TokenType::NonRetain) { DeclarationQualifier::NonRetain } / tok(TokenType::Persistent) { DeclarationQualifier::Persistent })? _ declarations:semisep_or_empty(<program_var_decl()>) _ tok(TokenType::EndVar) {
+    rule program_var_declarations() -> Vec<VarDeclarations> = tok(TokenType::Var) _ qualifier:(tok(TokenType::Constant) { DeclarationQualifier::Constant } / retention_qualifier())? _ declarations:semisep_or_empty(<program_var_decl()>) _ tok(TokenType::EndVar) {
       let qualifier = qualifier.unwrap_or(DeclarationQualifier::Unspecified);
       let mut located = Vec::new();
       let mut regular = Vec::new();
@@ -1876,7 +1899,7 @@ parser! {
     }
 
     // TODO program_access_decls
-    pub rule program_declaration() -> ProgramDeclaration = tok(TokenType::Program) _ p:program_type_name() _ decls:(access:program_access_decls() { vec![access] } / io:io_var_declarations() { io } / mixed:program_var_declarations() { mixed } / other:other_var_declarations() { vec![other] } / located:located_var_declarations() { vec![located] }) ** _ _ body:function_block_body() _ tok(TokenType::EndProgram) {
+    pub rule program_declaration() -> ProgramDeclaration = tok(TokenType::Program) _ p:program_type_name() _ decls:(access:program_access_decls() { vec![access] } / io:io_var_declarations() { io } / mixed:program_var_declarations() { mixed } / other:other_var_declarations() { vec![other] } / temp:temp_var_decls() { vec![temp] } / located:located_var_declarations() { vec![located] }) ** _ _ body:function_block_body() _ tok(TokenType::EndProgram) {
       let decls = VarDeclarations::flatten(decls);
       let (variables, remainder) = VarDeclarations::drain_var_decl(decls);
       let (access_variables, _) = VarDeclarations::drain_access(remainder);
@@ -2330,7 +2353,18 @@ parser! {
       }
 
     // B.3.2.2 Subprogram control statements
-    rule subprogram_control_statement() -> StmtKind = m:method_invocation() { m } / fb:fb_invocation() { fb } / tok(TokenType::Return) { StmtKind::Return }
+    rule subprogram_control_statement() -> StmtKind = m:method_invocation() { m } / fb:fb_invocation() { fb } / start:tok(TokenType::Return) _ tok(TokenType::LeftParen) _ expr:expression() _ end:tok(TokenType::RightParen) {
+      // TwinCAT: `RETURN(cond)` returns only when `cond` is TRUE. The
+      // argument is not a return value, so it is the same as an IF.
+      StmtKind::If(If {
+        expr,
+        body: vec![StmtKind::Return],
+        else_ifs: vec![],
+        else_body: vec![],
+        span: SourceSpan::join(&start.span, &end.span),
+      })
+    }
+    / tok(TokenType::Return) { StmtKind::Return }
     rule fb_invocation() -> StmtKind = name:fb_name() _ tok(TokenType::LeftParen) _ params:param_assignment() ** (_ tok(TokenType::Comma) _) _ end:tok(TokenType::RightParen) {
       let span = SourceSpan::join(&name.span, &end.span);
       StmtKind::FbCall(FbCall {
@@ -2434,7 +2468,7 @@ parser! {
         span: SourceSpan::join(&start.span, &end.span),
       }
     }
-    rule control_variable() -> Id = identifier()
+    rule control_variable() -> Id = variable_identifier()
     rule for_list() -> (Expr, Expr, Option<Expr>) = from:expression() _ tok(TokenType::To) _ to:expression() _ step:(tok(TokenType::By) _ s:expression() { s })? { (from, to, step) }
     rule while_statement() -> While = start:tok(TokenType::While) _ condition:expression() _ tok(TokenType::Do) _ body:statement_list() _ end:tok(TokenType::EndWhile) {
       While {

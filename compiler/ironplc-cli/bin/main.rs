@@ -161,7 +161,9 @@ struct FileArgs {
     #[arg(long)]
     allow_adr: bool,
 
-    /// Allow the Beckhoff TwinCAT/CODESYS `PERSISTENT` variable qualifier.
+    /// Allow the `PERSISTENT` variable qualifier, alone or combined with
+    /// `RETAIN` in either order, on `VAR`, `VAR_GLOBAL`, `VAR_INPUT` and
+    /// `VAR_OUTPUT` blocks.
     /// This is an extension, not part of the IEC 61131-3 standard; the
     /// `twincat` and `codesys` dialects enable it.
     #[arg(long)]
@@ -267,6 +269,12 @@ struct FileArgs {
     #[arg(long)]
     allow_radix_subrange_bounds: bool,
 
+    /// Allow RETURN(condition), a RETURN that happens only when the BOOL
+    /// condition is TRUE. This is an extension not part of the IEC 61131-3
+    /// standard.
+    #[arg(long)]
+    allow_conditional_return: bool,
+
     /// Allow a general (non-constant) expression as the value in a
     /// structured/call-style initializer's `name := value` pairs (e.g.
     /// `tonDelta : TON := (PT := pDevice^.Delta);`). This is a dialect
@@ -361,6 +369,7 @@ impl FileArgs {
         options.allow_radix_case_labels |= self.allow_radix_case_labels;
         options.allow_paren_string_length |= self.allow_paren_string_length;
         options.allow_radix_subrange_bounds |= self.allow_radix_subrange_bounds;
+        options.allow_conditional_return |= self.allow_conditional_return;
         options.allow_struct_initializer_expressions |= self.allow_struct_initializer_expressions;
         options.allow_fb_inheritance |= self.allow_fb_inheritance;
         options.allow_enum_explicit_values |= self.allow_enum_explicit_values;
