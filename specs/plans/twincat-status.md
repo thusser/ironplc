@@ -78,8 +78,7 @@ than P6011 and P6007 has its primary location in it. This covers 420 files, not
   (dynamic dispatch, #1870), and the remaining P2008 are other unbundled libraries
   (Tc2_MC2, Tc3_IotBase, the Tc2_System gaps), so the library spec PR and #1870
   come before more resolution work.
-- **Branch `sibling-project-references`** (pushed to `fork`, no PR yet, one commit
-  `0f8b79532`): item 1 of #2590 only. A `PlaceholderReference` whose name equals
+- **Branch `sibling-project-references`** (PR **#2603**, one commit `0f8b79532`): item 1 of #2590 only. A `PlaceholderReference` whose name equals
   the `<Name>` (else file stem) of a project loaded alongside is satisfied, so it
   no longer gives a false P6011; a sibling shadows a bundled library of the same
   name. References are resolved once all CLI paths are known. New
