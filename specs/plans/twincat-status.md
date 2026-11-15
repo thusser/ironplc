@@ -6,6 +6,33 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-11-15: synced to `main` @ `08bfbe790`; Garret merged and gated three parser PRs
+
+Merged `origin/main` into `twincat-dev` (no conflicts); `cargo test --workspace`
+passes. Not yet re-scored on the corpus.
+
+- **Merged, ours:** #2581 (keyword-named FOR counters), #2583 (empty member
+  initializer list).
+- **Superseded by Garret's own PRs** (he kept the author line where he reused our
+  commit):
+  - #2599 (merged) replaces #2582: PERSISTENT on VAR_INPUT/VAR_OUTPUT and with
+    RETAIN, plus an analyzer rule and P4099 for the places XAE rejects it.
+  - #2601 (merged) replaces #2587: `RETURN(cond)` behind
+    `--allow-conditional-return`, enabled by the codesys and twincat dialects,
+    P4098 without it. Untested in XAE: inside CASE, actions, properties.
+  - #2600 (open) replaces #2586: the `;` after a POU header behind
+    `--allow-pou-header-semicolon`, for PROGRAM, FUNCTION and METHOD too.
+- **Decision to expect on our remaining parser PRs:** Garret gates extensions
+  behind an `--allow-*` flag that the dialects turn on. #2584 (located array),
+  #2585 (omitted argument) and #2588 (qualified names) are not gated yet.
+- **Rebased onto the new `main`:** #2584, #2585 (one conflict in
+  `subprogram_control_statement`, kept main's RETURN rule), #2588. Tests pass on
+  each. Not force-pushed yet.
+- **Opened by Garret:** #2567 (initial value on a variable of a named array
+  type).
+- Removed the `ironplc-fix-2576` worktree (14 GB). `/home` was at 99%.
+
+
 ## 2026-11-10: corpus re-checked on a changed corpus; review replies; global string and structure initializers
 
 **Corpus.** `~/code/brotlib` changed a lot since the last run (the repos were
