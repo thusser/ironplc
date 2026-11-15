@@ -6,6 +6,46 @@ resume from a different machine. This branch (`twincat-dev` on
 work in one place -- individual pieces get merged into `main` separately via
 PRs, but `twincat-dev` should always reflect everything, landed or not.
 
+## 2026-11-15 (evening): XAE rounds 1 and 2; sibling projects need namespacing
+
+XAE 4024.66, compile plus online reads on the user-mode runtime. Probe sources and
+raw logs are on the runner in `XaeProbe\results\SUMMARY.md`; the handover is
+`xae-handover.md` (untracked, repository root).
+
+| Probe | Result |
+|---|---|
+| A, A2: empty value or trailing comma in a declaration initializer, in both `x : FB := (...)` and the call-style `x : FB(...)` (which passes arguments to `FB_init`) | all rejected (`Expression expected instead of ','`, `Expression expected instead of ')'`, `No matching FB_init method found`) |
+| B: `RETURN (c)` in a CASE branch, an action, a property getter | compiles; `c` TRUE skips the rest, FALSE runs it, same as `IF c THEN RETURN; END_IF` |
+| C1: variable `Error` beside enum constant `Error` | compiles; the variable is read (0 = Idle), with and without `qualified_only`. Matches IronPLC since #2378 |
+| C2: global `RUNNING` beside enum value `RUNNING` | rejected, `ambiguous use of name 'RUNNING'`. IronPLC silently picks the global (#2406) |
+| D: `FB_A` in the project and in referenced `Lib` | compiles; unqualified `FB_A` is the project's own (`a.x` = 2), `Lib.FB_A` the library's (`b.x` = 1) |
+| D2: `FB_A` in `LibA` and `LibB`, none in the project | unqualified `FB_A` rejected, `ambiguous use of name 'FB_A'`, in either reference order; `LibA.FB_A`, `LibB.FB_A` compile |
+| D3: `Lib.FB_A` and `Nonsense.FB_A` | first compiles, second rejected (`Unknown type: 'Nonsense.FB_A'`) |
+
+- **Name resolution in XAE:** the project's own name first, else the one referenced
+  library that provides it, else ambiguous; a prefix must name a referenced library
+  (the project's own name is not a prefix, from #2590). Flat merging of sibling
+  projects, which #2603 does, is therefore wrong when names overlap. This is why
+  scoring with siblings gave 153/420 against 156/420: the duplicate-declaration
+  errors in IAG50cm and MONETcommon are our bug, not a corpus quirk. This replaces
+  the "unchecked" remark in the section below.
+- **To correct in the design doc:** `REQ-CL-sources-009` (merged with #2603) says a
+  loaded project satisfies a reference "by that project's sources", which implies
+  flat merging. It needs rewording once the namespacing design exists.
+- **#2585:** A and A2 showed the extension leaked into the call-style declaration
+  rule (`fb_call_style_init_params`). Fixed in `fafce877a`, rebased onto `main`
+  @ `0928f47e8`, `cd compiler && just` passes, force-pushed. Reply posted on the PR.
+  Garret's `:=` snippet was the structure-initializer form, which was never
+  affected.
+- **#2601 limitation closed:** `RETURN(cond)` in CASE, actions and properties is
+  confirmed in XAE. Not yet run through IronPLC.
+- **Runner side effects:** `Lib`, `LibA`, `LibB` (company `Probe`) are installed in
+  the runner's library repository. In XAE `s` and `st` are IL operators and not
+  usable as identifiers.
+- **Next:** design for namespacing sibling projects (scoping questions to Tim
+  first), which also decides item 2 of #2590; comments on #2406 (C1, C2) and
+  #2590 (D to D3) not yet posted.
+
 ## 2026-11-15 (later): synced to `main` @ `048528065`; corpus unchanged at 156/420
 
 Merged `origin/main` into `twincat-dev` (`7ce1d627a`, no conflicts); build and
